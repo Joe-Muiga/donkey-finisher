@@ -1,0 +1,31 @@
+# render.yaml – Render.com deployment configuration
+#
+# ONLY TWO values ever need typing in per service:
+#   DERIV_API_TOKEN  – your Deriv API token (trade + read scope)
+#   RENDER_API_KEY   – Render Dashboard → Account Settings → API Keys.
+#                      One key per Render ACCOUNT: reuse the same key for
+#                      every service on that account.
+#
+# Everything else is automatic or has a built-in default:
+#   RENDER_SERVICE_ID / RENDER_EXTERNAL_URL / PORT  – injected by Render
+#   DERIV_APP_ID         – defaults to 1089 (add the var only to override)
+#   DERIV_ACCOUNT_MODE   – defaults to "demo" (set to "real" to trade real)
+#   DASHBOARD_PIN        – defaults to the last 6 chars of DERIV_API_TOKEN
+#   RENDER_DEPLOY_HOOK_URL – no longer needed (RENDER_API_KEY redeploys)
+
+services:
+  - type: web
+    name: sifm-deriv-bot
+    runtime: python
+    region: oregon    # or frankfurt for EU
+    plan: free
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+
+    envVars:
+      - key: DERIV_API_TOKEN
+        sync: false          # prompted once at Blueprint creation – never commit it
+
+      - key: RENDER_API_KEY
+        sync: false          # lets the bot redeploy itself + remember its state
