@@ -1672,10 +1672,10 @@ FIXED_CYCLE_LEG_MINUTES          = 5     # length of leg 1 — kept equal
                                           # (5 min) above; change both
                                           # together if you ever want a
                                           # different leg length
-FIXED_CYCLE_COOLDOWN_MIN_MINUTES = 1     # was 75 — lower bound of the
+FIXED_CYCLE_COOLDOWN_MIN_MINUTES = 4     # was 75 — lower bound of the
                                           # randomized cooldown after
                                           # every leg 1
-FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 3     # was 150 — upper bound; a fresh
+FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 7    # was 150 — upper bound; a fresh
                                           # value is drawn uniformly at
                                           # random between these two
                                           # every time leg 1 ends (see
