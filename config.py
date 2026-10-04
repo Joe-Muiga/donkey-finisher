@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 0.35
+MANUAL_STAKE_AMOUNT = 0.5
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 0.35    # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 0.5    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1629,6 +1629,17 @@ DONKEY_STRATEGY_MODE = "INDEPENDENT"   # "INDEPENDENT" | "COMBINED"
 # is no longer imported anywhere (dead file, kept only for reference).
 # ORIGINAL = has inversion (bets hot digit continues, DIGITUNDER trend
 #   filter) — the only variant that can trade now.
+# ── CONTRARIAN SWITCH (Oct 2026, chat-requested) ───────────────────────
+# False = ORIGINAL: follows the hot digit (hot inside the winning zone,
+#         cold outside) — same side as the usual digit-education crowd.
+# True  = CONTRARIAN: fades the hot digit (cold inside the winning zone,
+#         hot outside); trend signal flips UNDER t -> OVER 9-t. Same
+#         payout-ratio barrier selection, significance gate and guard.
+# This changes WHICH side you bet, not the odds: P(win) per barrier and
+# the payout are identical, so expected value is unchanged (still
+# slightly negative after Deriv's margin).
+DONKEY_CONTRARIAN = True
+
 DONKEY_CYCLE_START = "ORIGINAL"        # kept only as _donkey_active_
                                         # variant()'s belt-and-suspenders
                                         # fallback value; not otherwise
