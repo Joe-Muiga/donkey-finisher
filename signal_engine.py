@@ -2236,8 +2236,13 @@ def evaluate_step_grid(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 # ---------------------------------------------------------------------------
 
 def _donkey_active_variant() -> str:
-    """Locked to ORIGINAL — RAW and the balance-trend switch that used to
-    choose between the two are both disabled (Sep 2026, chat-requested)."""
+    """ORIGINAL (follows the hot digit — same side as the usual Deriv
+    digit-education crowd) or CONTRARIAN (fades the hot digit: bets the
+    cold digit lands, hot digit does not). RAW and the balance-trend switch
+    that used to choose between variants stay disabled. Chosen by
+    config.DONKEY_CONTRARIAN (Oct 2026, chat-requested)."""
+    if getattr(config, "DONKEY_CONTRARIAN", False):
+        return "CONTRARIAN"
     return "ORIGINAL"
 
 
@@ -2516,6 +2521,105 @@ def _donkey_signal_2_raw(ticks: List[Any], symbol: str) -> Optional[Tuple[str, i
     return "OVER", barrier, score
 
 
+def _donkey_signal_1_contrarian(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float, int, int]]:
+    """
+    CONTRARIAN frequency logic (Oct 2026, chat-requested) — exact mirror of
+    _donkey_signal_1_original with the hot/cold roles swapped, but with the
+    same barrier rigour (payout-ratio / widest-zone selection and the same
+    significance gate) that ORIGINAL has. Bets AGAINST the hot digit: the
+    COLD digit must sit INSIDE the winning zone, the HOT digit OUTSIDE it.
+
+      cold > hot : OVER(b) wins {b+1..9}. cold inside -> b <= cold-1;
+                   hot outside -> b >= hot.  Range [hot, cold-1].
+      cold < hot : UNDER(b) wins {0..b-1}. cold inside -> b >= cold+1;
+                   hot outside -> b <= hot.  Range [cold+1, hot].
+
+    Returns (match_type, barrier, score, hot, cold), or None.
+    """
+    window_n = getattr(config, "DONKEY_FREQ_WINDOW", 100)
+    min_n = getattr(config, "DONKEY_FREQ_MIN_SAMPLE", 100)
+    window = ticks[-window_n:]
+    if len(window) < min_n:
+        return None
+
+    decimals = _digit_decimals(symbol)
+    try:
+        digits = [_last_digit(_tick_quote(t), decimals) for t in window]
+    except ValueError:
+        logger.warning(f"DONKEY: {symbol} could not parse tick quotes for contrarian signal 1 — skipping")
+        return None
+
+    counts = [0] * 10
+    for d in digits:
+        counts[d] += 1
+
+    hot  = max(range(10), key=lambda d: (counts[d], -d))
+    cold = min(range(10), key=lambda d: (counts[d], d))
+    if hot == cold:
+        return None
+
+    if getattr(config, "DONKEY_SIGNIFICANCE_ENABLED", True):
+        alpha = float(getattr(config, "DONKEY_SIGNIFICANCE_ALPHA", 0.01))
+        _chi2, p_value = _chi2_binary(counts[hot], counts[cold])
+        if p_value >= alpha:
+            return None
+
+    n = len(digits)
+    score = max(0.0, min(1.0, counts[hot] / n - counts[cold] / n))
+
+    if cold > hot:
+        match_type, lo, hi = "OVER", hot, cold - 1
+    else:
+        match_type, lo, hi = "UNDER", cold + 1, hot
+    if lo > hi:
+        return None
+
+    max_p = _donkey_max_win_prob()
+    if max_p is not None:
+        # Payout-ratio mode: highest win rate that still keeps P <= max_p.
+        if match_type == "OVER":
+            barrier = max(lo, math.ceil(9 - 10 * max_p))   # P=(9-b)/10 falls as b rises
+        else:
+            barrier = min(hi, math.floor(10 * max_p))      # P=b/10 rises as b rises
+        if not (lo <= barrier <= hi):
+            return None
+    elif getattr(config, "DONKEY_WIDEST_ZONE", True):
+        barrier = lo if match_type == "OVER" else hi       # widest valid zone (barrier = hot)
+    else:
+        barrier = hi if match_type == "OVER" else lo       # narrowest valid zone
+
+    return match_type, barrier, score, hot, cold
+
+
+def _donkey_signal_2_contrarian(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float]]:
+    """
+    CONTRARIAN trend filter — mirror of _donkey_signal_2_original: when the
+    current tick is BELOW the SMA, ORIGINAL fires DIGITUNDER at barrier t;
+    this fires DIGITOVER at barrier 9-t, which has the identical win
+    probability (OVER 9-t wins on t digits, same as UNDER t) but the
+    opposite side. Returns (match_type, barrier, score) or None.
+    """
+    period = getattr(config, "DONKEY_TREND_SMA_PERIOD", 8)
+    if len(ticks) < period + 1:
+        return None
+    try:
+        quotes = np.array([_tick_quote(t) for t in ticks[-(period + 1):]], dtype=float)
+    except ValueError:
+        logger.warning(f"DONKEY: {symbol} could not parse tick quotes for contrarian signal 2 — skipping")
+        return None
+
+    sma_val = float(ind.sma(quotes, period)[-1])
+    current = float(quotes[-1])
+    if current >= sma_val:
+        return None
+
+    barrier = 9 - _donkey_trend_barrier()
+    barrier = max(0, min(8, barrier))          # DIGITOVER valid barriers are 0-8
+    spread = float(np.std(quotes)) or 1e-9
+    score = max(0.0, min(1.0, (sma_val - current) / (3 * spread)))
+    return "OVER", barrier, score
+
+
 def _donkey_combine(
     sig1: Optional[Tuple[str, int, float, int, int]],
     sig2: Optional[Tuple[str, int, float]],
@@ -2569,6 +2673,9 @@ def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalR
     variant = _donkey_active_variant()
     if variant == "RAW":
         sig1_fn, sig2_fn = _donkey_signal_1_raw, _donkey_signal_2_raw
+        target_type, barrier_combine = "OVER", max
+    elif variant == "CONTRARIAN":
+        sig1_fn, sig2_fn = _donkey_signal_1_contrarian, _donkey_signal_2_contrarian
         target_type, barrier_combine = "OVER", max
     else:
         sig1_fn, sig2_fn = _donkey_signal_1_original, _donkey_signal_2_original
