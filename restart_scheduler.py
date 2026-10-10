@@ -60,6 +60,14 @@ def _push_dashboard_flag(**kwargs) -> None:
         pass
 
 
+def is_enabled() -> bool:
+    """Scheduled self-redeploy is OFF when REDEPLOY_INTERVAL_SECONDS <= 0 (the default)."""
+    try:
+        return float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 0)) > 0
+    except Exception:
+        return False
+
+
 def is_redeploy_pending() -> bool:
     """True once the rolling REDEPLOY_INTERVAL_SECONDS timer has fired and a
     redeploy is due but hasn't been confirmed-triggered yet."""
@@ -78,6 +86,10 @@ async def run_scheduler():
     interval).
     """
     global _pending, _last_scheduled_at
+
+    if not is_enabled():
+        logger.info("REDEPLOY SCHEDULER: disabled (REDEPLOY_INTERVAL_SECONDS<=0) - bot runs continuously")
+        return
 
     while True:
         try:
@@ -236,6 +248,9 @@ async def _watchdog_loop():
     """
     global _last_watchdog_warning_at
 
+    if not is_enabled():
+        return
+
     check_interval_secs = 60
     grace_secs = getattr(config, "REDEPLOY_WATCHDOG_GRACE_MINS", 20) * 60
     warn_repeat_secs = getattr(config, "REDEPLOY_WATCHDOG_REPEAT_MINS", 15) * 60
@@ -284,6 +299,10 @@ def start_restart_scheduler():
     own event loop if called from synchronous code before any loop
     exists. Safe to call exactly once at process startup.
     """
+    if not is_enabled():
+        logger.info("restart_scheduler: DISABLED (REDEPLOY_INTERVAL_SECONDS<=0) - nothing started")
+        return
+
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(run_scheduler())
