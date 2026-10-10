@@ -1,6 +1,11 @@
 """
 bot_engine.py – lean engine: the walk-forward digit predictor is the ONLY strategy.
 
+Runs continuously (no scheduled redeploy). Self-healing is done in-process: the Deriv
+client reconnects forever with backoff, a watchdog re-subscribes / reconnects when a tick
+stream goes quiet, the predictor is re-synced after every reconnect and re-fitted
+periodically, and the whole engine is restarted by main.py if anything fatal escapes.
+
 Replaces the old multi-strategy engine. There are no trading gates here: no kill
 switch, no loss/drawdown/streak limits, no cooldowns, no news filter, no early
 exits (digit contracts run to expiry). Only technical necessities remain:
@@ -12,6 +17,7 @@ contract, flat stake) -> payout/stake >= MIN_PAYOUT_RATIO and p_lower > 1/ratio
 + EDGE_MARGIN -> buy. Anything else = no trade.
 """
 import asyncio
+import collections
 import logging
 import statistics
 import time
@@ -50,6 +56,11 @@ class BotEngine:
         self._lag_obs: List[int] = []
         self._last_decision = "—"
         self.balance = 0.0
+        # ── self-healing state ──
+        self._last_tick_wall: Dict[str, float] = {}
+        self._live: Dict[str, collections.deque] = {}      # recent (epoch, digit) seen live
+        self._seen_conn = 0                                 # client.connection_count we are synced to
+        self._last_forced_reconnect = 0.0
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def run(self):
@@ -67,6 +78,7 @@ class BotEngine:
             return
         self.balance = self.client.balance
         self.client.on_balance(lambda b: setattr(self, "balance", b))
+        self._seen_conn = self._conn_count()
 
         for sym in self.symbols:
             await self._init_symbol(sym)
@@ -74,7 +86,10 @@ class BotEngine:
         tasks = [asyncio.create_task(self._worker(s)) for s in self.symbols]
         tasks += [asyncio.create_task(self._settle_loop()),
                   asyncio.create_task(self._flush_loop()),
-                  asyncio.create_task(self._dashboard_loop())]
+                  asyncio.create_task(self._dashboard_loop()),
+                  asyncio.create_task(self._watchdog_loop()),
+                  asyncio.create_task(self._refit_loop()),
+                  asyncio.create_task(self._supervise_ws(ws_task))]
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -86,28 +101,49 @@ class BotEngine:
 
     # ── warm-up ──────────────────────────────────────────────────────────────
     async def _init_symbol(self, sym: str):
+        self._events[sym] = asyncio.Event()
+        self._live[sym] = collections.deque(maxlen=300)
+        self._last_tick_wall[sym] = time.time()
+        await self._fit_symbol(sym, initial=True)
+        await self.client.subscribe_ticks(sym, lambda tick, s=sym: self._on_tick(s, tick))
+        pr = self.predictors[sym]
+        logger.info("READY %s: decimals=%d horizon=%d tradable contexts=%d",
+                    sym, self._decimals[sym], pr.p.horizon, len(pr.selected))
+
+    async def _fit_symbol(self, sym: str, initial: bool = False) -> bool:
+        """Download recent ticks, re-probe payouts and (re)fit the predictor. Used for the
+        first warm-up and for every later re-sync/refit. On a refit that cannot get enough
+        history the old predictor is kept untouched and False is returned."""
         n = int(_cfg("WARMUP_TICKS", 5000))
         ticks = await self.client.get_tick_history(sym, n)
         if len(ticks) < 500:
             logger.warning("WARM-UP %s: only %d ticks returned", sym, len(ticks))
+        if not initial and len(ticks) < 300:
+            return False
         quotes = [t["quote"] for t in ticks]
-        dec_map = _cfg("DIGIT_DECIMALS", {}) or {}
-        dec = dec_map.get(sym)
-        if dec is None:
-            dec = pred.infer_decimals(quotes) if quotes else 2
-        self._decimals[sym] = int(dec)
+        if sym not in self._decimals:
+            dec_map = _cfg("DIGIT_DECIMALS", {}) or {}
+            dec = dec_map.get(sym)
+            if dec is None:
+                dec = pred.infer_decimals(quotes) if quotes else 2
+            self._decimals[sym] = int(dec)
         digits = pred.digits_from_quotes(quotes, self._decimals[sym])
+        last_ep = ticks[-1]["epoch"] if ticks else None
         self._recent_epochs[sym] = [t["epoch"] for t in ticks[-50:]]
-        self._ratios[sym] = {}
-        pr = pred.Predictor(sym, payout_ratio_fn=lambda c, s=sym: self._ratios.get(s, {}).get(c))
+        pr = self.predictors.get(sym)
+        if pr is None:
+            self._ratios.setdefault(sym, {})
+            pr = pred.Predictor(sym, payout_ratio_fn=lambda c, s=sym: self._ratios.get(s, {}).get(c))
         await self._probe_ratios(sym, pr)
-        pr.fit(digits, last_epoch=ticks[-1]["epoch"] if ticks else None)
+        pr.fit(digits, last_epoch=last_ep)
+        # ticks that arrived live while we were downloading/probing are not in `ticks`: replay them
+        if last_ep is not None:
+            for ep, d in list(self._live.get(sym, ())):
+                if ep > last_ep and pr.on_tick(d, ep):
+                    self._recent_epochs[sym].append(ep)
         pred.register(sym, pr)
         self.predictors[sym] = pr
-        self._events[sym] = asyncio.Event()
-        await self.client.subscribe_ticks(sym, lambda tick, s=sym: self._on_tick(s, tick))
-        logger.info("READY %s: decimals=%d horizon=%d tradable contexts=%d",
-                    sym, self._decimals[sym], pr.p.horizon, len(pr.selected))
+        return True
 
     async def _probe_ratios(self, sym: str, pr: pred.Predictor):
         """Live payout/stake for candidates that could clear the floor, so
@@ -131,19 +167,31 @@ class BotEngine:
             q, ep = float(tick["quote"]), float(tick.get("epoch", time.time()))
         except Exception:
             return
+        self._last_tick_wall[sym] = time.time()
         pr = self.predictors.get(sym)
         if pr is None:
             return
-        if not pr.on_tick(pred.last_digit(q, self._decimals[sym]), ep):
+        digit = pred.last_digit(q, self._decimals[sym])
+        if not pr.on_tick(digit, ep):
             return
+        self._live[sym].append((ep, digit))
         self._last_epoch[sym] = ep
         eps = self._recent_epochs.setdefault(sym, [])
         eps.append(ep)
         del eps[:-50]
         self._events[sym].set()
 
+    def _conn_count(self) -> int:
+        return int(getattr(self.client, "connection_count", 0))
+
+    def _needs_resync(self) -> bool:
+        """True after a (re)connect until the predictor has been re-synced: ticks may have
+        been missed, so the digit context would be wrong."""
+        return self._conn_count() != self._seen_conn
+
     def _blocked(self) -> bool:
-        return restart_scheduler.is_redeploy_pending() or time.time() < self._halted_until
+        return (restart_scheduler.is_redeploy_pending() or time.time() < self._halted_until
+                or not self.client.is_connected or self._needs_resync())
 
     # ── trading ──────────────────────────────────────────────────────────────
     async def _worker(self, sym: str):
@@ -231,6 +279,81 @@ class BotEngine:
             except Exception as exc:
                 logger.warning("subscribe_contract(%s) failed (settle loop will poll): %s", cid, exc)
             return
+
+    # ── self-healing ─────────────────────────────────────────────────────────
+    async def _supervise_ws(self, ws_task: "asyncio.Task"):
+        """connect() is meant to run forever. If it ever ends, raise so main.py rebuilds the
+        whole engine instead of leaving a zombie that is 'running' but never trades."""
+        await ws_task
+        raise RuntimeError("Deriv WebSocket task ended unexpectedly")
+
+    async def _watchdog_loop(self):
+        """Tick streams can die silently while the socket (and its pings) look fine."""
+        stale = float(_cfg("STALE_TICK_SECONDS", 30))
+        min_gap = float(_cfg("FORCE_RECONNECT_MIN_GAP", 90))
+        strikes = {s: 0 for s in self.symbols}
+        grace_until = {s: 0.0 for s in self.symbols}
+        while True:
+            await asyncio.sleep(5)
+            now = time.time()
+            if not self.client.is_connected:
+                for s in self.symbols:                       # downtime is not "stale"
+                    self._last_tick_wall[s] = now
+                    strikes[s] = 0
+                continue
+            for sym in self.symbols:
+                quiet = now - self._last_tick_wall.get(sym, now)
+                if quiet < stale:                            # a real tick arrived: healthy
+                    strikes[sym] = 0
+                    continue
+                if now < grace_until[sym]:                   # give the last fix time to work
+                    continue
+                try:
+                    if strikes[sym] == 0:
+                        logger.warning("WATCHDOG %s: no tick for %.0fs - re-subscribing", sym, quiet)
+                        strikes[sym] = 1
+                        grace_until[sym] = now + stale
+                        await self.client.refresh_ticks(sym, lambda tick, s=sym: self._on_tick(s, tick))
+                    elif now - self._last_forced_reconnect >= min_gap:
+                        logger.warning("WATCHDOG %s: still no tick after re-subscribe - reconnecting", sym)
+                        self._last_forced_reconnect = now
+                        strikes[sym] = 0
+                        grace_until[sym] = now + stale
+                        await self.client.force_reconnect(f"no ticks for {sym}")
+                except Exception as exc:
+                    logger.error("watchdog error %s: %s", sym, exc)
+
+    async def _refit_loop(self):
+        """Replaces what the periodic redeploy did implicitly: fresh history, fresh payout
+        probe, fresh selection - plus an immediate re-sync after any reconnect."""
+        interval = float(_cfg("REFIT_INTERVAL_SECONDS", 300))
+        last = time.time()
+        while True:
+            await asyncio.sleep(5)
+            if not self.client.is_connected:
+                continue
+            resync = self._needs_resync()
+            if not resync and not (interval > 0 and time.time() - last >= interval):
+                continue
+            conn_now = self._conn_count()
+            ok_all = True
+            for sym in self.symbols:
+                try:
+                    ok = await self._fit_symbol(sym)
+                    ok_all = ok_all and ok
+                    if ok:
+                        pr = self.predictors[sym]
+                        logger.info("%s %s: tradable contexts=%d",
+                                    "RESYNC" if resync else "REFIT", sym, len(pr.selected))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    ok_all = False
+                    logger.error("refit error %s: %s", sym, exc)
+            if ok_all:
+                if resync and self._conn_count() == conn_now:
+                    self._seen_conn = conn_now
+                last = time.time()
 
     # ── settlement ───────────────────────────────────────────────────────────
     async def _on_contract_result(self, cid: str, msg: dict):
