@@ -150,7 +150,32 @@ RISE_FALL_SYMBOLS = [
 # signal_engine.py checks `if symbol in config.DIGIT_SYMBOLS`; empty means
 # that branch is always skipped.
 # Digit predictor (the ONLY strategy) — comma separated env override.
-PREDICTOR_SYMBOLS = [s.strip() for s in os.environ.get("PREDICTOR_SYMBOLS", "R_100").split(",") if s.strip()]
+# Accepts a comma list, e.g. "R_100,R_75,1HZ100V", or the shortcut ALL_VOLATILITY (all ten
+# Volatility indices). Step Index (stpRNG*), Boom and Crash are always dropped; override the
+# filter with PREDICTOR_SYMBOL_BLOCKLIST (comma separated, case-insensitive prefixes).
+_VOLATILITY_ALL = ["R_10", "R_25", "R_50", "R_75", "R_100",
+                   "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
+_DEFAULT_BLOCK  = "stpRNG,STEP,BOOM,CRASH"
+
+
+def _parse_symbols(raw: str):
+    block = tuple(b.strip().upper() for b in
+                  os.environ.get("PREDICTOR_SYMBOL_BLOCKLIST", _DEFAULT_BLOCK).split(",") if b.strip())
+    wanted = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        wanted += _VOLATILITY_ALL if tok.upper() in ("ALL_VOLATILITY", "VOLATILITY", "ALL") else [tok]
+    out = []
+    for sym in wanted:
+        if any(sym.upper().startswith(b) for b in block) or sym in out:
+            continue
+        out.append(sym)
+    return out or ["R_100"]
+
+
+PREDICTOR_SYMBOLS = _parse_symbols(os.environ.get("PREDICTOR_SYMBOLS", "R_100"))
 # signal_engine routes these symbols to predictor.py
 DIGIT_SYMBOLS = list(PREDICTOR_SYMBOLS)
 
@@ -1610,7 +1635,12 @@ RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # PREDICTOR_SYMBOLS is defined next to DIGIT_SYMBOLS above.
 PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 1000.0)     # flat stake per trade
-MIN_PAYOUT_RATIO         = _env_f("MIN_PAYOUT_RATIO", 1.8)       # payout/stake floor (live proposal)
+# Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
+# MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
+# OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
+# expectation, versus ~4.8% for OVER5/UNDER4 and ~6.3% for OVER6/UNDER3. 0 = no ceiling.
+MIN_PAYOUT_RATIO         = _env_f("MIN_PAYOUT_RATIO", 2.0)
+MAX_PAYOUT_RATIO         = _env_f("MAX_PAYOUT_RATIO", 2.5)
 EDGE_MARGIN              = _env_f("EDGE_MARGIN", 0.01)
 WILSON_Z                 = _env_f("WILSON_Z", 2.0)
 MIN_CONTEXT_SAMPLES      = _env_i("MIN_CONTEXT_SAMPLES", 300)
@@ -1652,3 +1682,14 @@ TICK_HISTORY_PAGE_SIZE        = _env_i("TICK_HISTORY_PAGE_SIZE", 1000)
 STATS_PERSIST_TO_RENDER       = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
     "1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0").strip().lower() in ("1", "true", "yes", "on")
+
+# ─── Session risk controls ("secure the wins") ────────────────────────────────
+# All amounts are in multiples of PREDICTOR_STAKE so they scale with your stake.
+# Session P&L = sum of settled trades since the session started. When a limit trips the bot
+# stops opening trades for RISK_PAUSE_SECONDS, then starts a fresh session (0 = stay stopped
+# until the service restarts). Set a value to 0 to disable that rule.
+SESSION_TAKE_PROFIT_STAKES    = _env_f("SESSION_TAKE_PROFIT_STAKES", 10)   # bank the session at +10 stakes
+SESSION_STOP_LOSS_STAKES      = _env_f("SESSION_STOP_LOSS_STAKES", 20)     # cut it at -20 stakes
+TRAILING_LOCK_START_STAKES    = _env_f("TRAILING_LOCK_START_STAKES", 5)    # trailing lock arms at +5 stakes peak
+TRAILING_GIVEBACK_STAKES      = _env_f("TRAILING_GIVEBACK_STAKES", 3)      # ...and trips if P&L falls 3 stakes below peak
+RISK_PAUSE_SECONDS            = _env_f("RISK_PAUSE_SECONDS", 900)
