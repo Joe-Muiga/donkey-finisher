@@ -1635,11 +1635,6 @@ RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # PREDICTOR_SYMBOLS is defined next to DIGIT_SYMBOLS above.
 PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 1000.0)     # flat stake per trade
-# TARGET ACCOUNT BALANCE (set on Render). The moment the account balance is >= this value the bot
-# stops trading and permanently disconnects from Deriv, whatever contracts are still open (they
-# settle on Deriv's side; the bot just stops watching). 0 = disabled. Must be ABOVE the current
-# balance, otherwise the bot shuts down as soon as it connects. Remove/zero it to trade again.
-PREDICTOR_TARGET         = _env_f("PREDICTOR_TARGET", 0.0)
 # Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
 # OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
@@ -1660,29 +1655,6 @@ PREDICTOR_ENTRY_DELAY_TICKS = _env_i("PREDICTOR_ENTRY_DELAY_TICKS", 0)
 PREDICTOR_BARRIERS       = _env_tuple("PREDICTOR_BARRIERS", tuple(range(10)))
 PREDICTOR_ALPHA          = _env_f("PREDICTOR_ALPHA", 0.05)       # family-wise, Bonferroni-corrected
 PREDICTOR_PAYOUT_FACTOR  = _env_f("PREDICTOR_PAYOUT_FACTOR", 0.975)  # fallback payout estimate only
-# ── Signal-quality gates (all env-overridable) ──────────────────────────────
-# CONFIRM_Z: the held-out 20% must beat break-even by this many standard errors (was: just > 0).
-CONFIRM_Z                = _env_f("CONFIRM_Z", 1.0)
-# FORWARD GATE: a context that fit() selects may only trade after it has WON ON FRESH TICKS that
-# arrived after selection (see predictor.py docstring). On simulated fair digits the old gates
-# produced false trading episodes in ~48% of symbol-days; with this gate: none in 500 symbol-days.
-#   FORWARD_SAMPLES   occurrences per validation block (a context recurs ~every 10 ticks for k=1)
-#   FORWARD_START_Z   bar for the first block (z vs break-even; 2.5 = 0.6% false pass per selection)
-#   FORWARD_KEEP_Z    bar for every later block of an approved context
-#   FORWARD_EARLY_REVOKE_Z / _MIN  revoke immediately if the running block is this far below break-even
-#   FORWARD_COOLDOWN_TICKS  rejected/revoked context waits this many ticks, then re-enters probation
-# Set FORWARD_GATE_ENABLED=0 to restore the previous behaviour exactly.
-FORWARD_GATE_ENABLED     = _env_i("FORWARD_GATE_ENABLED", 1) == 1
-FORWARD_SAMPLES          = _env_i("FORWARD_SAMPLES", 250)
-FORWARD_START_Z          = _env_f("FORWARD_START_Z", 2.5)
-FORWARD_KEEP_Z           = _env_f("FORWARD_KEEP_Z", 1.0)
-FORWARD_EARLY_REVOKE_Z   = _env_f("FORWARD_EARLY_REVOKE_Z", 1.5)
-FORWARD_EARLY_MIN        = _env_i("FORWARD_EARLY_MIN", 60)
-FORWARD_COOLDOWN_TICKS   = _env_i("FORWARD_COOLDOWN_TICKS", 3000)
-# At boot the forward ledger is built by REPLAYING this many ticks of history through the same
-# fit -> refit -> next-tick loop the live bot runs (each selection judged only on later ticks), so
-# trading can start immediately instead of after ~40 min of shadowing. 0 = shadow live only.
-FORWARD_BACKFILL_TICKS   = _env_i("FORWARD_BACKFILL_TICKS", 20000)
 PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates priced per tick
 PREDICTOR_STATS_FLUSH_SECONDS = _env_f("PREDICTOR_STATS_FLUSH_SECONDS", 30)
 MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
