@@ -212,6 +212,9 @@ class DerivClient:
         # ticks may have been missed and re-sync its predictor.
         self._conn_count: int = 0
 
+        # Set by shutdown(): connect() stops reconnecting and returns (PREDICTOR_TARGET reached).
+        self._shutdown: bool = False
+
         # ── Rate limiting ─────────────────────────────────────────────────────
         self._buy_semaphore  = asyncio.Semaphore(1)  # one at a time
         self._last_buy_time  = 0.0                   # epoch of last buy attempt
@@ -353,6 +356,8 @@ class DerivClient:
         connected_at = 0.0
 
         while True:
+            if self._shutdown:
+                return
             connected_at = 0.0
             attempt_start = attempt
             try:
@@ -437,6 +442,10 @@ class DerivClient:
                         _fut.set_exception(ConnectionError("WebSocket disconnected"))
                 self._pending.clear()
 
+            if self._shutdown:
+                logger.warning("DERIV DISCONNECTED on purpose (shutdown requested) - not reconnecting")
+                return
+
             # A connection that stayed up for a while counts as healthy -> reset backoff.
             # One that died within seconds keeps backing off (avoids hammering OTP/REST).
             if connected_at and time.monotonic() - connected_at >= 30:
@@ -455,6 +464,20 @@ class DerivClient:
             delay = min(MAX_RETRY_DELAY, reconnect_interval * (2 ** min(max(attempt - 1, 0), 5)))
             logger.info(f"Reconnecting in {delay:.0f}s (backoff step {attempt})")
             await asyncio.sleep(delay)
+
+    async def shutdown(self, reason: str = "") -> None:
+        """Permanently disconnect from Deriv: close the socket and never reconnect.
+        Open contracts are NOT cancelled - they keep running and settle on Deriv's side."""
+        self._shutdown = True
+        logger.warning(f"DERIV SHUTDOWN{': ' + reason if reason else ''} - closing WebSocket for good")
+        ws = self._ws
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception as exc:
+                logger.debug(f"shutdown close error: {exc}")
+        self._connected = False
+        self._authorized = False
 
     async def force_reconnect(self, reason: str = "") -> None:
         """Close the current socket; connect()'s loop then re-establishes it from scratch
@@ -567,6 +590,8 @@ class DerivClient:
         """
         while True:
             await asyncio.sleep(_CONTRACT_POLL_INTERVAL)
+            if self._shutdown:
+                return
             # Task 2 observability requirement — cheap, always logged
             # (regardless of whether there's anything to poll) so tracking-
             # set sizes are visible on a predictable cadence rather than
