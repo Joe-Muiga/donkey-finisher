@@ -35,7 +35,6 @@ import logging
 import requests
 from flask import Flask, jsonify, Response, request
 import config
-import kill_switch
 
 try:
     from strategy_stats import stats as _strategy_stats
@@ -67,7 +66,6 @@ _state: dict = {
     "balance_history":       [],
     "suspended_symbols":     [],
     "paused_for_loss_limit": False,
-    "kill_switch":           kill_switch.is_paused(),
     "current_symbol":        "—",
     "uptime_seconds":        0,
     "start_time":            time.time(),
@@ -662,43 +660,9 @@ def _render_dashboard() -> str:
                 '</div>'
             )
 
-        # ── Kill switch (one-tap pause) ───────────────────────────────────────
-        _ks = kill_switch.snapshot()
-        if _ks["paused"]:
-            _ks_btn = ('<button class="ks-btn ks-resume" onclick="ksToggle(false)">'
-                       '▶ TRADING PAUSED — tap to RESUME</button>')
-        else:
-            _ks_btn = ('<button class="ks-btn ks-pause" onclick="ksToggle(true)">'
-                       '⛔ KILL SWITCH — tap to PAUSE trading</button>')
-        _ks_note = ""
-        if not _ks["persists"]:
-            _ks_note = ('<div class="ks-note">Heads-up: RENDER_API_KEY is not set, so this '
-                        'switch resets to ON-trading after the next redeploy.</div>')
-        ks_html = (
-            '<div class="ks-wrap">' + _ks_btn + _ks_note + '</div>'
-            '<script>'
-            'async function ksToggle(p){'
-            'var pin=localStorage.getItem("ks_pin")||"";'
-            'if(!pin){pin=prompt("Enter PIN (last 6 characters of your Deriv API token):")||"";'
-            'if(!pin)return;}'
-            'if(!p&&!confirm("Resume trading?"))return;'
-            'try{var r=await fetch("/kill-switch",{method:"POST",'
-            'headers:{"Content-Type":"application/json"},'
-            'body:JSON.stringify({paused:p,pin:pin})});'
-            'if(r.status===403){localStorage.removeItem("ks_pin");alert("Wrong PIN");return;}'
-            'if(r.status===429){alert("Too many wrong PINs — wait a minute");return;}'
-            'if(!r.ok){alert("Failed: HTTP "+r.status);return;}'
-            'localStorage.setItem("ks_pin",pin);location.reload();'
-            '}catch(e){alert("Network error: "+e);}}'
-            '</script>'
-        )
-        if _ks["paused"]:
-            paused_banner += (
-                '<div class="paused-banner">'
-                '⛔ Kill switch ENGAGED — no new trades. Open contracts settle normally.'
-                '</div>'
-            )
-            dot_class = "dot-yellow"
+        # ── Link to the predictor minute-of-hour panel (replaces the old widgets) ──
+        ks_html = ('<div style="margin:0 0 16px 0"><a href="/predictor" style="color:var(--blue,#58a6ff);'
+                   'font-weight:700">Predictor · minute-of-hour stats &rarr;</a></div>')
 
         # ── SVG charts ────────────────────────────────────────────────────────
         svg_balance = _build_svg_chart(
@@ -1303,32 +1267,49 @@ def index():
     return Response(_render_dashboard(), mimetype="text/html")
 
 
-_ks_fail: dict = {}   # ip -> (count, window_start) — tiny PIN brute-force limiter
+import hmac as _hmac
+
+_pin_fail: dict = {}   # ip -> (count, window_start) — tiny PIN brute-force limiter
 
 
-@app.route("/kill-switch", methods=["GET"])
-def kill_switch_status():
-    return jsonify(kill_switch.snapshot())
+def _expected_pin() -> str:
+    pin = (os.environ.get("DASHBOARD_PIN") or "").strip()
+    if pin:
+        return pin
+    tok = (getattr(config, "DERIV_API_TOKEN", "") or "").strip()
+    return tok[-6:] if tok else ""
 
 
-@app.route("/kill-switch", methods=["POST"])
-def kill_switch_set():
+def _check_pin(supplied: str) -> bool:
+    want = _expected_pin()
+    if not want:
+        return True
+    return _hmac.compare_digest(str(supplied or "").strip().encode(), want.encode())
+
+
+@app.route("/predictor")
+def predictor_page():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    with open(path, encoding="utf-8") as f:
+        return Response(f.read(), mimetype="text/html")
+
+
+@app.route("/api/predictor_stats")
+def predictor_stats_api():
     ip  = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
     now = time.time()
-    cnt, since = _ks_fail.get(ip, (0, now))
+    cnt, since = _pin_fail.get(ip, (0, now))
     if now - since > 60:
         cnt, since = 0, now
     if cnt >= 5:
         return jsonify({"error": "too many attempts"}), 429
-    body = request.get_json(silent=True) or {}
-    if not kill_switch.check_pin(body.get("pin", "")):
-        _ks_fail[ip] = (cnt + 1, since)
+    pin = request.headers.get("X-Pin") or request.args.get("pin", "")
+    if not _check_pin(pin):
+        _pin_fail[ip] = (cnt + 1, since)
         return jsonify({"error": "bad pin"}), 403
-    _ks_fail.pop(ip, None)
-    if "paused" not in body:
-        return jsonify({"error": "missing 'paused'"}), 400
-    kill_switch.set_paused(bool(body["paused"]), source="dashboard")
-    return jsonify(kill_switch.snapshot())
+    _pin_fail.pop(ip, None)
+    import predictor_stats
+    return jsonify(predictor_stats.analyze(predictor_stats.get_stats().snapshot()))
 
 
 @app.route("/health")
@@ -1369,7 +1350,6 @@ def stats_route():
         "streak":             int(s.get("streak", 0)),
         "streak_label":       str(s.get("streak_label", "—")),
         "paused":             bool(s.get("paused_for_loss_limit", False)),
-        "kill_switch":        kill_switch.is_paused(),
         "current_symbol":     str(s.get("current_symbol", "—")),
         "session":            str(s.get("session", "—")),
         "uptime_seconds":     int(s.get("uptime_seconds", 0)),
