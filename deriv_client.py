@@ -770,6 +770,10 @@ class DerivClient:
         single source of truth for "which symbols the bot currently wants
         live ticks for") rather than the stale sub_id map.
         """
+        if self._conn_count <= 1:
+            # First connection ever: any existing subscription was made on THIS socket
+            # already (e.g. the engine subscribed while a slow balance reply delayed us here).
+            return
         symbols = list(self._tick_callbacks.keys())
         self._subscription_map.clear()
         if not symbols:
@@ -916,7 +920,9 @@ class DerivClient:
 
     async def _subscribe_balance(self):
         try:
-            await self._send({"balance": 1, "subscribe": 1})
+            # Short timeout: this runs inside the connect sequence, so a lost reply must not
+            # hold up the tick/contract re-subscriptions behind it for 30 s.
+            await self._send({"balance": 1, "subscribe": 1}, timeout=10)
             logger.info("Balance subscription active ✓")
         except Exception as exc:
             logger.warning(
