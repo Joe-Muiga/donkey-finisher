@@ -159,8 +159,8 @@ _BOOM_CRASH_PREFIXES = ("BOOM", "CRASH")
 _VOLATILITY_PREFIXES = ("R_", "1HZ")
 
 # ── Reconnect defaults (overridden by config if present) ──────────────────────
-_DEFAULT_RECONNECT_INTERVAL = 5   # seconds between retries
-_DEFAULT_MAX_RECONNECTS     = 10  # 0 = unlimited
+_DEFAULT_RECONNECT_INTERVAL = 3   # base seconds between retries (exponential backoff, cap MAX_RETRY_DELAY)
+_DEFAULT_MAX_RECONNECTS     = 0   # 0 = unlimited: never give up reconnecting
 
 # Contract polling interval in seconds
 _CONTRACT_POLL_INTERVAL = 30
@@ -208,6 +208,10 @@ class DerivClient:
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # Incremented on every successful (re)connect so the engine can tell that
+        # ticks may have been missed and re-sync its predictor.
+        self._conn_count: int = 0
+
         # ── Rate limiting ─────────────────────────────────────────────────────
         self._buy_semaphore  = asyncio.Semaphore(1)  # one at a time
         self._last_buy_time  = 0.0                   # epoch of last buy attempt
@@ -254,7 +258,8 @@ class DerivClient:
             "Authorization": f"Bearer {token}",
         }
 
-        async with aiohttp.ClientSession() as session:
+        # Hard timeout: without it a stalled REST call can hang the reconnect loop for minutes.
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
             # Step 1 — list accounts
             async with session.get(
                 f"{_OPTIONS_API_BASE}/accounts", headers=headers
@@ -345,8 +350,11 @@ class DerivClient:
         )
         attempt   = 0
         max_label = str(max_reconnects) if max_reconnects > 0 else "∞"
+        connected_at = 0.0
 
         while True:
+            connected_at = 0.0
+            attempt_start = attempt
             try:
                 ws_url = await self._fetch_otp_ws_url()
                 logger.info(f"Connecting to {self._mask_otp(ws_url)} …")
@@ -358,7 +366,8 @@ class DerivClient:
                 ) as ws:
                     self._ws        = ws
                     self._connected = True
-                    attempt         = 0          # reset on successful connection
+                    connected_at    = time.monotonic()
+                    self._conn_count += 1
                     logger.info("WebSocket connected ✓")
 
                     # The OTP embedded in ws_url already authenticated this
@@ -422,7 +431,18 @@ class DerivClient:
                 self._connected  = False
                 self._authorized = False
                 self._ws         = None
+                # Fail in-flight requests immediately instead of leaving them to time out.
+                for _fut in list(self._pending.values()):
+                    if not _fut.done():
+                        _fut.set_exception(ConnectionError("WebSocket disconnected"))
                 self._pending.clear()
+
+            # A connection that stayed up for a while counts as healthy -> reset backoff.
+            # One that died within seconds keeps backing off (avoids hammering OTP/REST).
+            if connected_at and time.monotonic() - connected_at >= 30:
+                attempt = 0
+            elif connected_at and attempt == attempt_start:
+                attempt += 1      # short-lived clean close: still back off a little
 
             if max_reconnects > 0 and attempt >= max_reconnects:
                 logger.critical(
@@ -432,7 +452,24 @@ class DerivClient:
                     f"WebSocket failed after {max_reconnects} reconnect attempts."
                 )
 
-            await asyncio.sleep(reconnect_interval)
+            delay = min(MAX_RETRY_DELAY, reconnect_interval * (2 ** min(max(attempt - 1, 0), 5)))
+            logger.info(f"Reconnecting in {delay:.0f}s (backoff step {attempt})")
+            await asyncio.sleep(delay)
+
+    async def force_reconnect(self, reason: str = "") -> None:
+        """Close the current socket; connect()'s loop then re-establishes it from scratch
+        (fresh OTP, balance, contract and tick subscriptions)."""
+        ws = self._ws
+        logger.warning(f"FORCE RECONNECT requested{': ' + reason if reason else ''}")
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception as exc:
+                logger.debug(f"force_reconnect close error: {exc}")
+
+    @property
+    def connection_count(self) -> int:
+        return self._conn_count
 
     # ─── Message dispatch ─────────────────────────────────────────────────────
 
@@ -833,7 +870,11 @@ class DerivClient:
         fut = self._loop.create_future()
         self._pending[req_id] = fut
 
-        await self._ws.send(json.dumps(payload))
+        try:
+            await self._ws.send(json.dumps(payload))
+        except Exception:
+            self._pending.pop(req_id, None)
+            raise
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -1002,19 +1043,47 @@ class DerivClient:
     # ─── Historical ticks (digit predictor warm-up) ───────────────────────────
 
     async def get_tick_history(self, symbol: str, count: int = 5000) -> List[dict]:
-        """Latest `count` ticks (max 5000) as [{"epoch": int, "quote": float}], oldest first.
-        Returns [] on failure."""
+        """Latest `count` ticks as [{"epoch": int, "quote": float}], oldest first.
+        Deriv returns only ~1000 ticks per call, so older pages are fetched backwards
+        (end = oldest epoch - 1) until `count` is reached or no more come back.
+        Returns [] if even the first page fails; a failed older page just ends paging."""
         await self._ready.wait()
-        try:
-            resp = await self._send(
-                {"ticks_history": symbol, "adjust_start_time": 1, "count": int(count),
-                 "end": "latest", "style": "ticks"}, timeout=30)
+        page = max(100, int(getattr(config, "TICK_HISTORY_PAGE_SIZE", 1000)))
+        want = int(count)
+        by_epoch: Dict[int, float] = {}
+        end: Any = "latest"
+        for page_no in range(max(2, -(-want // page) + 2)):
+            req = {"ticks_history": symbol, "count": min(page, max(want - len(by_epoch), 1)),
+                   "end": end, "style": "ticks"}
+            if page_no == 0:
+                req["adjust_start_time"] = 1
+            try:
+                resp = await self._send(req, timeout=30)
+            except Exception as exc:
+                logger.warning(f"TICK HISTORY FAILED: {symbol} page={page_no} count={count} | error={exc}")
+                break
             h = resp.get("history", {}) or {}
-            return [{"epoch": int(t), "quote": float(p)}
-                    for t, p in zip(h.get("times", []), h.get("prices", []))]
-        except Exception as exc:
-            logger.warning(f"TICK HISTORY FAILED: {symbol} count={count} | error={exc}")
-            return []
+            before = len(by_epoch)
+            for t, p in zip(h.get("times", []), h.get("prices", [])):
+                by_epoch[int(t)] = float(p)
+            if len(by_epoch) >= want or len(by_epoch) == before:
+                break
+            end = min(by_epoch) - 1
+        ordered = sorted(by_epoch.items())[-want:]
+        return [{"epoch": e, "quote": q} for e, q in ordered]
+
+    async def refresh_ticks(self, symbol: str, callback: Callable[[dict], None]) -> bool:
+        """Drop and re-create one live tick subscription (used when a stream goes quiet
+        while the socket itself still looks healthy). Returns True on success."""
+        old = self._subscription_map.pop(symbol, None)
+        if old:
+            try:
+                await self._send({"forget": old}, timeout=10)
+            except Exception as exc:
+                logger.debug(f"forget({old}) failed: {exc}")
+        self._tick_callbacks.pop(symbol, None)
+        sub_id = await self.subscribe_ticks(symbol, callback)
+        return bool(sub_id)
 
     # ─── Live tick subscription ───────────────────────────────────────────────
 
