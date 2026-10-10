@@ -1216,7 +1216,10 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_SECONDS = float(os.environ.get("REDEPLOY_INTERVAL_SECONDS", "150"))
+# 0 (default) = scheduled self-redeploy DISABLED: the bot runs continuously and heals
+# itself in-process (reconnect, stale-tick watchdog, periodic refit). Set a positive
+# number of seconds only if you really want the old rolling redeploy back.
+REDEPLOY_INTERVAL_SECONDS = float(os.environ.get("REDEPLOY_INTERVAL_SECONDS", "0"))
 REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0   # legacy derived value; hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
@@ -1628,3 +1631,24 @@ MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
 WINDOW_MINUTES           = _env_i("WINDOW_MINUTES", 10)
 REDEPLOY_DRAIN_MAX_SECONDS = _env_f("REDEPLOY_DRAIN_MAX_SECONDS", 60)
 REDEPLOY_HALT_MAX_SECONDS  = _env_f("REDEPLOY_HALT_MAX_SECONDS", 600)
+
+# ─── Continuous-running / self-healing (replaces the rolling redeploy) ────────
+# Reconnect forever (0 = unlimited) with exponential backoff capped at 60 s.
+WEBSOCKET_MAX_RECONNECTS      = _env_i("WEBSOCKET_MAX_RECONNECTS", 0)
+WEBSOCKET_RECONNECT_INTERVAL  = _env_f("WEBSOCKET_RECONNECT_INTERVAL", 3)
+# No tick for this long on a symbol -> re-subscribe; still nothing after another
+# window -> drop the WebSocket and reconnect.
+STALE_TICK_SECONDS            = _env_f("STALE_TICK_SECONDS", 30)
+FORCE_RECONNECT_MIN_GAP       = _env_f("FORCE_RECONNECT_MIN_GAP", 90)
+# Re-download recent ticks, re-probe payouts and re-fit the predictor in-process
+# (this is what the old redeploy did implicitly by rebooting). Also runs right after
+# any reconnect, because ticks may have been missed.
+REFIT_INTERVAL_SECONDS        = _env_f("REFIT_INTERVAL_SECONDS", 300)
+# Deriv returns at most ~1000 ticks per ticks_history call; page backwards up to
+# WARMUP_TICKS in total.
+TICK_HISTORY_PAGE_SIZE        = _env_i("TICK_HISTORY_PAGE_SIZE", 1000)
+# Persisting stats into a Render env var makes Render treat it as a config change
+# (it can restart the service). Only needed when self-redeploying; off otherwise.
+STATS_PERSIST_TO_RENDER       = os.environ.get(
+    "STATS_PERSIST_TO_RENDER",
+    "1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0").strip().lower() in ("1", "true", "yes", "on")
