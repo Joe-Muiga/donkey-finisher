@@ -61,10 +61,12 @@ class MinuteStats:
                     logger.info(f"PREDICTOR STATS loaded: {d['t'][0]} trades")
             except Exception as exc:
                 logger.error(f"PREDICTOR STATS: could not parse stored stats: {exc}")
-        if not env_persist.configured() and not self._warned:
+        if not (getattr(config, "STATS_PERSIST_TO_RENDER", False) and env_persist.configured()) \
+                and not self._warned:
             self._warned = True
-            logger.warning("RENDER_API_KEY/RENDER_SERVICE_ID missing: predictor stats are saved to a "
-                           "local file only and WILL BE LOST on every redeploy.")
+            logger.info("Predictor stats are kept in memory + a local file only (no Render env-var "
+                        "writes, so the service is never restarted by stats saves). They reset if "
+                        "Render restarts the instance.")
 
     def serialize(self) -> str:
         with self._lock:
@@ -85,8 +87,11 @@ class MinuteStats:
             return True
         payload = self.serialize()
         self._write_local(payload)
-        ok = await env_persist.put_env_vars_async({ENV_KEY: payload}) if env_persist.configured() else True
-        if not env_persist.configured():
+        persist = bool(getattr(config, "STATS_PERSIST_TO_RENDER", False)) and env_persist.configured()
+        # Writing a Render env var counts as a config change on Render and can restart the
+        # service, so it is only done when the scheduled self-redeploy is in use.
+        ok = await env_persist.put_env_vars_async({ENV_KEY: payload}) if persist else True
+        if not persist:
             os.environ[ENV_KEY] = payload
         self._last_flush = now
         if ok:
