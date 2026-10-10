@@ -61,6 +61,10 @@ class BotEngine:
         self._live: Dict[str, collections.deque] = {}      # recent (epoch, digit) seen live
         self._seen_conn = 0                                 # client.connection_count we are synced to
         self._last_forced_reconnect = 0.0
+        # Deriv sometimes answers a buy-by-proposal-id with "Unknown contract proposal".
+        # After the first such failure we buy with the contract parameters directly
+        # (buy="1" + parameters), which does not depend on a proposal id at all.
+        self._direct_buy = False
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def run(self):
@@ -211,12 +215,22 @@ class BotEngine:
             finally:
                 self._busy.discard(sym)
 
-    async def _propose(self, sym: str, cand: pred.Candidate, stake: float) -> Optional[dict]:
-        req = {"proposal": 1, "amount": stake, "basis": "stake",
-               "contract_type": pred.contract_type(cand), "currency": "USD",
-               "duration": self.duration, "duration_unit": "t", "underlying_symbol": sym}
+    def _contract_params(self, sym: str, cand: pred.Candidate, stake: float) -> dict:
+        p = {"amount": stake, "basis": "stake",
+             "contract_type": pred.contract_type(cand), "currency": "USD",
+             "duration": int(self.duration), "duration_unit": "t", "underlying_symbol": sym}
         if cand[1] is not None:
-            req["barrier"] = str(cand[1])
+            p["barrier"] = str(cand[1])
+        return p
+
+    async def _buy_direct(self, sym: str, cand: pred.Candidate, price: float) -> dict:
+        """Buy without a proposal id: {"buy": "1", "price": max_price, "parameters": {...}}."""
+        return await self.client._send(
+            {"buy": "1", "price": price, "parameters": self._contract_params(sym, cand, self.stake)},
+            timeout=10)
+
+    async def _propose(self, sym: str, cand: pred.Candidate, stake: float) -> Optional[dict]:
+        req = {"proposal": 1, **self._contract_params(sym, cand, stake)}
         try:
             resp = await self.client._send(req, timeout=10)
             return resp.get("proposal") or None
@@ -255,7 +269,19 @@ class BotEngine:
                 return
             ask = float(prop.get("ask_price") or self.stake)
             try:
-                resp = await self.client._send({"buy": prop["id"], "price": ask}, timeout=10)
+                if self._direct_buy:
+                    resp = await self._buy_direct(sym, pk.cand, ask)
+                else:
+                    try:
+                        resp = await self.client._send({"buy": prop["id"], "price": ask}, timeout=10)
+                    except Exception as exc:
+                        if "InvalidContractProposal" not in str(exc) and "Unknown contract proposal" not in str(exc):
+                            raise
+                        logger.warning("Buy by proposal id was refused (%s) - retrying with a direct buy "
+                                       "(buy=1 + parameters)", str(exc)[:120])
+                        resp = await self._buy_direct(sym, pk.cand, ask)
+                        self._direct_buy = True
+                        logger.info("Direct buy worked - using it for all further trades")
             except Exception as exc:
                 await self._on_api_error("buy", exc)        # error handling, not a gate
                 return
