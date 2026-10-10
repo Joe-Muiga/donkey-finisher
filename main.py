@@ -5,9 +5,9 @@ main.py – entry point (Render web service).
   • bot-engine   : asyncio thread running the digit predictor. Starts on EVERY boot
                    and is restarted if it crashes – there is no cycle, cooldown or idle phase.
   • keep-alive   : self-ping of /health.
-  • restart sched: every REDEPLOY_INTERVAL_SECONDS (default 150) sets the "redeploy
-                   pending" flag; bot_engine stops opening trades, drains open
-                   contracts, flushes stats and triggers the Render redeploy.
+  • restart sched: OFF by default (REDEPLOY_INTERVAL_SECONDS=0). If set > 0 it sets the
+                   "redeploy pending" flag every N seconds; bot_engine then stops opening
+                   trades, drains open contracts, flushes stats and triggers a Render redeploy.
 
 Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (redeploy + stats persistence),
 optional DERIV_APP_ID, DERIV_ACCOUNT_MODE ("demo" default / "real" picks which
@@ -54,7 +54,10 @@ if __name__ == "__main__":
     logger.info(f"  Deriv App ID : {config.DERIV_APP_ID}")
     logger.info(f"  API token    : {'SET ✓' if config.DERIV_API_TOKEN else 'MISSING ✗'}")
     logger.info(f"  Symbols      : {config.PREDICTOR_SYMBOLS}  stake={config.PREDICTOR_STAKE}")
-    logger.info(f"  Redeploy     : every {config.REDEPLOY_INTERVAL_SECONDS:.0f}s")
+    if config.REDEPLOY_INTERVAL_SECONDS > 0:
+        logger.info(f"  Redeploy     : every {config.REDEPLOY_INTERVAL_SECONDS:.0f}s")
+    else:
+        logger.info("  Redeploy     : DISABLED (continuous run, in-process self-healing)")
     logger.info(f"  Port         : {config.PORT}")
 
     start_keep_alive()
