@@ -145,7 +145,6 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import config
-import kill_switch
 
 # Deriv's newer Options trading API (REST for account/OTP setup, WS for trading).
 # Replaces the legacy wss://ws.derivws.com/websockets/v3?app_id=... endpoint,
@@ -1000,6 +999,23 @@ class DerivClient:
             )
             return []
 
+    # ─── Historical ticks (digit predictor warm-up) ───────────────────────────
+
+    async def get_tick_history(self, symbol: str, count: int = 5000) -> List[dict]:
+        """Latest `count` ticks (max 5000) as [{"epoch": int, "quote": float}], oldest first.
+        Returns [] on failure."""
+        await self._ready.wait()
+        try:
+            resp = await self._send(
+                {"ticks_history": symbol, "adjust_start_time": 1, "count": int(count),
+                 "end": "latest", "style": "ticks"}, timeout=30)
+            h = resp.get("history", {}) or {}
+            return [{"epoch": int(t), "quote": float(p)}
+                    for t, p in zip(h.get("times", []), h.get("prices", []))]
+        except Exception as exc:
+            logger.warning(f"TICK HISTORY FAILED: {symbol} count={count} | error={exc}")
+            return []
+
     # ─── Live tick subscription ───────────────────────────────────────────────
 
     async def subscribe_ticks(
@@ -1171,8 +1187,7 @@ class DerivClient:
 
     @staticmethod
     def _digit_contract_type(match_type: str) -> Optional[str]:
-        # OVER/UNDER added for Donkey Strategy (signal_engine.
-        # evaluate_donkey_strategy()) — reuses the exact same match_type/
+        # OVER/UNDER support (digit predictor) — reuses the exact same match_type/
         # digit plumbing get_digit_proposal()/buy_digit_contract() already
         # had for MATCH/DIFFER, no signature changes needed.
         mapping = {
@@ -1269,12 +1284,6 @@ class DerivClient:
         After a successful buy, the caller is expected to register the
         contract for polling via subscribe_contract().
         """
-        # KILL SWITCH — dashboard one-tap pause. Last-line defence: nothing
-        # may open a new contract while it is engaged, whatever called us.
-        if kill_switch.is_paused():
-            logger.info(f"KILL SWITCH ON: {symbol} buy blocked (buy_contract)")
-            return None
-
         remaining = self._cb_blocked(symbol, strategy)
         if remaining is not None:
             logger.info(
@@ -1475,12 +1484,6 @@ class DerivClient:
         contract for polling via subscribe_contract() — already handled
         here the same way buy_contract() does it, via _subscribe_ws_contract.
         """
-        # KILL SWITCH — dashboard one-tap pause. Last-line defence: nothing
-        # may open a new contract while it is engaged, whatever called us.
-        if kill_switch.is_paused():
-            logger.info(f"KILL SWITCH ON: {symbol} buy blocked (buy_multiplier)")
-            return None
-
         remaining = self._cb_blocked(symbol, strategy)
         if remaining is not None:
             logger.info(
@@ -1776,12 +1779,6 @@ class DerivClient:
         contract for polling via subscribe_contract() — mirrors
         buy_contract()'s existing division of responsibility.
         """
-        # KILL SWITCH — dashboard one-tap pause. Last-line defence: nothing
-        # may open a new contract while it is engaged, whatever called us.
-        if kill_switch.is_paused():
-            logger.info(f"KILL SWITCH ON: {symbol} buy blocked (buy_accumulator)")
-            return None
-
         # Task 1 hard guard — checked before the semaphore/rate-limit wait.
         if not self._validate_stake(stake, symbol, "buy_accumulator"):
             return None
@@ -2089,12 +2086,6 @@ class DerivClient:
         contract for polling via subscribe_contract() — mirrors
         buy_contract()'s existing division of responsibility.
         """
-        # KILL SWITCH — dashboard one-tap pause. Last-line defence: nothing
-        # may open a new contract while it is engaged, whatever called us.
-        if kill_switch.is_paused():
-            logger.info(f"KILL SWITCH ON: {symbol} buy blocked (buy_digit_contract)")
-            return None
-
         contract_type = self._digit_contract_type(match_type)
 
         # Task 1 hard guard — checked before the semaphore/rate-limit wait.
