@@ -228,6 +228,10 @@ def test_engine_flow_with_fake_client():
     WARM = 20_000
     config.WARMUP_TICKS = WARM
     config.PREDICTOR_SYMBOLS = ["R_100"]
+    # this scenario plants its edge in EVEN/ODD (1.95x): pin the payout window the test was
+    # written for (production defaults are floor 2.0 / ceiling 2.5)
+    config.MIN_PAYOUT_RATIO = 1.8
+    config.MAX_PAYOUT_RATIO = 0.0
 
     class Fake:
         balance = 10_000.0
