@@ -69,6 +69,8 @@ class BotEngine:
         self._n_trades = 0
         self._n_wins = 0
         self._be_sum = 0.0            # sum of break-even win probabilities (1/ratio) of trades taken
+        self._fair_mean = 0.0         # sum of expected profit (in stakes) if every digit were fair
+        self._fair_var = 0.0          # sum of variance (in stakes^2) under the same assumption
         self._total_pnl = 0.0
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -422,12 +424,25 @@ class BotEngine:
     def _after_trade(self, info: dict, profit: float, won: bool):
         self._n_trades += 1
         self._n_wins += 1 if won else 0
-        self._be_sum += 1.0 / max(float(info.get("ratio") or 1.0), 1.0001)
+        ratio = max(float(info.get("ratio") or 1.0), 1.0001)
+        self._be_sum += 1.0 / ratio
         self._total_pnl += profit
-        if self._n_trades % 100 == 0:
+        # Edge test: compare actual results with a FAIR game (true digit probabilities, real payout).
+        # z near 0 = results are what luck alone produces; z > 3 over many trades = real edge.
+        try:
+            p_true = pred.true_probability(info["cand"])
+            self._fair_mean += p_true * ratio - 1.0
+            self._fair_var += p_true * (1.0 - p_true) * ratio * ratio
+        except Exception:
+            pass
+        if self._n_trades % 50 == 0:
             n = self._n_trades
-            logger.info("PERFORMANCE after %d trades: win rate %.1f%% vs break-even %.1f%% | total P&L %+.2f",
-                        n, 100.0 * self._n_wins / n, 100.0 * self._be_sum / n, self._total_pnl)
+            stakes_won = self._total_pnl / max(self.stake, 1e-9)
+            z = (stakes_won - self._fair_mean) / (self._fair_var ** 0.5) if self._fair_var > 0 else 0.0
+            logger.info("PERFORMANCE after %d trades: win rate %.1f%% vs break-even %.1f%% | total P&L %+.2f "
+                        "| expected for a fair game %+.2f | EDGE z-score %+.2f (needs > 3 to be an edge)",
+                        n, 100.0 * self._n_wins / n, 100.0 * self._be_sum / n, self._total_pnl,
+                        self._fair_mean * self.stake, z)
 
     def _note_lag(self, info: dict, poc: dict):
         """Observed entry delay in ticks vs the configured horizon (log only)."""
