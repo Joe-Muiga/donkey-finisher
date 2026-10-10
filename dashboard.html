@@ -1,207 +1,136 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SIFM Bot Dashboard</title>
-  <meta http-equiv="refresh" content="10">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0e1a; color: #c9d1d9; min-height: 100vh; padding: 20px; }
-    h1 { font-size: 1.5rem; font-weight: 700; color: #e6edf3; }
-    h2 { font-size: 1rem; font-weight: 600; color: #8b949e; letter-spacing: .05em; text-transform: uppercase; margin-bottom: 12px; }
-    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; border-bottom: 1px solid #21262d; padding-bottom: 16px; }
-    .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; animation: pulse 2s infinite; }
-    .dot-green  { background: #3fb950; }
-    .dot-yellow { background: #d29922; }
-    .dot-red    { background: #f85149; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
-    .card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 18px 20px; }
-    .card-value { font-size: 2rem; font-weight: 700; line-height: 1.1; margin-top: 6px; }
-    .card-sub { font-size: 0.78rem; color: #8b949e; margin-top: 4px; }
-    .green  { color: #3fb950; } .red    { color: #f85149; } .yellow { color: #d29922; }
-    .blue   { color: #58a6ff; } .purple { color: #bc8cff; }
-    .progress-bar { height: 6px; border-radius: 3px; background: #21262d; margin-top: 10px; overflow: hidden; }
-    .progress-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #238636, #3fb950); transition: width .5s ease; }
-    .progress-fill.danger { background: linear-gradient(90deg, #da3633, #f85149); }
-    .section { margin-bottom: 24px; }
-    table { width: 100%; border-collapse: collapse; font-size: .875rem; }
-    th { text-align: left; padding: 8px 10px; color: #8b949e; border-bottom: 1px solid #21262d; font-weight: 500; font-size: .78rem; text-transform: uppercase; }
-    td { padding: 8px 10px; border-bottom: 1px solid #161b22; }
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: #1c2128; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: .75rem; font-weight: 600; }
-    .badge-win  { background: #0f2d18; color: #3fb950; } .badge-loss { background: #2d0f0f; color: #f85149; }
-    .badge-long { background: #0d2137; color: #58a6ff; } .badge-short{ background: #2a1a0e; color: #d29922; }
-    .paused-banner { background: #2d1b00; border: 1px solid #d29922; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; color: #d29922; font-weight: 600; }
-    .ticker { font-family: 'Courier New', monospace; font-size: .8rem; color: #8b949e; }
-    footer { text-align: center; color: #484f58; font-size: .75rem; margin-top: 32px; }
-    .chart-wrap { margin-top: 12px; }
-    .chart-svg { width: 100%; height: 90px; display: block; }
-    .chart-line { fill: none; stroke-width: 2; }
-    .chart-line.pos { stroke: #3fb950; }
-    .chart-line.neg { stroke: #f85149; }
-    .chart-zero { stroke: #21262d; stroke-width: 1; stroke-dasharray: 3 3; }
-    .subgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 14px; }
-    .stat-mini { background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 10px 14px; }
-    .stat-mini .label { font-size: .7rem; color: #8b949e; text-transform: uppercase; letter-spacing: .04em; }
-    .stat-mini .value { font-size: 1.15rem; font-weight: 700; margin-top: 3px; }
-    .caveat { font-size: .72rem; color: #484f58; margin-top: 10px; line-height: 1.5; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Predictor · minute-of-hour stats</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0e1a; color: #c9d1d9; padding: 20px; }
+  h1 { font-size: 1.4rem; color: #e6edf3; }
+  h2 { font-size: .9rem; color: #8b949e; letter-spacing: .05em; text-transform: uppercase; margin-bottom: 10px; }
+  a { color: #58a6ff; }
+  .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; flex-wrap: wrap; gap: 8px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 14px 16px; }
+  .label { font-size: .7rem; color: #8b949e; text-transform: uppercase; }
+  .value { font-size: 1.4rem; font-weight: 700; margin-top: 4px; }
+  .green { color: #3fb950; } .red { color: #f85149; } .yellow { color: #d29922; } .muted { color: #8b949e; }
+  .section { margin-bottom: 18px; }
+  table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  th { text-align: right; padding: 6px 8px; color: #8b949e; border-bottom: 1px solid #21262d; font-size: .72rem; text-transform: uppercase; }
+  td { text-align: right; padding: 5px 8px; border-bottom: 1px solid #161b22; }
+  th:first-child, td:first-child { text-align: left; }
+  tr.unrel td { color: #6e7681; }
+  .scroll { max-height: 420px; overflow: auto; }
+  .btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem; }
+  .btn.on { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .note { font-size: .78rem; color: #d29922; margin-top: 12px; line-height: 1.5; }
+  svg { width: 100%; height: 130px; display: block; }
+  .tag { font-size: .68rem; border: 1px solid #484f58; border-radius: 10px; padding: 1px 6px; color: #8b949e; }
+</style>
 </head>
 <body>
-
-<div class="header">
+<div class="top">
+  <div><h1>Digit predictor · minute-of-hour stats</h1>
+       <div class="muted" style="font-size:.8rem;margin-top:3px"><a href="/">← main dashboard</a> · <span id="upd">loading…</span></div></div>
   <div>
-    <h1><span class="status-dot {{dot_class}}" id="dot"></span>SIFM Deriv Bot</h1>
-    <div style="color:#8b949e; font-size:.85rem; margin-top:4px;">{{session}} &nbsp;·&nbsp; Uptime {{uptime}}</div>
-  </div>
-  <div style="text-align:right">
-    <div style="font-size:.8rem; color:#8b949e;">Scanning</div>
-    <div style="font-size:1rem; font-weight:600; color:#58a6ff;">{{current_symbol}}</div>
-    <div style="font-size:.75rem; color:#484f58; margin-top:2px;">Auto-refresh 10 s</div>
+    <button class="btn on" id="b-utc" onclick="setTz('utc')">UTC</button>
+    <button class="btn" id="b-loc" onclick="setTz('local')">Browser local (<span id="tzname"></span>)</button>
   </div>
 </div>
 
-{{paused_banner}}
+<div class="grid" id="overall"></div>
 
-<div class="grid">
-  <div class="card">
-    <h2>Balance</h2>
-    <div class="card-value {{balance_color}}">$ {{balance}}</div>
-    <div class="card-sub">Started today @ ${{day_start}}</div>
-  </div>
-  <div class="card">
-    <h2>Daily P&L</h2>
-    <div class="card-value {{pnl_color}}">{{daily_pnl_sign}}$ {{daily_pnl_abs}}</div>
-    <div class="card-sub">{{daily_pnl_pct}} % of day start</div>
-    <div class="progress-bar"><div class="progress-fill {{danger_class}}" style="width:{{loss_bar_pct}}%"></div></div>
-    <div class="card-sub" style="margin-top:6px;">{{loss_bar_pct}}% of 90% limit used</div>
-  </div>
-  <div class="card">
-    <h2>Win Rate</h2>
-    <div class="card-value {{wr_color}}">{{win_rate}}%</div>
-    <div class="card-sub">{{wins}} W / {{losses}} L &nbsp;({{trades}} total)</div>
-  </div>
-  <div class="card">
-    <h2>Profit Factor</h2>
-    <div class="card-value {{pf_color}}">{{profit_factor}}</div>
-    <div class="card-sub">Gross profit / Gross loss</div>
-  </div>
-  <div class="card">
-    <h2>% P&amp;L of Staked</h2>
-    <div class="card-value {{pct_pnl_color}}">{{pct_pnl_sign}}{{pct_pnl_abs}}%</div>
-    <div class="card-sub">(Profit or loss / total staked) &times; 100</div>
-    <div class="progress-bar"><div class="progress-fill {{pct_pnl_bar_class}}" style="width:{{pct_pnl_bar_pct}}%"></div></div>
-  </div>
-  <div class="card">
-    <h2>Streak</h2>
-    <div class="card-value {{streak_color}}">{{streak_label}}</div>
-    <div class="card-sub">Consecutive {{streak_type}}</div>
-  </div>
-  <div class="card">
-    <h2>Session</h2>
-    <div class="card-value blue" style="font-size:1.1rem; margin-top:10px;">{{session}}</div>
-    <div class="card-sub">{{tradeable_count}} symbols in queue</div>
-  </div>
+<div class="section card">
+  <h2>Suggested boot window</h2>
+  <div id="window"></div>
 </div>
 
 <div class="section card">
-  <h2>Performance Trends</h2>
-  <div class="card-sub" style="margin-bottom:4px;">% P&amp;L of Staked — cumulative, over time</div>
-  <div class="chart-wrap"><svg class="chart-svg" id="chart-pct-pnl" viewBox="0 0 600 90" preserveAspectRatio="none"></svg></div>
-  <div class="card-sub" style="margin-bottom:4px; margin-top:16px;">Profit Factor — cumulative, over time</div>
-  <div class="chart-wrap"><svg class="chart-svg" id="chart-pf" viewBox="0 0 600 90" preserveAspectRatio="none"></svg></div>
-</div>
-
-<div class="section card">
-  <h2>Scaled $20 Account &middot; $1 per Trade</h2>
-  <div class="card-sub">A faithful replay of this account's real trade sequence (same wins/losses, same order, same realized payout ratios) at a fixed $1 stake against a $20 starting balance — not a resimulated market.</div>
-  <div class="subgrid">
-    <div class="stat-mini"><div class="label">Current Balance</div><div class="value {{scaled_balance_color}}">${{scaled_balance}}</div></div>
-    <div class="stat-mini"><div class="label">Total P&amp;L</div><div class="value {{scaled_pnl_color}}">{{scaled_pnl_sign}}${{scaled_pnl_abs}}</div></div>
-    <div class="stat-mini"><div class="label">% Return</div><div class="value {{scaled_pct_color}}">{{scaled_pct_sign}}{{scaled_pct_abs}}%</div></div>
+  <h2>Win rate by minute of the hour <span class="tag" id="tzlabel">UTC</span></h2>
+  <svg id="chart" viewBox="0 0 600 130" preserveAspectRatio="none"></svg>
+  <div class="muted" style="font-size:.72rem;margin:4px 0 10px">bars = Wilson lower bound; line = break-even win rate; grey = unreliable (too few trades)</div>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Minute</th><th>Trades</th><th>Win rate</th><th>Wilson LB</th><th>Net profit</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
   </div>
-  <div class="chart-wrap"><svg class="chart-svg" id="chart-scaled" viewBox="0 0 600 90" preserveAspectRatio="none"></svg></div>
-
-  <h2 style="margin-top:20px;">Growth Projection &middot; if not withdrawing</h2>
-  <div class="subgrid">
-    <div class="stat-mini"><div class="label">Projected · 1 Day</div><div class="value">${{proj_balance_1d}}</div></div>
-    <div class="stat-mini"><div class="label">Projected · 1 Week</div><div class="value">${{proj_balance_1w}}</div></div>
-    <div class="stat-mini"><div class="label">Projected · 1 Month</div><div class="value">${{proj_balance_1m}}</div></div>
-  </div>
-  <div class="caveat">Linear extrapolation of this account's OBSERVED average $ P&amp;L per trade &times; observed trades/day ({{observed_trades_per_day}}/day) over its logged history. Not a forecast or guarantee — assumes future trades behave statistically like past ones, and win rate/edge can and does change over time, especially on limited history. Balances are floored at $0 (an account can't go negative).</div>
 </div>
 
-<div class="section card">
-  <h2>Recent Trades</h2>
-  <table>
-    <thead><tr><th>Time</th><th>Symbol</th><th>Dir</th><th>Stake</th><th>P&L</th><th>Bal After</th><th>Result</th></tr></thead>
-    <tbody>{{recent_rows}}</tbody>
-  </table>
-</div>
-
-<div class="section card">
-  <h2>Symbol Leaderboard</h2>
-  <table>
-    <thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>P&L</th><th>Score</th></tr></thead>
-    <tbody>{{symbol_rows}}</tbody>
-  </table>
-</div>
-
-<div class="section card">
-  <h2>Last Signal</h2>
-  <div class="ticker">{{last_signal}}</div>
-</div>
-
-<footer>SIFM Deriv Bot &nbsp;·&nbsp; {{now_utc}} UTC &nbsp;·&nbsp; Risk 1% / trade · 90% daily loss limit</footer>
+<div class="note">With 60 minute buckets, the best-looking ones are often just luck, so treat the suggestion as a hypothesis to confirm on other days.</div>
 
 <script>
-// Lightweight, dependency-free SVG line chart — no CDN, works offline.
-// dataArr: plain array of numbers, oldest-first.
-function drawLineChart(svgId, dataArr) {
-  var svg = document.getElementById(svgId);
-  if (!svg || !dataArr || dataArr.length < 2) return;
-  var w = 600, h = 90;
-  var min = Math.min.apply(null, dataArr.concat([0]));
-  var max = Math.max.apply(null, dataArr.concat([0]));
-  var range = (max - min) || 1;
-  var stepX = w / (dataArr.length - 1);
+let tz = 'utc', data = null;
+const off = -new Date().getTimezoneOffset();            // minutes east of UTC
+document.getElementById('tzname').textContent = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const pct = x => x == null ? '—' : (100 * x).toFixed(1) + '%';
+const money = x => (x >= 0 ? '+' : '−') + '$' + Math.abs(x).toLocaleString(undefined, {maximumFractionDigits: 2});
+const shift = m => tz === 'utc' ? m : (((m + off) % 60) + 60) % 60;
+const mm = m => ':' + String(shift(m)).padStart(2, '0');
 
-  if (min < 0 && max > 0) {
-    var zeroY = h - ((0 - min) / range) * h;
-    var zline = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    zline.setAttribute('x1', 0); zline.setAttribute('x2', w);
-    zline.setAttribute('y1', zeroY); zline.setAttribute('y2', zeroY);
-    zline.setAttribute('class', 'chart-zero');
-    svg.appendChild(zline);
-  }
+function setTz(t) { tz = t; document.getElementById('b-utc').className = 'btn' + (t === 'utc' ? ' on' : '');
+  document.getElementById('b-loc').className = 'btn' + (t === 'local' ? ' on' : '');
+  document.getElementById('tzlabel').textContent = t === 'utc' ? 'UTC' : 'local'; if (data) render(); }
 
-  var points = dataArr.map(function (v, i) {
-    var x = i * stepX;
-    var y = h - ((v - min) / range) * h;
-    return x.toFixed(1) + ',' + y.toFixed(1);
-  }).join(' ');
-  var line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
-  line.setAttribute('points', points);
-  var last = dataArr[dataArr.length - 1];
-  line.setAttribute('class', 'chart-line ' + (last >= 0 ? 'pos' : 'neg'));
-  svg.appendChild(line);
+async function pin() { let p = localStorage.getItem('ks_pin') || '';
+  if (!p) { p = prompt('Enter PIN (last 6 characters of your Deriv API token, or DASHBOARD_PIN):') || ''; } return p; }
+
+async function load() {
+  const p = await pin();
+  try {
+    const r = await fetch('/api/predictor_stats', {headers: {'X-Pin': p}});
+    if (r.status === 403) { localStorage.removeItem('ks_pin'); document.getElementById('upd').textContent = 'wrong PIN – reload'; return; }
+    if (r.status === 429) { document.getElementById('upd').textContent = 'too many wrong PINs – wait a minute'; return; }
+    if (!r.ok) { document.getElementById('upd').textContent = 'HTTP ' + r.status; return; }
+    localStorage.setItem('ks_pin', p);
+    data = await r.json();
+    document.getElementById('upd').textContent = 'updated ' + new Date().toLocaleTimeString();
+    render();
+  } catch (e) { document.getElementById('upd').textContent = 'error: ' + e; }
 }
 
-// Data injected by the dashboard renderer as plain JSON arrays of numbers
-// (see strategy_stats.get_dashboard_analytics() — pct_pnl_series /
-// profit_factor_series / scaled_account.balance_series, each mapped down
-// to just the numeric value per point before injecting here).
-var pctPnlData = {{pct_pnl_series_json}};
-var profitFactorData = {{profit_factor_series_json}};
-var scaledBalanceData = {{scaled_balance_series_json}};
+function render() {
+  const o = data.overall;
+  const beTxt = o.break_even ? pct(o.break_even) : '—';
+  const wrCls = (o.win_rate != null && o.break_even && o.win_rate > o.break_even) ? 'green' : 'red';
+  document.getElementById('overall').innerHTML = [
+    ['Trades', o.trades.toLocaleString(), ''],
+    ['Wins', o.wins.toLocaleString(), ''],
+    ['Win rate', pct(o.win_rate), o.trades ? wrCls : ''],
+    ['Avg payout ratio', o.avg_payout_ratio ? o.avg_payout_ratio.toFixed(3) + '×' : '—', ''],
+    ['Break-even win rate', beTxt, ''],
+    ['Net profit', money(o.net_profit), o.net_profit >= 0 ? 'green' : 'red'],
+  ].map(([l, v, c]) => `<div class="card"><div class="label">${l}</div><div class="value ${c}">${v}</div></div>`).join('');
 
-drawLineChart('chart-pct-pnl', pctPnlData);
-drawLineChart('chart-pf', profitFactorData);
-drawLineChart('chart-scaled', scaledBalanceData);
+  const w = data.window, be = o.break_even;
+  if (w.status) {
+    document.getElementById('window').innerHTML = `<div class="value yellow" style="font-size:1.1rem">insufficient data</div>
+      <div class="muted" style="font-size:.8rem;margin-top:4px">Needs a window with ≥ ${w.needed_trades} pooled trades (${data.params.min_trades_per_minute}/min × ${data.params.window_minutes} min).</div>`;
+  } else {
+    const beats = w.beats_break_even;
+    document.getElementById('window').innerHTML =
+      `<div class="value" style="font-size:1.3rem">${mm(w.start)} → ${mm(w.end)} <span class="muted" style="font-size:.8rem">(${w.minutes} min, ${tz === 'utc' ? 'UTC' : 'local'}${w.start + w.minutes > 59 ? ', wraps past :59' : ''})</span></div>
+       <div style="font-size:.85rem;margin-top:6px">${w.trades} trades · win rate ${pct(w.win_rate)} · Wilson LB <b>${pct(w.wilson_lower)}</b> · net ${money(w.net_profit)}</div>
+       <div class="${beats ? 'green' : 'red'}" style="font-size:.85rem;margin-top:6px">${beats ? '✔ lower bound exceeds' : '✘ lower bound does NOT exceed'} break-even (${beTxt})</div>
+       <div class="muted" style="font-size:.78rem;margin-top:4px">Boot the Render service a little before :${String(shift(w.start)).padStart(2, '0')}.</div>`;
+  }
+
+  const mins = data.minutes.slice().sort((a, b) => shift(a.minute) - shift(b.minute));
+  document.getElementById('rows').innerHTML = mins.map(m =>
+    `<tr class="${m.reliable ? '' : 'unrel'}"><td>${mm(m.minute)}</td><td>${m.trades}</td><td>${pct(m.win_rate)}</td><td>${pct(m.wilson_lower)}</td>
+     <td class="${m.net_profit >= 0 ? 'green' : 'red'}">${m.trades ? money(m.net_profit) : '—'}</td><td>${m.reliable ? '' : '<span class="tag">unreliable</span>'}</td></tr>`).join('');
+
+  const lo = 0.3, hi = 0.8, H = 130, bw = 600 / 60;
+  const y = v => H - ((Math.min(Math.max(v, lo), hi) - lo) / (hi - lo)) * (H - 6);
+  let svg = '';
+  mins.forEach((m, i) => { if (m.wilson_lower == null) return;
+    svg += `<rect x="${i * bw + 1}" y="${y(m.wilson_lower)}" width="${bw - 2}" height="${H - y(m.wilson_lower)}" fill="${m.reliable ? '#3fb950' : '#484f58'}"/>`; });
+  if (be) svg += `<line x1="0" x2="600" y1="${y(be)}" y2="${y(be)}" stroke="#f85149" stroke-width="1.5" stroke-dasharray="4 3"/>`;
+  document.getElementById('chart').innerHTML = svg;
+}
+load(); setInterval(load, 10000);
 </script>
-
 </body>
 </html>
