@@ -213,6 +213,133 @@ def test_break_even_values():
     assert not pr.accept(pk2, 1.8).ok
 
 
+def test_forward_gate_blocks_until_fresh_wins_and_is_lookahead_free():
+    """A selected context must not trade until it has won on ticks AFTER selection."""
+    p = params(forward_gate=True, forward_samples=100, forward_start_z=2.0)
+    digits = planted_digits(26_000, seed=5)
+    pr = Predictor("SIM", p, payout_ratio_fn=lambda c: RATIO)
+    pr.fit(digits[:20_000])
+    assert pr.selected, "planted context should be selected by fit()"
+    assert pr.fwd and pr.best_with_ratios(lambda c: RATIO) is None, "no trade before fresh evidence exists"
+    first_trade_tick = None
+    for t in range(20_000, 25_999):
+        pr.on_tick(int(digits[t]))
+        if pr.best_with_ratios(lambda c: RATIO):
+            first_trade_tick = t
+            break
+    assert first_trade_tick is not None, "a real edge must eventually be approved"
+    assert first_trade_tick > 20_000 + 100, "must wait for >= FORWARD_SAMPLES fresh occurrences"
+    # fair digits: nothing may be approved
+    rng = np.random.default_rng(77)
+    fair = rng.integers(0, 10, 60_000)
+    pf = Predictor("SIM", params(forward_gate=True, forward_samples=250, forward_start_z=2.5),
+                   payout_ratio_fn=lambda c: RATIO)
+    pf.fit(fair[:5000])
+    trades = 0
+    for t in range(5000, 59_999):
+        if (t - 5000) % 300 == 0:
+            pf.fit(fair[t - 5000:t])
+        pf.on_tick(int(fair[t]))
+        trades += bool(pf.best_with_ratios(lambda c: RATIO))
+    assert trades <= 10, trades
+    print(f"[forward] planted edge approved after {first_trade_tick - 20_000} ticks; fair trades={trades}")
+
+
+def test_target_balance_stops_trading_and_disconnects_for_good():
+    import asyncio
+    import config
+    import bot_engine, predictor_stats
+    from deriv_client import DerivClient
+
+    # 1) DerivClient: after shutdown() connect() returns instead of reconnecting
+    async def client_part():
+        c = DerivClient()
+        await c.shutdown("test")
+        await asyncio.wait_for(c.connect(), timeout=2)          # returns immediately
+        assert c._shutdown and not c.is_connected
+    asyncio.run(client_part())
+
+    # 2) engine: target crossing on a balance push blocks buys at once and closes the socket
+    config.PREDICTOR_TARGET = 10_500.0
+    config.WARMUP_TICKS = 6000
+    _p = P
+    _p._REGISTRY.clear()
+
+    class Fake:
+        balance = 10_000.0
+        is_connected = True
+        def __init__(self):
+            self._contract_symbol_map = {}; self.cbs = []; self.down = False; self.sent = []
+        def on_balance(self, cb): self.cbs.append(cb)
+        async def connect(self): await asyncio.sleep(3600)
+        async def get_tick_history(self, sym, n): return []
+        async def subscribe_ticks(self, sym, cb): pass
+        async def force_check_contract(self, cid): return {}
+        async def shutdown(self, reason=""): self.down = True; self.is_connected = False
+        async def _send(self, req, timeout=0):
+            self.sent.append(req); raise RuntimeError("no trading expected")
+
+    async def scenario():
+        bot_engine.DerivClient = Fake
+        predictor_stats._stats = predictor_stats.MinuteStats(local_file=os.devnull)
+        eng = bot_engine.BotEngine()
+        fake = eng.client
+        assert eng.target == 10_500.0 and not eng._blocked()
+        eng._open["X"] = {"sym": "R_100"}                       # an open trade must not delay anything
+        fake.cbs.append(eng._on_balance)
+        for cb in fake.cbs: cb(10_499.99)
+        await asyncio.sleep(0.01)
+        assert not eng._target_hit and not fake.down, "below target: keep trading"
+        for cb in fake.cbs: cb(10_500.0)
+        assert eng._target_hit and eng._blocked(), "buys must be blocked synchronously"
+        await asyncio.sleep(0.05)
+        assert fake.down, "must disconnect from Deriv"
+        n = len(fake.sent)
+        for cb in fake.cbs: cb(11_000.0)                         # later pushes do not re-trigger
+        await asyncio.sleep(0.01)
+        assert len(fake.sent) == n
+    try:
+        asyncio.run(scenario())
+    finally:
+        config.PREDICTOR_TARGET = 0.0
+
+
+def test_backfill_replays_history_so_trading_can_start_at_boot():
+    p = params(forward_gate=True, forward_samples=100, forward_start_z=2.0)
+    digits = planted_digits(26_000, seed=5)
+    pr = Predictor("SIM", p, payout_ratio_fn=lambda c: RATIO)
+    out = pr.backfill(digits[:22_000], None, fit_window=8000, refit_every=300)
+    assert out["replayed"] == 14_000 and out["approved"] >= 1, out
+    pr.fit(digits[14_000:22_000])
+    t0 = None
+    for t in range(22_000, 22_200):
+        pr.on_tick(int(digits[t]))
+        if pr.best_with_ratios(lambda c: RATIO):
+            t0 = t - 22_000
+            break
+    assert t0 is not None and t0 < 200, "history backfill should allow trading right after boot"
+    fair = np.random.default_rng(3).integers(0, 10, 30_000)
+    pf = Predictor("SIM", params(forward_gate=True), payout_ratio_fn=lambda c: RATIO)
+    assert pf.backfill(fair[:25_000], None, fit_window=5000, refit_every=300)["approved"] == 0
+
+
+def test_forward_ledger_counts_each_tick_once():
+    """bot_engine replays ticks after a refit; the ledger must not double count them."""
+    p = params(forward_gate=True, forward_samples=10_000)
+    digits = planted_digits(8000, seed=9)
+    pr = Predictor("SIM", p, payout_ratio_fn=lambda c: RATIO)
+    pr.fit(digits[:6000], last_epoch=5999.0)
+    assert pr.fwd
+    for t in range(6000, 7000):
+        pr.on_tick(int(digits[t]), float(t))
+    n1 = {k: e["tot_n"] for k, e in pr.fwd.items()}
+    pr.fit(digits[:6900], last_epoch=6899.0)               # refit mid-stream ...
+    for t in range(6900, 7000):                             # ... then replay already-seen ticks
+        pr.on_tick(int(digits[t]), float(t))
+    n2 = {k: e["tot_n"] for k, e in pr.fwd.items() if k in n1}
+    assert n1 == n2, "replayed ticks were double counted in the forward ledger"
+
+
 def test_wilson():
     assert wilson_lower(60, 100, 2.0) < 0.6
     assert wilson_lower(0, 0) == 0.0
@@ -232,6 +359,11 @@ def test_engine_flow_with_fake_client():
     # written for (production defaults are floor 2.0 / ceiling 2.5)
     config.MIN_PAYOUT_RATIO = 1.8
     config.MAX_PAYOUT_RATIO = 0.0
+    # the forward gate needs fresh out-of-sample occurrences before the first buy; shrink the
+    # block so a 2,500-tick scenario can complete it (production default is 250)
+    config.FORWARD_SAMPLES = 100
+    import predictor as _p
+    _p._REGISTRY.clear()
 
     class Fake:
         balance = 10_000.0
