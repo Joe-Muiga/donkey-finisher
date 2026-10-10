@@ -41,9 +41,6 @@ class BotEngine:
         self.client = DerivClient()
         self.symbols: List[str] = list(_cfg("PREDICTOR_SYMBOLS", ["R_100"]))
         self.stake = float(_cfg("PREDICTOR_STAKE", 1000.0))
-        self.target = float(_cfg("PREDICTOR_TARGET", 0.0))     # 0 = off
-        self._target_hit = False
-        self._tasks: List["asyncio.Task"] = []
         self.duration = int(_cfg("CONTRACT_DURATION_TICKS", 1))
         self.stats = predictor_stats.get_stats()
         self.predictors: Dict[str, pred.Predictor] = {}
@@ -80,8 +77,6 @@ class BotEngine:
     async def run(self):
         logger.info("=" * 64)
         logger.info("  Digit predictor bot  –  stake %.2f, symbols %s", self.stake, self.symbols)
-        if self.target > 0:
-            logger.info("  PREDICTOR_TARGET = %.2f  (bot disconnects for good once balance >= target)", self.target)
         logger.info("=" * 64)
         ws_task = asyncio.create_task(self.client.connect())
         for _ in range(60):
@@ -93,11 +88,8 @@ class BotEngine:
             ws_task.cancel()
             return
         self.balance = self.client.balance
-        self.client.on_balance(self._on_balance)
+        self.client.on_balance(lambda b: setattr(self, "balance", b))
         self._seen_conn = self._conn_count()
-        if self._check_target(self.balance):
-            await self._target_shutdown()
-            return await self._park_forever()
 
         for sym in self.symbols:
             await self._init_symbol(sym)
@@ -109,7 +101,6 @@ class BotEngine:
                   asyncio.create_task(self._watchdog_loop()),
                   asyncio.create_task(self._refit_loop()),
                   asyncio.create_task(self._supervise_ws(ws_task))]
-        self._tasks = list(tasks)
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -118,56 +109,6 @@ class BotEngine:
             for t in tasks:
                 t.cancel()
             ws_task.cancel()
-        if self._target_hit:                  # never return: main.py would rebuild the engine and reconnect
-            await self._park_forever()
-
-    # ── target balance ───────────────────────────────────────────────────────
-    def _on_balance(self, bal: float):
-        """Runs on every Deriv balance push (i.e. the instant a contract settles)."""
-        self.balance = bal
-        if self._check_target(bal):
-            asyncio.get_running_loop().create_task(self._target_shutdown())
-
-    def _check_target(self, bal: float) -> bool:
-        """True exactly once, when the balance first reaches PREDICTOR_TARGET. Sets the latch
-        synchronously so _blocked() stops every new proposal/buy from this very moment."""
-        if self.target > 0 and not self._target_hit and float(bal or 0.0) >= self.target:
-            self._target_hit = True
-            return True
-        return False
-
-    async def _target_shutdown(self):
-        """Target reached: stop trading, drop the Deriv connection, never reconnect.
-        Open contracts are abandoned on purpose (they settle on Deriv's side)."""
-        me = asyncio.current_task()
-        logger.warning("=" * 64)
-        logger.warning("TARGET REACHED: balance %.2f >= PREDICTOR_TARGET %.2f - stopping and disconnecting "
-                       "(%d contract(s) still open will settle on Deriv's side)",
-                       self.balance, self.target, len(self._open))
-        logger.warning("=" * 64)
-        try:
-            await self.client.shutdown("PREDICTOR_TARGET reached")
-        except Exception as exc:
-            logger.error("shutdown error: %s", exc)
-        for t in self._tasks:
-            if t is not me:
-                t.cancel()
-        try:
-            await self.stats.flush(force=True)
-        except Exception:
-            pass
-        try:
-            import keep_alive
-            keep_alive.update_status(
-                balance=round(self.balance, 2), session="TARGET REACHED",
-                last_signal=f"TARGET {self.target:.2f} reached at {self.balance:.2f} - disconnected from Deriv",
-                open_contracts_count=len(self._open))
-        except Exception:
-            pass
-
-    @staticmethod
-    async def _park_forever():
-        await asyncio.Event().wait()
 
     # ── warm-up ──────────────────────────────────────────────────────────────
     async def _init_symbol(self, sym: str):
@@ -185,10 +126,7 @@ class BotEngine:
         first warm-up and for every later re-sync/refit. On a refit that cannot get enough
         history the old predictor is kept untouched and False is returned."""
         n = int(_cfg("WARMUP_TICKS", 5000))
-        pr0 = self.predictors.get(sym) or pred._REGISTRY.get(sym)
-        backfill_n = int(_cfg("FORWARD_BACKFILL_TICKS", 0)) if (
-            initial and _cfg("FORWARD_GATE_ENABLED", True) and not (pr0 and pr0.fwd)) else 0
-        ticks = await self.client.get_tick_history(sym, max(n, backfill_n))
+        ticks = await self.client.get_tick_history(sym, n)
         if len(ticks) < 500:
             logger.warning("WARM-UP %s: only %d ticks returned", sym, len(ticks))
         if not initial and len(ticks) < 300:
@@ -206,20 +144,9 @@ class BotEngine:
         pr = self.predictors.get(sym)
         if pr is None:
             self._ratios.setdefault(sym, {})
-            # main.py rebuilds BotEngine after a crash; reuse the live predictor so its forward
-            # ledger (out-of-sample evidence) is not thrown away and re-learned for ~40 minutes.
-            pr = pred._REGISTRY.get(sym)
-            if pr is None:
-                pr = pred.Predictor(sym)
-            pr.payout_ratio_fn = lambda c, s=sym: self._ratios.get(s, {}).get(c)
+            pr = pred.Predictor(sym, payout_ratio_fn=lambda c, s=sym: self._ratios.get(s, {}).get(c))
         await self._probe_ratios(sym, pr)
-        if backfill_n and len(digits) >= n + 500:
-            try:
-                pr.backfill(digits, [t["epoch"] for t in ticks], fit_window=n,
-                            refit_every=max(1, int(_cfg("BACKFILL_REFIT_TICKS", 300))))
-            except Exception as exc:                       # never block boot; falls back to live shadowing
-                logger.error("FORWARD BACKFILL failed for %s: %s", sym, exc, exc_info=True)
-        pr.fit(digits[-n:], last_epoch=last_ep)
+        pr.fit(digits, last_epoch=last_ep)
         # ticks that arrived live while we were downloading/probing are not in `ticks`: replay them
         if last_ep is not None:
             for ep, d in list(self._live.get(sym, ())):
@@ -279,7 +206,7 @@ class BotEngine:
     def _blocked(self) -> bool:
         # Only technical blocks remain: no socket, or predictor not yet re-synced after a
         # reconnect (a few seconds), or the optional scheduled redeploy (off by default).
-        return (self._target_hit or restart_scheduler.is_redeploy_pending() or time.time() < self._halted_until
+        return (restart_scheduler.is_redeploy_pending() or time.time() < self._halted_until
                 or not self.client.is_connected or self._needs_resync())
 
     # ── trading ──────────────────────────────────────────────────────────────
@@ -454,9 +381,8 @@ class BotEngine:
                     ok_all = ok_all and ok
                     if ok:
                         pr = self.predictors[sym]
-                        logger.info("%s %s: tradable contexts=%d forward=%s",
-                                    "RESYNC" if resync else "REFIT", sym, len(pr.selected),
-                                    pr.forward_summary())
+                        logger.info("%s %s: tradable contexts=%d",
+                                    "RESYNC" if resync else "REFIT", sym, len(pr.selected))
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
