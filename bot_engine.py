@@ -65,11 +65,7 @@ class BotEngine:
         # After the first such failure we buy with the contract parameters directly
         # (buy="1" + parameters), which does not depend on a proposal id at all.
         self._direct_buy = False
-        # ── session risk controls / performance tracking ──
-        self._sess_pnl = 0.0
-        self._sess_peak = 0.0
-        self._risk_halt_until = 0.0
-        self._risk_halt_forever = False
+        # ── performance tracking (log only; nothing here ever blocks a trade) ──
         self._n_trades = 0
         self._n_wins = 0
         self._be_sum = 0.0            # sum of break-even win probabilities (1/ratio) of trades taken
@@ -205,20 +201,11 @@ class BotEngine:
         been missed, so the digit context would be wrong."""
         return self._conn_count() != self._seen_conn
 
-    def _stop_loss_reserved(self) -> bool:
-        """Do not open more trades while (session P&L - stake of every unsettled contract) is
-        already at the stop-loss: those open contracts could all still lose."""
-        sl = float(_cfg("SESSION_STOP_LOSS_STAKES", 0)) * self.stake
-        if sl <= 0:
-            return False
-        at_risk = sum(float(i.get("stake") or 0.0) for i in self._open.values())
-        return self._sess_pnl - at_risk <= -sl
-
     def _blocked(self) -> bool:
+        # Only technical blocks remain: no socket, or predictor not yet re-synced after a
+        # reconnect (a few seconds), or the optional scheduled redeploy (off by default).
         return (restart_scheduler.is_redeploy_pending() or time.time() < self._halted_until
-                or not self.client.is_connected or self._needs_resync()
-                or self._risk_halt_forever or time.time() < self._risk_halt_until
-                or self._stop_loss_reserved())
+                or not self.client.is_connected or self._needs_resync())
 
     # ── trading ──────────────────────────────────────────────────────────────
     async def _worker(self, sym: str):
@@ -431,45 +418,16 @@ class BotEngine:
         except Exception:
             pass
 
-    # ── session risk controls ────────────────────────────────────────────────
+    # ── performance log (no limits, no pauses) ───────────────────────────────
     def _after_trade(self, info: dict, profit: float, won: bool):
         self._n_trades += 1
         self._n_wins += 1 if won else 0
         self._be_sum += 1.0 / max(float(info.get("ratio") or 1.0), 1.0001)
         self._total_pnl += profit
-        self._sess_pnl += profit
-        self._sess_peak = max(self._sess_peak, self._sess_pnl)
-
         if self._n_trades % 100 == 0:
             n = self._n_trades
             logger.info("PERFORMANCE after %d trades: win rate %.1f%% vs break-even %.1f%% | total P&L %+.2f",
                         n, 100.0 * self._n_wins / n, 100.0 * self._be_sum / n, self._total_pnl)
-
-        stake = self.stake
-        tp = float(_cfg("SESSION_TAKE_PROFIT_STAKES", 0)) * stake
-        sl = float(_cfg("SESSION_STOP_LOSS_STAKES", 0)) * stake
-        t_start = float(_cfg("TRAILING_LOCK_START_STAKES", 0)) * stake
-        t_give = float(_cfg("TRAILING_GIVEBACK_STAKES", 0)) * stake
-        reason = None
-        if tp > 0 and self._sess_pnl >= tp:
-            reason = f"TAKE-PROFIT hit: session P&L {self._sess_pnl:+.2f} >= {tp:.2f}"
-        elif sl > 0 and self._sess_pnl <= -sl:
-            reason = f"STOP-LOSS hit: session P&L {self._sess_pnl:+.2f} <= -{sl:.2f}"
-        elif t_start > 0 and t_give > 0 and self._sess_peak >= t_start \
-                and self._sess_pnl <= self._sess_peak - t_give:
-            reason = (f"TRAILING LOCK hit: peak {self._sess_peak:+.2f}, now {self._sess_pnl:+.2f} "
-                      f"(gave back {self._sess_peak - self._sess_pnl:.2f})")
-        if reason and not self._risk_halt_forever and time.time() >= self._risk_halt_until:
-            pause = float(_cfg("RISK_PAUSE_SECONDS", 900))
-            if pause > 0:
-                self._risk_halt_until = time.time() + pause
-                logger.warning("RISK LOCK - %s. No new trades for %.0fs, then a fresh session starts. "
-                               "(Open contracts still settle.)", reason, pause)
-                self._sess_pnl = 0.0
-                self._sess_peak = 0.0
-            else:
-                self._risk_halt_forever = True
-                logger.warning("RISK LOCK - %s. Trading stopped until the service restarts.", reason)
 
     def _note_lag(self, info: dict, poc: dict):
         """Observed entry delay in ticks vs the configured horizon (log only)."""
