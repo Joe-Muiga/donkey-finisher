@@ -2,12 +2,13 @@
 #
 # Required per service:
 #   DERIV_API_TOKEN  – Deriv API token (trade + read scope)
-#   RENDER_API_KEY   – Render Dashboard → Account Settings → API Keys. Lets the bot
-#                      redeploy itself every 150 s AND persist minute-of-hour stats
-#                      across redeploys (Render's disk is ephemeral).
 # Optional (all have defaults, see CHANGES.md):
 #   DERIV_ACCOUNT_MODE (demo|real), DASHBOARD_PIN, PREDICTOR_SYMBOLS (default R_100),
-#   PREDICTOR_STAKE (1000), REDEPLOY_INTERVAL_SECONDS (150), MIN_PAYOUT_RATIO (1.8) ...
+#   PREDICTOR_STAKE (1000), MIN_PAYOUT_RATIO (1.8) ...
+#   REDEPLOY_INTERVAL_SECONDS (0 = scheduled self-redeploy OFF, the default; the bot runs
+#     continuously and heals itself: reconnect-forever, stale-tick watchdog, periodic refit).
+#     If you set it > 0 you also need RENDER_API_KEY so the bot can trigger the redeploy.
+#   STALE_TICK_SECONDS (30), REFIT_INTERVAL_SECONDS (300), STATS_PERSIST_TO_RENDER (0)
 
 services:
   - type: web
@@ -22,5 +23,7 @@ services:
     envVars:
       - key: DERIV_API_TOKEN
         sync: false
+      - key: REDEPLOY_INTERVAL_SECONDS
+        value: "0"
       - key: RENDER_API_KEY
         sync: false
