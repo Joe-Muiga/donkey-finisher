@@ -1682,14 +1682,3 @@ TICK_HISTORY_PAGE_SIZE        = _env_i("TICK_HISTORY_PAGE_SIZE", 1000)
 STATS_PERSIST_TO_RENDER       = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
     "1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0").strip().lower() in ("1", "true", "yes", "on")
-
-# ─── Session risk controls ("secure the wins") ────────────────────────────────
-# All amounts are in multiples of PREDICTOR_STAKE so they scale with your stake.
-# Session P&L = sum of settled trades since the session started. When a limit trips the bot
-# stops opening trades for RISK_PAUSE_SECONDS, then starts a fresh session (0 = stay stopped
-# until the service restarts). Set a value to 0 to disable that rule.
-SESSION_TAKE_PROFIT_STAKES    = _env_f("SESSION_TAKE_PROFIT_STAKES", 10)   # bank the session at +10 stakes
-SESSION_STOP_LOSS_STAKES      = _env_f("SESSION_STOP_LOSS_STAKES", 20)     # cut it at -20 stakes
-TRAILING_LOCK_START_STAKES    = _env_f("TRAILING_LOCK_START_STAKES", 5)    # trailing lock arms at +5 stakes peak
-TRAILING_GIVEBACK_STAKES      = _env_f("TRAILING_GIVEBACK_STAKES", 3)      # ...and trips if P&L falls 3 stakes below peak
-RISK_PAUSE_SECONDS            = _env_f("RISK_PAUSE_SECONDS", 900)
