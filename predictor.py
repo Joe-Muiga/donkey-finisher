@@ -26,6 +26,18 @@ Anti-overfitting (fit())
     (c) train count >= MIN_CONTEXT_SAMPLES.
   Counts keep updating online after fit(); selection is refreshed each boot.
 
+Forward validation (the "false-signal killer")
+  A context that passes fit() has only been validated on data that also chose it
+  (winner's curse), and fit() is re-run every REFIT_INTERVAL_SECONDS, so on a fair
+  generator some context eventually passes by luck. Every context that is ever
+  selected therefore enters a forward ledger and may NOT trade until it wins on
+  FRESH ticks that arrived after it was selected: FORWARD_SAMPLES occurrences must
+  beat break-even by FORWARD_START_Z standard errors (one fixed-size test, no
+  optional stopping). Approved contexts are re-tested on every further block of
+  FORWARD_SAMPLES occurrences (bar FORWARD_KEEP_Z) and are revoked early if the
+  running block collapses (FORWARD_EARLY_REVOKE_Z). Failed/revoked contexts sit out
+  FORWARD_COOLDOWN_TICKS and then start probation again. Shadow tracking costs nothing.
+
 Decision (rank() + accept())
   Wilson lower bound (WILSON_Z) of the context's win-rate must exceed
   break_even + EDGE_MARGIN, break_even = 1/(payout/stake) from the LIVE
@@ -173,6 +185,14 @@ class PredictorParams:
     even_odd: bool = True
     alpha: float = field(default_factory=lambda: float(_cfg("PREDICTOR_ALPHA", 0.05)))
     payout_factor: float = field(default_factory=lambda: float(_cfg("PREDICTOR_PAYOUT_FACTOR", 0.975)))
+    confirm_z: float = field(default_factory=lambda: float(_cfg("CONFIRM_Z", 1.0)))
+    forward_gate: bool = field(default_factory=lambda: bool(_cfg("FORWARD_GATE_ENABLED", True)))
+    forward_samples: int = field(default_factory=lambda: int(_cfg("FORWARD_SAMPLES", 250)))
+    forward_start_z: float = field(default_factory=lambda: float(_cfg("FORWARD_START_Z", 2.5)))
+    forward_keep_z: float = field(default_factory=lambda: float(_cfg("FORWARD_KEEP_Z", 1.0)))
+    forward_early_revoke_z: float = field(default_factory=lambda: float(_cfg("FORWARD_EARLY_REVOKE_Z", 1.5)))
+    forward_early_min: int = field(default_factory=lambda: int(_cfg("FORWARD_EARLY_MIN", 60)))
+    forward_cooldown_ticks: int = field(default_factory=lambda: int(_cfg("FORWARD_COOLDOWN_TICKS", 3000)))
 
     @property
     def horizon(self) -> int:
@@ -187,6 +207,7 @@ class Pick:
     n: int
     p_hat: float
     p_lower: float
+    key: Optional[Tuple[int, int, int]] = None     # (k, ctx index, candidate index)
 
 
 @dataclass
@@ -216,6 +237,11 @@ class Predictor:
         self.last_epoch: Optional[float] = None
         self.fitted = False
         self.fit_report: dict = {}
+        # forward ledger: survives fit() on purpose (that is what makes it out-of-sample)
+        self.fwd: Dict[Tuple[int, int, int], dict] = {}
+        self._fwd_by_ctx: Dict[Tuple[int, int], List[int]] = {}
+        self._fwd_tick = 0
+        self._fwd_last_epoch: Optional[float] = None
         self._reset_counts()
 
     # -- payout ratio used for selection / ranking (live when known)
@@ -306,13 +332,18 @@ class Predictor:
             p_cf = float(cc @ self._win[ci]) / nc
             if p_cf <= be:
                 continue
+            if self.p.confirm_z > 0 and (p_cf - be) / math.sqrt(be * (1.0 - be) / nc) < self.p.confirm_z:
+                continue
             self.selected[(k, ctx, ci)] = {"n_train": nt, "p_train": p_tr, "n_confirm": nc,
                                            "p_confirm": p_cf, "be": be, "z": z}
+        for key in self.selected:
+            self._fwd_track(key)
         self.fitted = True
         self.fit_report = {"ticks": n, "train": n_train, "confirm": n - n_train,
                            "horizon": h, "tested": len(tests), "z_crit": z_crit,
                            "passed_train": passed_train, "tradable": len(self.selected)}
-        logger.info(f"PREDICTOR FIT {self.symbol}: {self.fit_report}")
+        if not getattr(self, "_replaying", False):
+            logger.info(f"PREDICTOR FIT {self.symbol}: {self.fit_report}")
         return self.fit_report
 
     # -- online ----------------------------------------------------------------
@@ -327,11 +358,108 @@ class Predictor:
         if len(self.history) > 256:
             del self.history[:-128]
         h = self.p.horizon
+        # forward ledger: each tick is counted ONCE (epoch guard: bot_engine replays ticks after a refit)
+        fwd_new = (self.p.forward_gate and bool(self.fwd)
+                   and (epoch is None or self._fwd_last_epoch is None or epoch > self._fwd_last_epoch))
+        if fwd_new:
+            if epoch is not None:
+                self._fwd_last_epoch = epoch
+            self._fwd_tick += 1
         for k in self.p.context_sizes:
             if len(self.history) >= k + h:
                 ctx = self._ctx_index(self.history[-(k + h):-h])
                 self.counts_all[k][ctx, int(digit)] += 1
+                if fwd_new:
+                    for ci in self._fwd_by_ctx.get((k, ctx), ()):
+                        self._fwd_observe((k, ctx, ci), int(digit))
         return True
+
+    def backfill(self, digits: Sequence[int], epochs: Optional[Sequence[float]] = None,
+                 fit_window: int = 5000, refit_every: int = 300) -> dict:
+        """Build the forward ledger from HISTORY instead of waiting for live ticks.
+
+        Replays the history exactly as the live loop would have run it: fit on the first
+        `fit_window` ticks, then step tick by tick (decision uses only earlier ticks, the
+        outcome lands on the next one), re-fitting every `refit_every` ticks on the latest
+        `fit_window` ticks. Every selection is therefore judged only on ticks that came AFTER
+        it, so the evidence is as out-of-sample as live waiting, minus the waiting. The caller
+        must run a normal fit() on the latest ticks afterwards (bot_engine does)."""
+        D = [int(x) for x in digits]
+        n, W = len(D), int(fit_window)
+        if not self.p.forward_gate or n < W + 500:
+            return {"replayed": 0}
+        ep = list(epochs) if epochs is not None else None
+        self.fwd, self._fwd_by_ctx, self._fwd_tick, self._fwd_last_epoch = {}, {}, 0, None
+        self._replaying = True                           # silence the per-refit FIT log lines
+        try:
+            self.fit(D[:W], last_epoch=ep[W - 1] if ep else None)
+            for t in range(W, n):
+                if (t - W) % refit_every == 0 and t > W:
+                    self.fit(D[t - W:t], last_epoch=ep[t - 1] if ep else None)
+                self.on_tick(D[t], ep[t] if ep else None)
+        finally:
+            self._replaying = False
+        summ = self.forward_summary()
+        logger.info("FORWARD BACKFILL %s: replayed %d ticks -> %s", self.symbol, n - W, summ)
+        return {"replayed": n - W, **summ}
+
+    # -- forward ledger --------------------------------------------------------
+    def _fwd_track(self, key: Tuple[int, int, int]) -> None:
+        if key in self.fwd:
+            return
+        self.fwd[key] = {"state": "probation", "n": 0, "w": 0, "retry": 0, "tot_n": 0, "tot_w": 0}
+        self._fwd_by_ctx.setdefault((key[0], key[1]), []).append(key[2])
+
+    def _fwd_z(self, w: int, n: int, ci: int) -> float:
+        be = break_even(self.ratio_for(self.candidates[ci]))
+        return ((w / n) - be) / math.sqrt(be * (1.0 - be) / n)
+
+    def _fwd_observe(self, key: Tuple[int, int, int], digit: int) -> None:
+        e = self.fwd[key]
+        ci = key[2]
+        if e["state"] == "cooldown":
+            if self._fwd_tick < e["retry"]:
+                return
+            e.update(state="probation", n=0, w=0)             # fresh probation, fresh data only
+        e["n"] += 1
+        e["tot_n"] += 1
+        win = 1 if self._win[ci, digit] else 0
+        e["w"] += win
+        e["tot_w"] += win
+        n, w = e["n"], e["w"]
+        approved = e["state"] == "approved"
+        if approved and n >= self.p.forward_early_min and \
+                self._fwd_z(w, n, ci) <= -self.p.forward_early_revoke_z:
+            self._fwd_fail(key, e, "early revoke")
+            return
+        if n >= self.p.forward_samples:
+            z = self._fwd_z(w, n, ci)
+            need = self.p.forward_keep_z if approved else self.p.forward_start_z
+            if z >= need:
+                if not approved:
+                    logger.info("FORWARD APPROVED %s k=%d ctx=%d %s: %d/%d z=%.2f",
+                                self.symbol, key[0], key[1], self.candidates[ci], w, n, z)
+                e.update(state="approved", n=0, w=0)          # next block re-validates (lower bar)
+            else:
+                self._fwd_fail(key, e, f"block z={z:.2f} < {need}")
+
+    def _fwd_fail(self, key: Tuple[int, int, int], e: dict, why: str) -> None:
+        if e["state"] == "approved":
+            logger.info("FORWARD REVOKED %s k=%d ctx=%d %s: %s", self.symbol, key[0], key[1],
+                        self.candidates[key[2]], why)
+        e.update(state="cooldown", n=0, w=0, retry=self._fwd_tick + self.p.forward_cooldown_ticks)
+
+    def forward_ok(self, key: Optional[Tuple[int, int, int]]) -> bool:
+        if not self.p.forward_gate or key is None:
+            return True
+        e = self.fwd.get(key)
+        return bool(e and e["state"] == "approved")
+
+    def forward_summary(self) -> dict:
+        out = {"probation": 0, "approved": 0, "cooldown": 0}
+        for e in self.fwd.values():
+            out[e["state"]] += 1
+        return out
 
     def context(self, k: int) -> Optional[Tuple[int, ...]]:
         """Last k digits KNOWN NOW (uses nothing after the latest tick)."""
@@ -350,13 +478,15 @@ class Predictor:
             cur = self.context(k)
             if cur is None or self._ctx_index(cur) != ctx:
                 continue
+            if not self.forward_ok((k, ctx, ci)):
+                continue
             row = self.counts_all[k][ctx]
             n = int(row.sum())
             if n == 0:
                 continue
             w = float(row @ self._win[ci])
             picks.append(Pick(self.candidates[ci], k, cur, n, w / n,
-                              wilson_lower(w, n, self.p.wilson_z)))
+                              wilson_lower(w, n, self.p.wilson_z), (k, ctx, ci)))
         picks.sort(key=lambda x: x.p_lower - break_even(self.ratio_for(x.cand)), reverse=True)
         return picks
 
@@ -368,6 +498,8 @@ class Predictor:
             return Decision(False, f"payout ratio {ratio:.4f} > ceiling {self.p.max_payout_ratio}", ratio)
         be = break_even(ratio)
         edge = pick.p_lower - be
+        if not self.forward_ok(pick.key):
+            return Decision(False, "forward validation pending/failed", ratio, be, edge)
         if pick.p_lower <= be + self.p.edge_margin:
             return Decision(False, f"p_lower {pick.p_lower:.4f} <= be {be:.4f} + margin", ratio, be, edge)
         return Decision(True, "ok", ratio, be, edge)
