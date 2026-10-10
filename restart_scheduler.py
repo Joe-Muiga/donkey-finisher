@@ -1,11 +1,11 @@
 """
 restart_scheduler.py – rolling redeploy scheduler.
 
-Spec point 11 (Aug 2026): the bot force-redeploys itself every
-config.REDEPLOY_INTERVAL_HOURS hours, measured from the last actual
+The bot force-redeploys itself every
+config.REDEPLOY_INTERVAL_SECONDS seconds (default 150), measured from the last actual
 redeploy/resumption — NOT anchored to a fixed clock time. Replaces the
 previous fixed-Africa/Nairobi-midnight schedule (_next_nairobi_midnight()),
-which ignored config.REDEPLOY_INTERVAL_HOURS entirely and always fired once
+which ignored config.REDEPLOY_INTERVAL_SECONDS entirely and always fired once
 a day regardless of what that config value was set to.
 
 Public interface (unchanged contract with bot_engine.py):
@@ -61,14 +61,14 @@ def _push_dashboard_flag(**kwargs) -> None:
 
 
 def is_redeploy_pending() -> bool:
-    """True once the rolling REDEPLOY_INTERVAL_HOURS timer has fired and a
+    """True once the rolling REDEPLOY_INTERVAL_SECONDS timer has fired and a
     redeploy is due but hasn't been confirmed-triggered yet."""
     return _pending
 
 
 async def run_scheduler():
     """
-    Sleeps for config.REDEPLOY_INTERVAL_HOURS, measured from the moment
+    Sleeps for config.REDEPLOY_INTERVAL_SECONDS, measured from the moment
     this loop iteration starts (i.e. from the last actual redeploy or from
     process start on the very first iteration) — not anchored to any fixed
     wall-clock time. Sets the pending flag, then repeats.
@@ -81,8 +81,7 @@ async def run_scheduler():
 
     while True:
         try:
-            interval_hours = getattr(config, "REDEPLOY_INTERVAL_HOURS", 3)
-            interval_secs = interval_hours * 3600
+            interval_secs = float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 150))
             _last_scheduled_at = time.time()
 
             next_fire = datetime.fromtimestamp(
@@ -90,13 +89,13 @@ async def run_scheduler():
             )
             logger.info(
                 f"REDEPLOY SCHEDULER: next redeploy at {next_fire.isoformat()} "
-                f"({interval_hours}h from now, rolling) — sleeping {interval_secs:.0f}s"
+                f"({interval_secs:.0f}s from now, rolling)"
             )
             await asyncio.sleep(interval_secs)
 
             _pending = True
             logger.warning(
-                f"REDEPLOY DUE: {interval_hours}h rolling interval elapsed — "
+                f"REDEPLOY DUE: {interval_secs:.0f}s rolling interval elapsed — "
                 f"waiting for bot_engine to drain open contracts before "
                 f"actually redeploying"
             )
@@ -107,9 +106,9 @@ async def run_scheduler():
             # drain doesn't wedge this loop forever — just keep logging.
             waited = 0
             while _pending:
-                await asyncio.sleep(30)
-                waited += 30
-                if waited % 600 == 0:
+                await asyncio.sleep(1)
+                waited += 1
+                if waited % 300 == 0:
                     logger.warning(
                         f"REDEPLOY STILL PENDING: {waited}s since due — "
                         f"bot_engine is still draining open contracts "
@@ -140,7 +139,7 @@ def trigger_redeploy() -> None:
     in the deployed environment, this used to clear `_pending` and quietly
     return — no actual redeploy happens, but the rolling timer in
     run_scheduler() sees `_pending` go False and starts a fresh
-    REDEPLOY_INTERVAL_HOURS window right then, as if a real redeploy had
+    REDEPLOY_INTERVAL_SECONDS window right then, as if a real redeploy had
     just occurred. The process just keeps running and keeps trading,
     indefinitely, with the scheduler's own logs looking completely normal
     ("next redeploy at ..." every cycle) — this fully explains the
@@ -170,7 +169,7 @@ def trigger_redeploy() -> None:
             "REDEPLOY HOOK NOT CONFIGURED\n"
             "Neither RENDER_API_KEY nor RENDER_DEPLOY_HOOK_URL is set. trigger_redeploy() is clearing "
             "the pending flag and starting a brand-new "
-            f"{getattr(config, 'REDEPLOY_INTERVAL_HOURS', 3)}h window WITHOUT an "
+            f"{getattr(config, 'REDEPLOY_INTERVAL_SECONDS', 150)}s window WITHOUT an "
             "actual redeploy happening. The rolling-restart mechanism is "
             "effectively disabled until RENDER_DEPLOY_HOOK_URL is configured in "
             "the deployment environment.\n" + "=" * 78
@@ -226,7 +225,7 @@ async def _watchdog_loop():
     Task 7 self-check requirement: an independent watchdog that fires a
     loud, high-visibility warning if wall-clock time since the last
     CONFIRMED redeploy (or process start, before the first one) exceeds
-    REDEPLOY_INTERVAL_HOURS by more than a grace margin — regardless of
+    REDEPLOY_INTERVAL_SECONDS by more than a grace margin — regardless of
     what run_scheduler()'s own `_pending` state currently says, and
     regardless of the specific cause (missing hook URL, a stuck drain in
     bot_engine._settle_loop(), a wedged run_scheduler() task, etc). This
@@ -244,8 +243,7 @@ async def _watchdog_loop():
     while True:
         try:
             await asyncio.sleep(check_interval_secs)
-            interval_hours = getattr(config, "REDEPLOY_INTERVAL_HOURS", 3)
-            interval_secs = interval_hours * 3600
+            interval_secs = float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 150))
             baseline = _last_confirmed_redeploy_at or _process_start_time
             uptime_secs = time.time() - baseline
             overdue_by = uptime_secs - interval_secs
@@ -257,8 +255,8 @@ async def _watchdog_loop():
                     logger.critical(
                         "\n" + "=" * 78 + "\n"
                         f"REDEPLOY WATCHDOG: no CONFIRMED redeploy in "
-                        f"{uptime_secs / 3600:.2f}h — {overdue_by / 60:.0f}min "
-                        f"past the {interval_hours}h interval + grace margin. "
+                        f"{uptime_secs:.0f}s — {overdue_by / 60:.0f}min "
+                        f"past the {interval_secs:.0f}s interval + grace margin. "
                         f"The rolling-redeploy mechanism may be stalled — check "
                         f"RENDER_DEPLOY_HOOK_URL is set and reachable, and that "
                         f"bot_engine's _settle_loop()/drain logic isn't stuck.\n"
