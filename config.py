@@ -1658,6 +1658,10 @@ PREDICTOR_BARRIERS       = _env_tuple("PREDICTOR_BARRIERS", tuple(range(10)))
 # MIN_PAYOUT_RATIO if you only want the higher-paying Over/Under contracts).
 PREDICTOR_CONTRACT_KINDS = tuple(k.strip().upper() for k in
                                  os.environ.get("PREDICTOR_CONTRACT_KINDS", "EVEN,ODD").split(",") if k.strip())
+# Invert before execution: when on, a pick EVEN is bought as ODD (and ODD as EVEN). The predictor
+# still decides WHEN to trade (same gates); only the side is flipped. Even/Odd only; Over/Under
+# picks are never flipped. 1 = on, 0 = off.
+PREDICTOR_INVERT = os.environ.get("PREDICTOR_INVERT", "1").strip().lower() in ("1", "true", "yes", "on")
 PREDICTOR_ALPHA          = _env_f("PREDICTOR_ALPHA", 0.05)       # family-wise, Bonferroni-corrected
 PREDICTOR_PAYOUT_FACTOR  = _env_f("PREDICTOR_PAYOUT_FACTOR", 0.975)  # fallback payout estimate only
 PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates priced per tick
