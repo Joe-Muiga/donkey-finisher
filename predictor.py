@@ -171,6 +171,7 @@ class PredictorParams:
     max_payout_ratio: float = field(default_factory=lambda: float(_cfg("MAX_PAYOUT_RATIO", 0.0)))  # 0 = no ceiling
     barriers: Tuple[int, ...] = field(default_factory=lambda: tuple(_cfg("PREDICTOR_BARRIERS", tuple(range(10)))))
     even_odd: bool = True
+    kinds: Tuple[str, ...] = field(default_factory=lambda: tuple(_cfg("PREDICTOR_CONTRACT_KINDS", ("EVEN", "ODD", "OVER", "UNDER"))))
     alpha: float = field(default_factory=lambda: float(_cfg("PREDICTOR_ALPHA", 0.05)))
     payout_factor: float = field(default_factory=lambda: float(_cfg("PREDICTOR_PAYOUT_FACTOR", 0.975)))
 
@@ -206,7 +207,10 @@ class Predictor:
         self.symbol = symbol
         self.p = params or PredictorParams()
         self.payout_ratio_fn = payout_ratio_fn
-        self.candidates = all_candidates(self.p.barriers, self.p.even_odd)
+        self.candidates = [c for c in all_candidates(self.p.barriers, self.p.even_odd)
+                           if c[0] in self.p.kinds]
+        if not self.candidates:
+            raise ValueError(f"PREDICTOR_CONTRACT_KINDS={self.p.kinds} leaves no tradable contract")
         self._win = np.array([[1.0 if wins_digit(c, d) else 0.0 for d in range(10)]
                               for c in self.candidates])           # [cand, digit]
         self.counts_all: Dict[int, np.ndarray] = {}
