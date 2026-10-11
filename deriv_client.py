@@ -198,6 +198,7 @@ class DerivClient:
         self._balance: float             = 0.0
         self._balance_ts: float          = 0.0          # epoch of last successful fetch
         self._balance_callbacks: List[Callable] = []
+        self._stopped: bool              = False        # set by shutdown(): never reconnect again
 
         # ── Polling-based contract resolution ──────────────────────────────────
         # {contract_id: {"callback": fn, "placed_at": time}}
@@ -437,6 +438,10 @@ class DerivClient:
                         _fut.set_exception(ConnectionError("WebSocket disconnected"))
                 self._pending.clear()
 
+            if self._stopped:
+                logger.warning("WebSocket shut down on purpose - reconnect loop ended")
+                return
+
             # A connection that stayed up for a while counts as healthy -> reset backoff.
             # One that died within seconds keeps backing off (avoids hammering OTP/REST).
             if connected_at and time.monotonic() - connected_at >= 30:
@@ -466,6 +471,33 @@ class DerivClient:
                 await ws.close()
             except Exception as exc:
                 logger.debug(f"force_reconnect close error: {exc}")
+
+    async def shutdown(self, reason: str = "") -> None:
+        """Close the socket and keep it closed (connect()'s loop exits instead of reconnecting)."""
+        self._stopped = True
+        logger.warning(f"DERIV CLIENT SHUTDOWN{': ' + reason if reason else ''}")
+        ws = self._ws
+        if ws is not None:
+            try:
+                await asyncio.wait_for(ws.close(), timeout=5)
+            except Exception as exc:
+                logger.debug(f"shutdown close error: {exc}")
+
+    async def fetch_balance_live(self, timeout: float = 8.0) -> float:
+        """Ask Deriv for the balance RIGHT NOW (no cache), update the cached value and fire
+        the balance callbacks. Raises if not connected / on error."""
+        resp = await self._send({"balance": 1}, timeout=timeout)
+        new_bal = float(resp.get("balance", {}).get("balance", self._balance))
+        if new_bal != self._balance:
+            logger.info(f"Balance poll: ${self._balance:.4f} -> ${new_bal:.4f}")
+        self._balance = new_bal
+        self._balance_ts = time.monotonic()
+        for cb in self._balance_callbacks:
+            try:
+                cb(self._balance)
+            except Exception:
+                pass
+        return self._balance
 
     @property
     def connection_count(self) -> int:
@@ -567,6 +599,8 @@ class DerivClient:
         """
         while True:
             await asyncio.sleep(_CONTRACT_POLL_INTERVAL)
+            if self._stopped:
+                return
             # Task 2 observability requirement — cheap, always logged
             # (regardless of whether there's anything to poll) so tracking-
             # set sizes are visible on a predictable cadence rather than
@@ -860,6 +894,13 @@ class DerivClient:
     # ─── Request helper ───────────────────────────────────────────────────────
 
     async def _send(self, payload: dict, timeout: float = 30.0) -> dict:
+        if self._stopped:
+            raise RuntimeError("Client shut down")
+        if "buy" in payload or "proposal" in payload:
+            # Balance-target guard: once TARGET_BALANCE is hit nothing new may be priced or bought.
+            import target_guard
+            if target_guard.is_reached():
+                raise RuntimeError("TARGET_REACHED: trading stopped, order not sent")
         if not self._ws or not self._connected:
             raise RuntimeError("Not connected")
 
