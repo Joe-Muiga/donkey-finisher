@@ -10,6 +10,11 @@
 #     If you set it > 0 you also need RENDER_API_KEY so the bot can trigger the redeploy.
 #   STALE_TICK_SECONDS (30), REFIT_INTERVAL_SECONDS (300), STATS_PERSIST_TO_RENDER (0)
 
+#   TARGET_BALANCE (unset/0 = OFF) - account balance you want. The moment Deriv's LIVE balance
+#     is >= this, the bot stops trading (open trades or not), closes the Deriv connection and
+#     SUSPENDS this Render service. Needs RENDER_API_KEY (below) for the suspend step.
+#     TARGET_CHECK_SECONDS (3) = how often the balance is also polled directly.
+
 services:
   - type: web
     name: sifm-deriv-bot
@@ -26,4 +31,6 @@ services:
       - key: REDEPLOY_INTERVAL_SECONDS
         value: "0"
       - key: RENDER_API_KEY
+        sync: false
+      - key: TARGET_BALANCE
         sync: false
