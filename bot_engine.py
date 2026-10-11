@@ -30,6 +30,15 @@ import restart_scheduler
 import target_guard
 from deriv_client import DerivClient
 
+try:                                    # follower system is optional; the collector never depends on it
+    import db as _follower_db
+except Exception:                       # pragma: no cover
+    _follower_db = None
+try:
+    import follower_manager as _follower_mgr
+except Exception:                       # pragma: no cover
+    _follower_mgr = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,6 +128,8 @@ class BotEngine:
                   asyncio.create_task(self._refit_loop()),
                   asyncio.create_task(self._target_monitor_loop()),
                   asyncio.create_task(self._supervise_ws(ws_task))]
+        if _follower_mgr is not None:        # Deriv server-time offset for the follower scheduler
+            tasks.append(asyncio.create_task(_follower_mgr.collector_time_sync(self.client)))
         stopper = asyncio.create_task(self._target_done.wait())
         main_t = asyncio.gather(*tasks)
         try:
@@ -327,6 +338,13 @@ class BotEngine:
                 logger.warning("BUY returned no contract_id: %s", resp)
                 return
             opened = float(buy.get("purchase_time") or time.time())
+            if _follower_mgr is not None:    # mirror to follower accounts: non-blocking, never raises
+                try:
+                    _follower_mgr.publish_signal({
+                        "signal_id": cid, "symbol": sym, "contract_type": pred.contract_type(pk.cand),
+                        "barrier": pk.cand[1], "duration": int(self.duration), "signal_time": time.time()})
+                except Exception:
+                    pass
             self._open[cid] = {"sym": sym, "cand": pk.cand, "stake": self.stake, "ratio": ratio,
                                "opened_at": opened, "decision_epoch": tick_epoch, "t0": time.time(),
                                "ctx": pk.context, "p_lower": pk.p_lower}
@@ -478,6 +496,11 @@ class BotEngine:
         profit = float(poc.get("profit") or 0.0)
         won = profit > 0
         self.stats.record(info["opened_at"], info["stake"], info["ratio"], profit)
+        if _follower_db is not None:         # batched DB write; never blocks, never raises
+            try:
+                _follower_db.record_collector_trade(info["opened_at"], info["stake"], info["ratio"], profit)
+            except Exception:
+                pass
         tag = f"{info['cand'][0]}{'' if info['cand'][1] is None else info['cand'][1]}"
         logger.info("CONTRACT SETTLED %s %s %s %s profit=%.2f", cid, info["sym"], tag,
                     "WIN" if won else "LOSS", profit)
