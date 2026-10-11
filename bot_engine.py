@@ -416,3 +416,4 @@ def evaluate_for_signal_engine(ticks: Optional[List[Any]], symbol: str):
     return SignalResult(direction=kind, strength=3, score=pk.p_lower, strategy="PREDICTOR",
                         reason=f"k={pk.k} ctx={pk.context} n={pk.n} p={pk.p_hat:.3f} lb={pk.p_lower:.3f} edge={d.edge:.3f}",
                         contract_kind="DIGIT", digit=b, match_type=kind)
+ 
