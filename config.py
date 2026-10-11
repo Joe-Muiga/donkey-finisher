@@ -1639,7 +1639,7 @@ PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 1000.0)     # flat stake pe
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
 # OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
 # expectation, versus ~4.8% for OVER5/UNDER4 and ~6.3% for OVER6/UNDER3. 0 = no ceiling.
-MIN_PAYOUT_RATIO         = _env_f("MIN_PAYOUT_RATIO", 2.0)
+MIN_PAYOUT_RATIO         = _env_f("MIN_PAYOUT_RATIO", 1.9)   # EVEN/ODD pay ~1.95x, so the floor must sit below that
 MAX_PAYOUT_RATIO         = _env_f("MAX_PAYOUT_RATIO", 2.5)
 EDGE_MARGIN              = _env_f("EDGE_MARGIN", 0.01)
 WILSON_Z                 = _env_f("WILSON_Z", 2.0)
@@ -1653,6 +1653,11 @@ CONTRACT_DURATION_TICKS  = _env_i("CONTRACT_DURATION_TICKS", 1)
 # proposal+buy round trip is shorter than one tick interval). Horizon = duration + this.
 PREDICTOR_ENTRY_DELAY_TICKS = _env_i("PREDICTOR_ENTRY_DELAY_TICKS", 0)
 PREDICTOR_BARRIERS       = _env_tuple("PREDICTOR_BARRIERS", tuple(range(10)))
+# Which digit contract kinds may trade: any of EVEN, ODD, OVER, UNDER (comma separated).
+# Default = Even/Odd only. Use "EVEN,ODD,OVER,UNDER" to allow Over/Under again (then also raise
+# MIN_PAYOUT_RATIO if you only want the higher-paying Over/Under contracts).
+PREDICTOR_CONTRACT_KINDS = tuple(k.strip().upper() for k in
+                                 os.environ.get("PREDICTOR_CONTRACT_KINDS", "EVEN,ODD").split(",") if k.strip())
 PREDICTOR_ALPHA          = _env_f("PREDICTOR_ALPHA", 0.05)       # family-wise, Bonferroni-corrected
 PREDICTOR_PAYOUT_FACTOR  = _env_f("PREDICTOR_PAYOUT_FACTOR", 0.975)  # fallback payout estimate only
 PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates priced per tick
