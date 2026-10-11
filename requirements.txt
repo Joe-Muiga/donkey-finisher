@@ -10,3 +10,5 @@ gunicorn>=21.0.0
 setuptools>=68.0.0
 pyarrow>=14.0.0
 aiohttp
+psycopg[binary,pool]>=3.2
+cryptography>=42.0
