@@ -37,12 +37,18 @@ if not config.DERIV_API_TOKEN:
 def _run_bot():
     """Run the engine; if it ever exits or crashes, start it again (never sit idle)."""
     from bot_engine import BotEngine
+    import target_guard
     while True:
         try:
             asyncio.run(BotEngine().run())
+            if target_guard.is_reached():
+                logger.warning("Balance target reached - bot stays stopped (no restart)")
+                return
             logger.warning("Bot engine returned; restarting in 5 s")
         except Exception as exc:
             logger.error(f"Bot crashed: {exc}", exc_info=True)
+        if target_guard.is_reached():
+            return
         time.sleep(5)
 
 
@@ -58,6 +64,8 @@ if __name__ == "__main__":
         logger.info(f"  Redeploy     : every {config.REDEPLOY_INTERVAL_SECONDS:.0f}s")
     else:
         logger.info("  Redeploy     : DISABLED (continuous run, in-process self-healing)")
+    import target_guard as _tg
+    logger.info(f"  Balance target: {_tg.target() if _tg.target() else 'OFF (TARGET_BALANCE not set)'}")
     logger.info(f"  Port         : {config.PORT}")
 
     start_keep_alive()
