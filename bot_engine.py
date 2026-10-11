@@ -262,6 +262,13 @@ class BotEngine:
             finally:
                 self._busy.discard(sym)
 
+    @staticmethod
+    def _trade_cand(cand: pred.Candidate) -> pred.Candidate:
+        """INVERT: buy the opposite parity of the predictor's pick (Even/Odd only)."""
+        if _cfg("PREDICTOR_INVERT", False) and cand[0] in ("EVEN", "ODD"):
+            return ("ODD" if cand[0] == "EVEN" else "EVEN", None)
+        return cand
+
     def _contract_params(self, sym: str, cand: pred.Candidate, stake: float) -> dict:
         p = {"amount": stake, "basis": "stake",
              "contract_type": pred.contract_type(cand), "currency": "USD",
@@ -300,14 +307,17 @@ class BotEngine:
         for pk in picks[: int(_cfg("PREDICTOR_MAX_PROPOSALS", 3))]:
             if self._blocked():
                 return
-            prop = await self._propose(sym, pk.cand, self.stake)
+            tc = self._trade_cand(pk.cand)                  # side actually bought (flipped if INVERT)
+            prop = await self._propose(sym, tc, self.stake)
             if not prop:
                 continue
             payout = float(prop.get("payout") or 0.0)
             ratio = payout / self.stake                     # live ratio, never hardcoded
-            self._ratios[sym][pk.cand] = ratio
-            dec = pr.accept(pk, ratio)
-            tag = f"{pk.cand[0]}{'' if pk.cand[1] is None else pk.cand[1]}"
+            self._ratios[sym][tc] = ratio
+            dec = pr.accept(pk, ratio)                      # same gates: the predictor decides WHEN
+            tag = f"{tc[0]}{'' if tc[1] is None else tc[1]}"
+            if tc != pk.cand:
+                tag += f"(inv {pk.cand[0]})"
             if not dec.ok:
                 self._last_decision = f"skip {tag}: {dec.reason}"
                 logger.info("SKIP %s %s: %s", sym, tag, dec.reason)
@@ -317,7 +327,7 @@ class BotEngine:
             ask = float(prop.get("ask_price") or self.stake)
             try:
                 if self._direct_buy:
-                    resp = await self._buy_direct(sym, pk.cand, ask)
+                    resp = await self._buy_direct(sym, tc, ask)
                 else:
                     try:
                         resp = await self.client._send({"buy": prop["id"], "price": ask}, timeout=10)
@@ -326,7 +336,7 @@ class BotEngine:
                             raise
                         logger.warning("Buy by proposal id was refused (%s) - retrying with a direct buy "
                                        "(buy=1 + parameters)", str(exc)[:120])
-                        resp = await self._buy_direct(sym, pk.cand, ask)
+                        resp = await self._buy_direct(sym, tc, ask)
                         self._direct_buy = True
                         logger.info("Direct buy worked - using it for all further trades")
             except Exception as exc:
@@ -341,11 +351,11 @@ class BotEngine:
             if _follower_mgr is not None:    # mirror to follower accounts: non-blocking, never raises
                 try:
                     _follower_mgr.publish_signal({
-                        "signal_id": cid, "symbol": sym, "contract_type": pred.contract_type(pk.cand),
-                        "barrier": pk.cand[1], "duration": int(self.duration), "signal_time": time.time()})
+                        "signal_id": cid, "symbol": sym, "contract_type": pred.contract_type(tc),
+                        "barrier": tc[1], "duration": int(self.duration), "signal_time": time.time()})
                 except Exception:
                     pass
-            self._open[cid] = {"sym": sym, "cand": pk.cand, "stake": self.stake, "ratio": ratio,
+            self._open[cid] = {"sym": sym, "cand": tc, "stake": self.stake, "ratio": ratio,
                                "opened_at": opened, "decision_epoch": tick_epoch, "t0": time.time(),
                                "ctx": pk.context, "p_lower": pk.p_lower}
             self._last_decision = f"BUY {tag} ctx={pk.context} lb={pk.p_lower:.3f} ratio={ratio:.3f}"
