@@ -1660,8 +1660,15 @@ PREDICTOR_CONTRACT_KINDS = tuple(k.strip().upper() for k in
                                  os.environ.get("PREDICTOR_CONTRACT_KINDS", "EVEN,ODD").split(",") if k.strip())
 # Invert before execution: when on, a pick EVEN is bought as ODD (and ODD as EVEN). The predictor
 # still decides WHEN to trade (same gates); only the side is flipped. Even/Odd only; Over/Under
-# picks are never flipped. 1 = on, 0 = off.
-PREDICTOR_INVERT = os.environ.get("PREDICTOR_INVERT", "1").strip().lower() in ("1", "true", "yes", "on")
+# picks are never flipped. 1 = on, 0 = off (default: OFF, trade the predictor's own side).
+PREDICTOR_INVERT = os.environ.get("PREDICTOR_INVERT", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Startup delay: after every (re)deploy / process start the bot places NO trade for this many
+# seconds (default 300 = 5 minutes). Ticks keep feeding the predictor, but no signal is acted on
+# during the delay and none is queued for afterwards. 0 = no delay.
+import time as _time
+STARTUP_DELAY_SECONDS = float(os.environ.get("STARTUP_DELAY_SECONDS", "300") or 0)
+PROCESS_START = _time.time()
 PREDICTOR_ALPHA          = _env_f("PREDICTOR_ALPHA", 0.05)       # family-wise, Bonferroni-corrected
 PREDICTOR_PAYOUT_FACTOR  = _env_f("PREDICTOR_PAYOUT_FACTOR", 0.975)  # fallback payout estimate only
 PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates priced per tick
