@@ -65,6 +65,7 @@ class BotEngine:
         self._drain_started: Optional[float] = None
         self._lag_obs: List[int] = []
         self._last_decision = "—"
+        self._delay_over_logged = False
         self.balance = 0.0
         self._target_done = asyncio.Event()   # set once the TARGET_BALANCE shutdown has finished
         # ── self-healing state ──
@@ -237,10 +238,23 @@ class BotEngine:
         been missed, so the digit context would be wrong."""
         return self._conn_count() != self._seen_conn
 
+    def _startup_delay_left(self) -> float:
+        """Seconds left of the post-redeploy no-trade window (0 once it is over)."""
+        d = float(_cfg("STARTUP_DELAY_SECONDS", 0) or 0)
+        if d <= 0:
+            return 0.0
+        left = float(_cfg("PROCESS_START", 0.0)) + d - time.time()
+        if left <= 0:
+            if not self._delay_over_logged:
+                self._delay_over_logged = True
+                logger.info("STARTUP DELAY over - trading enabled")
+            return 0.0
+        return left
+
     def _blocked(self) -> bool:
         # Only technical blocks remain: no socket, or predictor not yet re-synced after a
         # reconnect (a few seconds), or the optional scheduled redeploy (off by default).
-        return (target_guard.is_reached()
+        return (self._startup_delay_left() > 0 or target_guard.is_reached()
                 or restart_scheduler.is_redeploy_pending() or time.time() < self._halted_until
                 or not self.client.is_connected or self._needs_resync())
 
@@ -251,6 +265,9 @@ class BotEngine:
             await ev.wait()
             ev.clear()
             if self._blocked() or sym in self._busy:
+                left = self._startup_delay_left()
+                if left > 0:                       # signal dropped, not queued
+                    self._last_decision = f"startup delay: {int(left)}s left, no trading"
                 continue
             self._busy.add(sym)
             try:
