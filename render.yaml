@@ -15,6 +15,20 @@
 #     SUSPENDS this Render service. Needs RENDER_API_KEY (below) for the suspend step.
 #     TARGET_CHECK_SECONDS (3) = how often the balance is also polled directly.
 
+# ── Follower accounts (optional; the collector runs the same without them) ─────────────
+#   Set on Render (Environment tab; never put values in this file):
+#     DATABASE_URL    - Neon pooled connection string (already set)
+#     ADMIN_PASSWORD  - password for /followers /verdict /capacity (pages refuse to load without it)
+#     ENCRYPTION_KEY  - Fernet key that encrypts follower tokens. Generate once with:
+#         python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#   Optional (defaults in brackets):
+#     DEFAULT_ZONE_START (53), DEFAULT_ZONE_END (59)  - pre-registered HYPOTHESIS window, minutes of the
+#       hour, inclusive: starts 53:00.0, last opening 59:59.9. A test, not a claimed edge.
+#     ZONE_MIN_TRADES (150), ZONE_MAX_PER_HOUR (3), VERDICT_MIN_TRADES (300),
+#     FOLLOWER_LOCK_THRESHOLD (5.0)
+#   Keep TARGET_BALANCE UNSET, otherwise the collector would stop.
+#   Demo/real is ONE global switch on the /followers page (typed confirmation), not an env var.
+
 services:
   - type: web
     name: sifm-deriv-bot
