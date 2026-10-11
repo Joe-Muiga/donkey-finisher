@@ -13,6 +13,8 @@ Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (redeploy + stats persisten
 optional DERIV_APP_ID, DERIV_ACCOUNT_MODE ("demo" default / "real" picks which
 account the token's OTP is minted for), DASHBOARD_PIN, PREDICTOR_SYMBOLS, ...
 (see CHANGES.md).
+
+Follower accounts (optional): DATABASE_URL, ADMIN_PASSWORD, ENCRYPTION_KEY - see render.yaml.
 """
 import asyncio
 import logging
@@ -70,6 +72,23 @@ if __name__ == "__main__":
 
     start_keep_alive()
     start_restart_scheduler()
+
+    # Follower accounts: own thread + own event loop + Flask Blueprint. Fully optional:
+    # any failure here is logged and the collector below starts regardless.
+    try:
+        import follower_manager
+        import follower_web
+        follower_web.register(app)
+        follower_manager.start()
+
+        def _on_sigterm(signum, frame):
+            logger.warning("SIGTERM - flushing follower DB buffers")
+            follower_manager.shutdown_blocking(8.0)
+            raise SystemExit(0)
+        import signal
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception as exc:
+        logger.error(f"Follower system not started: {exc}", exc_info=True)
     threading.Thread(target=_run_bot, name="bot-engine", daemon=True).start()
     logger.info("Bot engine thread started ✓")
     app.run(host="0.0.0.0", port=config.PORT, use_reloader=False, threaded=True)
