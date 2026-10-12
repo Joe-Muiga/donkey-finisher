@@ -9,9 +9,10 @@
 #   TRADE WINDOW: connected to Deriv only minutes 29-36 of each hour (UTC). When the window closes the bot
 #     disconnects and redeploys itself with the build cache CLEARED (needs RENDER_API_KEY, required now),
 #     then idles until ~40 s before minute 29 (WINDOW_PRECONNECT_SECONDS, default 40). REDEPLOY_INTERVAL_SECONDS is ignored.
-#   REDEPLOY_INTERVAL_SECONDS (0 = scheduled self-redeploy OFF, the default; the bot runs
-#     continuously and heals itself: reconnect-forever, stale-tick watchdog, periodic refit).
-#     If you set it > 0 you also need RENDER_API_KEY so the bot can trigger the redeploy.
+#   AUTO_REDEPLOY (0 = scheduled self-redeploy OFF, the default; the bot runs continuously and heals
+#     itself: reconnect-forever, stale-tick watchdog, periodic refit). 1 = ON: redeploys every
+#     AUTO_REDEPLOY_SECONDS (edit at the bottom of config.py; 420 = 7 min) and turns the hourly trade
+#     window off. Needs RENDER_API_KEY so the bot can trigger the redeploy.
 #   STALE_TICK_SECONDS (30), REFIT_INTERVAL_SECONDS (300), STATS_PERSIST_TO_RENDER (0)
 
 #   TARGET_BALANCE (unset/0 = OFF) - account balance you want. The moment Deriv's LIVE balance
@@ -46,7 +47,7 @@ services:
     envVars:
       - key: DERIV_API_TOKEN
         sync: false
-      - key: REDEPLOY_INTERVAL_SECONDS
+      - key: AUTO_REDEPLOY      # 1 = redeploy every config.AUTO_REDEPLOY_SECONDS (bottom of config.py, 420 = 7 min); 0 = off
         value: "0"
       - key: RENDER_API_KEY
         sync: false
