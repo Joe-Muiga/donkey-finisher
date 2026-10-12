@@ -56,7 +56,7 @@ VERDICT_MIN_TRADES = _i("VERDICT_MIN_TRADES", 300)
 
 # ── money rules ──────────────────────────────────────────────────────────────
 LOCK_THRESHOLD = _f("FOLLOWER_LOCK_THRESHOLD", 5.0)
-MIN_STAKE = 0.35
+MIN_STAKE = _f("PREDICTOR_STAKE", 0.35)      # same Render env var as the main account
 STAKE_FRACTION = 0.175
 FLOOR_FRACTION = 0.7
 PEAK_SHARE = 0.5
