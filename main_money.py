@@ -69,20 +69,20 @@ class MainMoney:
         except Exception:
             db = None
         if db is not None:
-            # The bot is redeployed after every trade window, so the database is the only state that
-            # survives. If it is configured but unreadable, do NOT start from a fresh P (that would
-            # silently lower the floor): fail, and no trading happens this window.
-            last = None
+            # Redeploys wipe local files, so the database is the real memory. If it cannot be read the
+            # bot still trades: it falls back to the local file, else starts from a fresh P/floor.
             for attempt in range(3):
                 try:
                     db.ensure_started()
                     raw = db.meta_get(STATE_KEY)
                     return json.loads(raw) if raw else None
                 except Exception as exc:
-                    last = exc
+                    logger.warning("MAIN MONEY: database state unreadable (attempt %d/3): %s",
+                                   attempt + 1, str(exc)[:100])
                     time.sleep(2.0 * (attempt + 1))
-            raise RuntimeError(f"saved floor state unreadable: {str(last)[:100]}")
-        logger.warning("MAIN MONEY: no DATABASE_URL - the floor is kept only in a local file and is LOST on "
+            logger.error("MAIN MONEY: database unreadable - trading continues; using local file / fresh floor")
+        else:
+            logger.warning("MAIN MONEY: no DATABASE_URL - the floor is kept only in a local file and is LOST on "
                        "every redeploy (the bot redeploys after each trade window)")
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as fh:
