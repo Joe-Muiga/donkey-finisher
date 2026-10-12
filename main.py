@@ -5,8 +5,9 @@ main.py – entry point (Render web service).
   • bot-engine   : asyncio thread running the digit predictor. Starts on EVERY boot
                    and is restarted if it crashes – there is no cycle, cooldown or idle phase.
   • keep-alive   : self-ping of /health.
-  • restart sched: OFF by default (REDEPLOY_INTERVAL_SECONDS=0). If set > 0 it sets the
-                   "redeploy pending" flag every N seconds; bot_engine then stops opening
+  • restart sched: OFF by default. Render env var AUTO_REDEPLOY=1 turns it on; the interval is
+                   config.AUTO_REDEPLOY_SECONDS (bottom of config.py, default 420 = 7 min). It sets
+                   the "redeploy pending" flag every N seconds; bot_engine then stops opening
                    trades, drains open contracts, flushes stats and triggers a Render redeploy.
 
 Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (redeploy + stats persistence),
@@ -93,17 +94,18 @@ if __name__ == "__main__":
     if not (os.environ.get("PREDICTOR_STAKE") or "").strip():
         logger.warning("PREDICTOR_STAKE is not set on Render - using the default minimum stake %s", config.PREDICTOR_STAKE)
     if config.REDEPLOY_INTERVAL_SECONDS > 0:
-        logger.info(f"  Redeploy     : every {config.REDEPLOY_INTERVAL_SECONDS:.0f}s")
+        logger.info(f"  Redeploy     : AUTO_REDEPLOY ON - every {config.REDEPLOY_INTERVAL_SECONDS:.0f}s "
+                    f"({config.REDEPLOY_INTERVAL_SECONDS / 60:.1f} min); hourly trade window forced OFF")
     else:
-        logger.info("  Redeploy     : DISABLED (continuous run, in-process self-healing)")
+        logger.info("  Redeploy     : OFF (set AUTO_REDEPLOY=1 on Render to enable)")
     import target_guard as _tg
     logger.info(f"  Balance target: {_tg.target() if _tg.target() else 'OFF (TARGET_BALANCE not set)'}")
     logger.info(f"  Port         : {config.PORT}")
 
     start_keep_alive()
     if config.REDEPLOY_INTERVAL_SECONDS > 0:
-        logger.warning("REDEPLOY_INTERVAL_SECONDS is ignored: the window scheduler redeploys (cache cleared) "
-                       "after every trade window instead")
+        import restart_scheduler
+        restart_scheduler.start_restart_scheduler()      # rolling timer + watchdog (own thread)
 
     # Follower accounts: own thread + own event loop + Flask Blueprint. Fully optional:
     # any failure here is logged and the main account below starts regardless.
