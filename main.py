@@ -88,7 +88,8 @@ if __name__ == "__main__":
     logger.info(f"  Symbols      : {config.PREDICTOR_SYMBOLS}  "
                 f"min stake (PREDICTOR_STAKE)={config.PREDICTOR_STAKE}")
     logger.info(f"  Account mode : {config.DERIV_ACCOUNT_MODE}")
-    logger.info(f"  Trade window : minutes {config.TRADE_WINDOW_START_MINUTE}-{config.TRADE_WINDOW_END_MINUTE} of every hour (UTC), strict")
+    logger.info("  Trade window : %s" % (f"minutes {config.TRADE_WINDOW_START_MINUTE}-{config.TRADE_WINDOW_END_MINUTE} of every hour (UTC), strict"
+                                         if config.TRADE_WINDOW_ENABLED else "OFF (SESSION_WINDOW_ENABLED=0) - trading all hours, no hourly redeploy"))
     if not (os.environ.get("PREDICTOR_STAKE") or "").strip():
         logger.warning("PREDICTOR_STAKE is not set on Render - using the default minimum stake %s", config.PREDICTOR_STAKE)
     if config.REDEPLOY_INTERVAL_SECONDS > 0:
