@@ -1672,6 +1672,28 @@ PREDICTOR_BARRIERS       = _env_tuple("PREDICTOR_BARRIERS", tuple(range(10)))
 PREDICTOR_ALPHA          = _env_f("PREDICTOR_ALPHA", 0.05)       # family-wise, Bonferroni-corrected
 PREDICTOR_PAYOUT_FACTOR  = _env_f("PREDICTOR_PAYOUT_FACTOR", 0.975)  # fallback payout estimate only
 PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates priced per tick
+
+# ─── SET MODE: predict a set of next digits, buy the Over/Under that covers it ─────────────────────
+# (set_predictor.py + set_engine.py). ON by default; SET_MODE=0 runs the original single-contract engine.
+# It ignores TRADE_WINDOW_*, MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, never uses Matches/Differs/Even/Odd,
+# and is DEMO-ONLY unless SET_ALLOW_REAL=1.
+SET_MODE               = os.environ.get("SET_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+SET_ALLOW_REAL         = os.environ.get("SET_ALLOW_REAL", "0").strip().lower() in ("1", "true", "yes", "on")
+SET_SIZE               = _env_i("SET_SIZE", 3)                    # digits predicted per tick
+SET_MAX_COVER_WIDTH    = _env_i("SET_MAX_COVER_WIDTH", 5)         # "clustered": cover wins on <= this many digits
+SET_CONTEXT_SIZES      = _env_tuple("SET_CONTEXT_SIZES", (1, 2, 3))
+SET_PRIOR_STRENGTH     = _env_f("SET_PRIOR_STRENGTH", 50.0)       # shrinkage toward uniform
+SET_BACKOFF_STRENGTH   = _env_f("SET_BACKOFF_STRENGTH", 30.0)     # shrinkage of a context toward its shorter one
+SET_MIN_SET_PROB       = _env_f("SET_MIN_SET_PROB", 0.0)          # optional: min P(next digit in set); 0 = off
+SET_MIN_SCORE          = _env_f("SET_MIN_SCORE", 0.0)             # optional: min (P(win) x payout/stake); 0 = off
+SET_STAKE              = _env_f("SET_STAKE", 1.0)                 # flat stake per contract (demo)
+SET_PRICE_TOP          = _env_i("SET_PRICE_TOP", 4)               # best symbols priced (in parallel) per scan
+SET_MAX_BUYS_PER_SCAN  = _env_i("SET_MAX_BUYS_PER_SCAN", 2)       # contracts bought (in parallel) per scan
+SET_MAX_OPEN           = _env_i("SET_MAX_OPEN", 6)                # max contracts open at once
+SET_COALESCE_SECONDS   = _env_f("SET_COALESCE_SECONDS", 0.05)     # wait so simultaneous ticks are ranked together
+SET_MIN_SCAN_GAP       = _env_f("SET_MIN_SCAN_GAP", 0.25)         # min seconds between scans (API rate limits)
+SET_SIGNAL_MAX_AGE_FRAC = _env_f("SET_SIGNAL_MAX_AGE_FRAC", 0.6)  # a signal dies after this fraction of a tick interval
+SET_REPORT_SECONDS     = _env_f("SET_REPORT_SECONDS", 300)        # accuracy/performance report period
 PREDICTOR_STATS_FLUSH_SECONDS = _env_f("PREDICTOR_STATS_FLUSH_SECONDS", 30)
 MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
 WINDOW_MINUTES           = _env_i("WINDOW_MINUTES", 10)
