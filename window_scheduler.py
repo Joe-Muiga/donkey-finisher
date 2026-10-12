@@ -38,6 +38,8 @@ def _minute(ts: float) -> float:
 
 
 def in_window(ts: float) -> bool:
+    if not config.TRADE_WINDOW_ENABLED:              # SESSION_WINDOW_ENABLED=0: always "inside"
+        return True
     m = int(ts // 60) % 60
     return config.TRADE_WINDOW_START_MINUTE <= m <= config.TRADE_WINDOW_END_MINUTE
 
