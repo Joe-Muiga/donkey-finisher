@@ -9,8 +9,11 @@ What is different from the original engine
   * Scan: every symbol keeps one fresh signal (valid until that symbol's next tick). A single scanner
     ranks ALL fresh signals at the same instant, prices the best SET_PRICE_TOP of them IN PARALLEL with
     live proposals, ranks them by  P(win) x payout/stake  and buys the best SET_MAX_BUYS_PER_SCAN IN
-    PARALLEL. No payout floor/ceiling, no trade window, no edge gate (SET_MIN_SCORE / SET_MIN_SET_PROB
+    PARALLEL. No payout floor/ceiling, no edge gate (SET_MIN_SCORE / SET_MIN_SET_PROB
     are optional and off by default).
+  * Money: stakes come from the profit-securing money rules (main_money.py): stake = max(PREDICTOR_STAKE,
+    17.5% of balance-above-floor); never a buy that would take the balance under the floor.
+  * Window: buys only in minutes 29-36 of the hour (config.TRADE_WINDOW_*).
   * Safety: DEMO ONLY unless SET_ALLOW_REAL=1; SET_MAX_OPEN caps simultaneous contracts; trades are NOT
     mirrored to follower accounts and are not fed into the follower zone statistics.
   * Reporting: every SET_REPORT_SECONDS the log shows live top-1 / top-N prediction accuracy next to
@@ -46,7 +49,7 @@ def account_allowed() -> Tuple[bool, str]:
 class SetEngine(BotEngine):
     def __init__(self):
         super().__init__()
-        self.stake = float(_cfg("SET_STAKE", 1.0))
+        self.stake = float(_cfg("PREDICTOR_STAKE", 0.35))  # MINIMUM stake (env) - probe stake; real stakes: money rules
         self._feed_followers = False                       # no follower stats / mirroring in set mode
         self._signals: Dict[str, sp.SetSignal] = {}
         self._scan_event = asyncio.Event()
@@ -57,10 +60,7 @@ class SetEngine(BotEngine):
         self._set_known = 0                                # trades where the settling digit could be read
         self._scans = 0
 
-    # the trade window of the original engine does not apply: any minute of the hour
-    @staticmethod
-    def _in_trade_window(ts: float) -> bool:
-        return True
+    # the strict trade window (minutes 27-36 of the hour) is inherited from BotEngine._in_trade_window
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def run(self):
@@ -68,7 +68,7 @@ class SetEngine(BotEngine):
         if not ok:
             logger.critical("SET MODE REFUSED TO START: %s", why)
             return
-        logger.info("SET MODE: %s | set size %d, cover width <= %d, stake %.2f, max open %d",
+        logger.info("SET MODE: %s | set size %d, cover width <= %d, min stake %.2f, max open %d",
                     why, int(_cfg("SET_SIZE", 3)), int(_cfg("SET_MAX_COVER_WIDTH", 5)),
                     self.stake, int(_cfg("SET_MAX_OPEN", 6)))
         await super().run()
@@ -162,6 +162,10 @@ class SetEngine(BotEngine):
                 await asyncio.sleep(coalesce)          # ticks of several symbols often land together
             self._scan_event.clear()
             if self._blocked():
+                if not self._in_trade_window(time.time()):
+                    self._last_decision = (f"outside trade window (minutes "
+                                           f"{int(_cfg('TRADE_WINDOW_START_MINUTE', 0))}-"
+                                           f"{int(_cfg('TRADE_WINDOW_END_MINUTE', 59))})")
                 continue
             try:
                 await self._scan_once()
@@ -178,6 +182,10 @@ class SetEngine(BotEngine):
         slots = int(_cfg("SET_MAX_OPEN", 6)) - len(self._open) - self._inflight
         if slots <= 0:
             self._last_decision = f"max open contracts ({len(self._open)}) reached"
+            return
+        stake = self._next_stake()                      # money rules; None = stopped (floor reached)
+        if stake is None:
+            self._last_decision = "stopped by money rules (floor reached) - resumes at next reset"
             return
         fresh = []
         for sym, sig in list(self._signals.items()):
@@ -196,14 +204,14 @@ class SetEngine(BotEngine):
         top = ranked[: max(1, int(_cfg("SET_PRICE_TOP", 4)))]
 
         # live proposals for all of them at once
-        props = await asyncio.gather(*(self._propose(sig.symbol, c[0], self.stake) for _, sig, c in top),
+        props = await asyncio.gather(*(self._propose(sig.symbol, c[0], stake) for _, sig, c in top),
                                      return_exceptions=True)
         min_score = float(_cfg("SET_MIN_SCORE", 0.0))
         scored = []
         for (_est, sig, c), prop in zip(top, props):
             if isinstance(prop, BaseException) or not prop:
                 continue
-            ratio = float(prop.get("payout") or 0.0) / self.stake
+            ratio = float(prop.get("payout") or 0.0) / stake
             if ratio <= 0:
                 continue
             self._ratios.setdefault(sig.symbol, {})[c[0]] = ratio
@@ -223,6 +231,14 @@ class SetEngine(BotEngine):
         if not picks:
             self._last_decision = "signals expired while pricing"
             return
+        affordable = []
+        for x in picks:                               # hard rule: every buy must leave balance >= floor
+            if self.money.reserve(stake):
+                affordable.append(x)
+        picks = affordable
+        if not picks:
+            self._last_decision = "skip: buying would breach the profit floor"
+            return
         for x in picks:                               # claim them before any await
             sig = x[1]
             self._used.add((sig.symbol, sig.epoch if sig.epoch is not None else sig.wall))
@@ -230,17 +246,19 @@ class SetEngine(BotEngine):
             self._used.clear()
         self._inflight += len(picks)
         try:
-            await asyncio.gather(*(self._buy_signal(*x) for x in picks), return_exceptions=True)
+            await asyncio.gather(*(self._buy_signal(*x, stake) for x in picks), return_exceptions=True)
         finally:
             self._inflight -= len(picks)
+            for _ in picks:
+                self.money.release(stake)
 
-    async def _buy_signal(self, score, sig: sp.SetSignal, c, ratio: float, prop: dict):
+    async def _buy_signal(self, score, sig: sp.SetSignal, c, ratio: float, prop: dict, stake: float):
         sym, cand = sig.symbol, c[0]
         try:
-            ask = float(prop.get("ask_price") or self.stake)
+            ask = float(prop.get("ask_price") or stake)
             try:
                 if self._direct_buy:
-                    resp = await self._buy_direct(sym, cand, ask)
+                    resp = await self._buy_direct(sym, cand, ask, stake)
                 else:
                     try:
                         resp = await self.client._send({"buy": prop["id"], "price": ask}, timeout=10)
@@ -249,19 +267,20 @@ class SetEngine(BotEngine):
                             raise
                         logger.warning("Buy by proposal id was refused (%s) - retrying with a direct buy",
                                        str(exc)[:120])
-                        resp = await self._buy_direct(sym, cand, ask)
+                        resp = await self._buy_direct(sym, cand, ask, stake)
                         self._direct_buy = True
             except Exception as exc:
                 await self._on_api_error("buy", exc)
                 return None
             buy = resp.get("buy") or {}
+            self.money.note_buy(buy)
             cid = str(buy.get("contract_id", ""))
             if not cid:
                 logger.warning("BUY returned no contract_id: %s", resp)
                 return None
             opened = float(buy.get("purchase_time") or time.time())
             tg = sp.tag(cand)
-            self._open[cid] = {"sym": sym, "cand": cand, "stake": self.stake, "ratio": ratio,
+            self._open[cid] = {"sym": sym, "cand": cand, "stake": stake, "ratio": ratio,
                                "opened_at": opened, "decision_epoch": sig.epoch, "t0": time.time(),
                                "ctx": sig.ranked, "p_lower": c[2], "pred_digits": sig.digits,
                                "pred_ranked": sig.ranked, "p_win": c[2], "score": score, "width": c[1]}
@@ -363,7 +382,7 @@ class SetEngine(BotEngine):
                     balance=round(self.client.balance, 2), session="SET MODE (demo)",
                     current_symbol=",".join(self.symbols), last_signal=self._last_decision,
                     tradeable_count=len(self._signals), open_contracts_count=len(self._open),
-                    target_balance=target_guard.target())
+                    target_balance=target_guard.target(), money=self.money.snapshot())
                 keep_alive.set_active_trades(len(self._open))
             except Exception:
                 pass
