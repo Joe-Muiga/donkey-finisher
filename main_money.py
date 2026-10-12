@@ -133,6 +133,15 @@ class MainMoney:
                                    milestone_hit=bool(saved.get("milestone_hit")))
         bal = await client.fetch_balance_live(timeout=8)
         self.on_balance(bal)
+        # New session (every trade window): if the last one ended with the floor reached, the bot must not
+        # sit idle until midnight. Re-base: P = live balance, new floor = 0.7*P. The old floor may be
+        # breached (that is the point: keep trading to grow the account), but trading stays protected.
+        if self.state.p is not None and mr.is_stopped(self.state, bal, self.min_stake):
+            old_floor = self.state.floor
+            self.state = mr.apply_reset(self.state, bal, self.lock_threshold, self.state.last_reset_date)
+            logger.warning("MAIN MONEY re-based for this session: floor %s was reached; P=%.2f new floor=%s",
+                           _f(old_floor), bal, _f(self.state.floor))
+            self._save_soon()
         self.ready = True
         logger.info("MAIN MONEY ready: balance=%.2f P=%s floor=%s tier=%s min_stake(PREDICTOR_STAKE)=%.2f "
                     "lock_threshold=%.2f", bal, _f(self.state.p), _f(self.state.floor), self.state.tier,
