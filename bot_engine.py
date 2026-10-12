@@ -67,6 +67,7 @@ class BotEngine:
         self._last_decision = "—"
         self.balance = 0.0
         self._target_done = asyncio.Event()   # set once the TARGET_BALANCE shutdown has finished
+        self._feed_followers = True           # SetEngine turns this off (no follower stats / mirroring)
         # ── self-healing state ──
         self._last_tick_wall: Dict[str, float] = {}
         self._live: Dict[str, collections.deque] = {}      # recent (epoch, digit) seen live
@@ -151,6 +152,7 @@ class BotEngine:
                   asyncio.create_task(self._refit_loop()),
                   asyncio.create_task(self._target_monitor_loop()),
                   asyncio.create_task(self._supervise_ws(ws_task))]
+        tasks += [asyncio.create_task(c) for c in self._extra_tasks()]
         if _follower_mgr is not None:        # Deriv server-time offset for the follower scheduler
             tasks.append(asyncio.create_task(_follower_mgr.collector_time_sync(self.client)))
         stopper = asyncio.create_task(self._target_done.wait())
@@ -167,6 +169,13 @@ class BotEngine:
             stopper.cancel()
             ws_task.cancel()
 
+    def _extra_tasks(self) -> list:
+        """Coroutines a subclass wants run next to the standard loops (none for the original engine)."""
+        return []
+
+    def _pr_desc(self, pr) -> str:
+        return f"tradable contexts={len(pr.selected)}"
+
     # ── warm-up ──────────────────────────────────────────────────────────────
     async def _init_symbol(self, sym: str):
         self._events[sym] = asyncio.Event()
@@ -179,8 +188,8 @@ class BotEngine:
             raise RuntimeError("no digit contract could be priced")
         await self.client.subscribe_ticks(sym, lambda tick, s=sym: self._on_tick(s, tick))
         pr = self.predictors[sym]
-        logger.info("READY %s: decimals=%d horizon=%d tradable contexts=%d",
-                    sym, self._decimals[sym], pr.p.horizon, len(pr.selected))
+        logger.info("READY %s: decimals=%d horizon=%d %s",
+                    sym, self._decimals[sym], pr.p.horizon, self._pr_desc(pr))
 
     async def _fit_symbol(self, sym: str, initial: bool = False) -> bool:
         """Download recent ticks, re-probe payouts and (re)fit the predictor. Used for the
@@ -510,8 +519,8 @@ class BotEngine:
                     ok_all = ok_all and ok
                     if ok:
                         pr = self.predictors[sym]
-                        logger.info("%s %s: tradable contexts=%d",
-                                    "RESYNC" if resync else "REFIT", sym, len(pr.selected))
+                        logger.info("%s %s: %s",
+                                    "RESYNC" if resync else "REFIT", sym, self._pr_desc(pr))
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -537,7 +546,7 @@ class BotEngine:
         profit = float(poc.get("profit") or 0.0)
         won = profit > 0
         self.stats.record(info["opened_at"], info["stake"], info["ratio"], profit)
-        if _follower_db is not None:         # batched DB write; never blocks, never raises
+        if _follower_db is not None and self._feed_followers:   # batched DB write; never blocks, never raises
             try:
                 _follower_db.record_collector_trade(info["opened_at"], info["stake"], info["ratio"], profit)
             except Exception:
