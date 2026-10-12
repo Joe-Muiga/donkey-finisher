@@ -25,12 +25,13 @@ from typing import Dict, List, Optional
 
 import config
 import predictor as pred
+import main_money
 import predictor_stats
 import restart_scheduler
 import target_guard
 from deriv_client import DerivClient
 
-try:                                    # follower system is optional; the collector never depends on it
+try:                                    # follower system is optional; the main account never depends on it
     import db as _follower_db
 except Exception:                       # pragma: no cover
     _follower_db = None
@@ -50,7 +51,8 @@ class BotEngine:
     def __init__(self):
         self.client = DerivClient()
         self.symbols: List[str] = list(_cfg("PREDICTOR_SYMBOLS", ["R_100"]))
-        self.stake = float(_cfg("PREDICTOR_STAKE", 1000.0))
+        self.stake = float(_cfg("PREDICTOR_STAKE", 0.35))     # MINIMUM stake (env) - also the probe stake
+        self.money = main_money.MainMoney()                  # profit-securing money rules (floor / stake sizing)
         self.duration = int(_cfg("CONTRACT_DURATION_TICKS", 1))
         self.stats = predictor_stats.get_stats()
         self.predictors: Dict[str, pred.Predictor] = {}
@@ -66,7 +68,8 @@ class BotEngine:
         self._lag_obs: List[int] = []
         self._last_decision = "—"
         self.balance = 0.0
-        self._target_done = asyncio.Event()   # set once the TARGET_BALANCE shutdown has finished
+        self._target_done = asyncio.Event()   # set once the TARGET_BALANCE / window-end shutdown has finished
+        self._session_over = False            # trade window closed: no buys, socket dropped, engine returns
         self._feed_followers = True           # SetEngine turns this off (no follower stats / mirroring)
         # ── self-healing state ──
         self._last_tick_wall: Dict[str, float] = {}
@@ -84,11 +87,12 @@ class BotEngine:
         self._fair_mean = 0.0         # sum of expected profit (in stakes) if every digit were fair
         self._fair_var = 0.0          # sum of variance (in stakes^2) under the same assumption
         self._total_pnl = 0.0
+        self._stakes_won = 0.0        # sum of profit/stake (stakes vary with the money rules)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def run(self):
         logger.info("=" * 64)
-        logger.info("  Digit predictor bot  –  stake %.2f, symbols %s", self.stake, self.symbols)
+        logger.info("  Digit predictor bot  –  min stake %.2f (PREDICTOR_STAKE), symbols %s", self.stake, self.symbols)
         logger.info("=" * 64)
         ws_task = asyncio.create_task(self.client.connect())
         for _ in range(60):
@@ -115,6 +119,10 @@ class BotEngine:
                 return
         else:
             logger.info("TARGET GUARD: TARGET_BALANCE not set - no balance target")
+        try:
+            await self.money.start(self.client)          # saved floor/P, live balance, midnight reset
+        except Exception as exc:
+            logger.error("MAIN MONEY could not start (%s) - the bot will not trade until it can", exc)
         self.client.on_balance(self._on_balance)
         self._seen_conn = self._conn_count()
 
@@ -151,9 +159,10 @@ class BotEngine:
                   asyncio.create_task(self._watchdog_loop()),
                   asyncio.create_task(self._refit_loop()),
                   asyncio.create_task(self._target_monitor_loop()),
+                  asyncio.create_task(self._window_watch_loop()),
                   asyncio.create_task(self._supervise_ws(ws_task))]
         tasks += [asyncio.create_task(c) for c in self._extra_tasks()]
-        if _follower_mgr is not None:        # Deriv server-time offset for the follower scheduler
+        if _follower_mgr is not None:        # Deriv server-time offset for the follower scheduler (main account time)
             tasks.append(asyncio.create_task(_follower_mgr.collector_time_sync(self.client)))
         stopper = asyncio.create_task(self._target_done.wait())
         main_t = asyncio.gather(*tasks)
@@ -281,10 +290,14 @@ class BotEngine:
         minute = int(ts // 60) % 60
         return int(_cfg("TRADE_WINDOW_START_MINUTE", 0)) <= minute <= int(_cfg("TRADE_WINDOW_END_MINUTE", 59))
 
+    def _next_stake(self) -> Optional[float]:
+        """Stake from the money rules for the next buy; None = stopped (floor reached) or not ready."""
+        return self.money.next_stake()
+
     def _blocked(self) -> bool:
         # Only technical blocks remain: no socket, or predictor not yet re-synced after a
         # reconnect (a few seconds), or the optional scheduled redeploy (off by default).
-        return (not self._in_trade_window(time.time()) or target_guard.is_reached()
+        return (not self._in_trade_window(time.time()) or target_guard.is_reached() or self._session_over
                 or restart_scheduler.is_redeploy_pending() or time.time() < self._halted_until
                 or not self.client.is_connected or self._needs_resync())
 
@@ -318,10 +331,10 @@ class BotEngine:
             p["barrier"] = str(cand[1])
         return p
 
-    async def _buy_direct(self, sym: str, cand: pred.Candidate, price: float) -> dict:
+    async def _buy_direct(self, sym: str, cand: pred.Candidate, price: float, stake: Optional[float] = None) -> dict:
         """Buy without a proposal id: {"buy": "1", "price": max_price, "parameters": {...}}."""
         return await self.client._send(
-            {"buy": "1", "price": price, "parameters": self._contract_params(sym, cand, self.stake)},
+            {"buy": "1", "price": price, "parameters": self._contract_params(sym, cand, self.stake if stake is None else stake)},
             timeout=10)
 
     async def _propose(self, sym: str, cand: pred.Candidate, stake: float) -> Optional[dict]:
@@ -347,14 +360,18 @@ class BotEngine:
         tick_epoch = self._last_epoch.get(sym)
         if tick_epoch is not None and not self._in_trade_window(float(tick_epoch)):
             return                                          # the signal tick itself is outside the window
+        stake = self._next_stake()                          # money rules: None = stopped / floor reached
+        if stake is None:
+            self._last_decision = "stopped by money rules (floor reached) - resumes at next reset"
+            return
         for pk in picks[: int(_cfg("PREDICTOR_MAX_PROPOSALS", 3))]:
             if self._blocked():
                 return
-            prop = await self._propose(sym, pk.cand, self.stake)
+            prop = await self._propose(sym, pk.cand, stake)
             if not prop:
                 continue
             payout = float(prop.get("payout") or 0.0)
-            ratio = payout / self.stake                     # live ratio, never hardcoded
+            ratio = payout / stake                          # live ratio, never hardcoded
             self._ratios[sym][pk.cand] = ratio
             dec = pr.accept(pk, ratio)
             tag = f"{pk.cand[0]}{'' if pk.cand[1] is None else pk.cand[1]}"
@@ -364,10 +381,13 @@ class BotEngine:
                 continue
             if self._blocked():
                 return
-            ask = float(prop.get("ask_price") or self.stake)
+            ask = float(prop.get("ask_price") or stake)
+            if not self.money.reserve(stake):               # hard rule: balance - stake must stay >= floor
+                self._last_decision = "skip: buying would breach the profit floor"
+                return
             try:
                 if self._direct_buy:
-                    resp = await self._buy_direct(sym, pk.cand, ask)
+                    resp = await self._buy_direct(sym, pk.cand, ask, stake)
                 else:
                     try:
                         resp = await self.client._send({"buy": prop["id"], "price": ask}, timeout=10)
@@ -376,13 +396,16 @@ class BotEngine:
                             raise
                         logger.warning("Buy by proposal id was refused (%s) - retrying with a direct buy "
                                        "(buy=1 + parameters)", str(exc)[:120])
-                        resp = await self._buy_direct(sym, pk.cand, ask)
+                        resp = await self._buy_direct(sym, pk.cand, ask, stake)
                         self._direct_buy = True
                         logger.info("Direct buy worked - using it for all further trades")
             except Exception as exc:
+                self.money.release(stake)
                 await self._on_api_error("buy", exc)        # error handling, not a gate
                 return
             buy = resp.get("buy") or {}
+            self.money.note_buy(buy)
+            self.money.release(stake)
             cid = str(buy.get("contract_id", ""))
             if not cid:
                 logger.warning("BUY returned no contract_id: %s", resp)
@@ -395,7 +418,7 @@ class BotEngine:
                         "barrier": pk.cand[1], "duration": int(self.duration), "signal_time": time.time()})
                 except Exception:
                     pass
-            self._open[cid] = {"sym": sym, "cand": pk.cand, "stake": self.stake, "ratio": ratio,
+            self._open[cid] = {"sym": sym, "cand": pk.cand, "stake": stake, "ratio": ratio,
                                "opened_at": opened, "decision_epoch": tick_epoch, "t0": time.time(),
                                "ctx": pk.context, "p_lower": pk.p_lower}
             self._last_decision = f"BUY {tag} ctx={pk.context} lb={pk.p_lower:.3f} ratio={ratio:.3f}"
@@ -415,15 +438,52 @@ class BotEngine:
         """connect() is meant to run forever. If it ever ends, raise so main.py rebuilds the
         whole engine instead of leaving a zombie that is 'running' but never trades."""
         await ws_task
-        if target_guard.is_reached():                  # intentional shutdown, not a crash
+        if target_guard.is_reached() or self._session_over:   # intentional shutdown, not a crash
             await self._target_done.wait()
             return
         raise RuntimeError("Deriv WebSocket task ended unexpectedly")
+
+    # ── trade window: connected only for the window, then drain + disconnect ──
+    async def _window_watch_loop(self):
+        """Once the window has been seen open and then closes: end the session (main.py then
+        redeploys with a cleared build cache and idles until the next window)."""
+        seen = False
+        while True:
+            await asyncio.sleep(1)
+            if self._in_trade_window(time.time()):
+                seen = True
+            elif seen:
+                break
+        await self._end_session()
+
+    async def _end_session(self):
+        self._session_over = True                       # _blocked() is now True: no new proposals/buys
+        drain = float(_cfg("SESSION_DRAIN_SECONDS", 45))
+        logger.warning("TRADE WINDOW CLOSED: no new trades; draining %d open contract(s) (max %.0fs)",
+                       len(self._open), drain)
+        t0 = time.time()
+        while self._open and time.time() - t0 < drain:
+            await asyncio.sleep(1)
+        try:
+            await asyncio.wait_for(self.stats.flush(force=True), timeout=5)
+        except Exception as exc:
+            logger.warning("session end: stats flush skipped: %s", exc)
+        try:
+            import keep_alive
+            keep_alive.update_status(session="IDLE - disconnected until next window",
+                                     open_contracts_count=len(self._open))
+        except Exception:
+            pass
+        await self.client.shutdown("trade window closed")
+        logger.warning("SESSION ENDED: disconnected from Deriv (%d contract(s) left to settle on Deriv's side)",
+                       len(self._open))
+        self._target_done.set()
 
     # ── balance target ───────────────────────────────────────────────────────
     def _on_balance(self, bal: float):
         """Runs on EVERY live balance update from Deriv (inside the event loop)."""
         self.balance = bal
+        self.money.on_balance(bal)
         if target_guard.should_stop(bal) and target_guard.mark_reached(bal):
             # flag is already set (no new trade can start); do the slow part as a task
             asyncio.get_running_loop().create_task(self._shutdown_for_target(bal))
@@ -570,6 +630,7 @@ class BotEngine:
         ratio = max(float(info.get("ratio") or 1.0), 1.0001)
         self._be_sum += 1.0 / ratio
         self._total_pnl += profit
+        self._stakes_won += profit / max(float(info.get("stake") or self.stake), 1e-9)
         # Edge test: compare actual results with a FAIR game (true digit probabilities, real payout).
         # z near 0 = results are what luck alone produces; z > 3 over many trades = real edge.
         try:
@@ -580,7 +641,7 @@ class BotEngine:
             pass
         if self._n_trades % 50 == 0:
             n = self._n_trades
-            stakes_won = self._total_pnl / max(self.stake, 1e-9)
+            stakes_won = self._stakes_won
             z = (stakes_won - self._fair_mean) / (self._fair_var ** 0.5) if self._fair_var > 0 else 0.0
             logger.info("PERFORMANCE after %d trades: win rate %.1f%% vs break-even %.1f%% | total P&L %+.2f "
                         "| expected for a fair game %+.2f | EDGE z-score %+.2f (needs > 3 to be an edge)",
@@ -653,7 +714,7 @@ class BotEngine:
                     current_symbol=",".join(self.symbols), last_signal=self._last_decision,
                     tradeable_count=sum(len(p.selected) for p in self.predictors.values()),
                     open_contracts_count=len(self._open),
-                    target_balance=target_guard.target())
+                    target_balance=target_guard.target(), money=self.money.snapshot())
                 keep_alive.set_active_trades(len(self._open))
             except Exception:
                 pass
