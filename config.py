@@ -1720,3 +1720,31 @@ TICK_HISTORY_PAGE_SIZE        = _env_i("TICK_HISTORY_PAGE_SIZE", 1000)
 STATS_PERSIST_TO_RENDER       = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
     "1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  AUTO REDEPLOY  -  EASY-EDIT SECTION (keep this block at the very bottom of the file)
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  Render env var  AUTO_REDEPLOY   1 / true / on  = bot redeploys itself every
+#                                                   AUTO_REDEPLOY_SECONDS (below)
+#                                  0 / unset      = OFF (bot runs continuously, no redeploy)
+#  Flip it in Render > Environment; no code change needed. Needs RENDER_API_KEY set on Render.
+#
+#  A redeploy wipes the instance's local data - that is expected.
+#  While ON, the hourly trade window (minutes 29-36) is switched OFF, because the window scheduler
+#  runs its own redeploy cycle and the two would fight each other. Each cycle the bot stops opening
+#  trades, drains open contracts (max REDEPLOY_DRAIN_MAX_SECONDS), then fires the Render redeploy.
+#
+#  >>> CHANGE THE INTERVAL HERE (seconds). 420 = 7 minutes. <<<
+AUTO_REDEPLOY_SECONDS = 420
+# ────────────────────────────────────────────────────────────────────────────────────────────
+AUTO_REDEPLOY_ENABLED = os.environ.get("AUTO_REDEPLOY", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Everything below applies the switch - no need to edit.
+REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
+REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0
+if AUTO_REDEPLOY_ENABLED:
+    TRADE_WINDOW_ENABLED = False          # continuous trading; the 7-min redeploy replaces the hourly one
+STATS_PERSIST_TO_RENDER = os.environ.get(
+    "STATS_PERSIST_TO_RENDER",
+    "1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0").strip().lower() in ("1", "true", "yes", "on")
