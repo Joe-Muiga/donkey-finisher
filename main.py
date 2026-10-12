@@ -18,6 +18,7 @@ Follower accounts (optional): DATABASE_URL, ADMIN_PASSWORD, ENCRYPTION_KEY - see
 """
 import asyncio
 import logging
+import os
 import sys
 import threading
 import time
@@ -47,23 +48,37 @@ def _run_bot():
             return                                   # no restart loop: this needs a config change
     else:
         from bot_engine import BotEngine as Engine
+    import window_scheduler as ws
+    import keep_alive
     while True:
+        now = time.time()
+        if not ws.should_be_connected(now):              # outside the window: NOT connected to Deriv
+            wait = ws.seconds_until_open(now)
+            keep_alive.update_status(session=f"IDLE - disconnected, next window in {int(wait // 60)} min")
+            time.sleep(min(15.0, max(1.0, wait - ws._preconnect())))
+            continue
+        eng = Engine()
         try:
-            asyncio.run(Engine().run())
-            if target_guard.is_reached():
-                logger.warning("Balance target reached - bot stays stopped (no restart)")
-                return
-            logger.warning("Bot engine returned; restarting in 5 s")
+            asyncio.run(eng.run())
         except Exception as exc:
             logger.error(f"Bot crashed: {exc}", exc_info=True)
         if target_guard.is_reached():
+            logger.warning("Balance target reached - bot stays stopped (no restart)")
             return
+        if getattr(eng, "_session_over", False):
+            # the window ran and closed: redeploy with a cleared build cache BEFORE the next connect
+            keep_alive.update_status(session="IDLE - redeploying (build cache cleared)")
+            if ws.redeploy_clear_cache():
+                time.sleep(900)                          # Render replaces this instance; just wait
+            else:
+                time.sleep(60)                           # no redeploy possible: reconnect at next window anyway
+            continue
+        logger.warning("Bot engine returned inside the window; restarting in 5 s")
         time.sleep(5)
 
 
 if __name__ == "__main__":
     from keep_alive import app, start_keep_alive
-    from restart_scheduler import start_restart_scheduler
 
     logger.info("Starting digit predictor bot … (%s)",
                 "SET MODE: top-%d digit set -> covering Over/Under, all symbols in parallel" % config.SET_SIZE
@@ -71,8 +86,11 @@ if __name__ == "__main__":
     logger.info(f"  Deriv App ID : {config.DERIV_APP_ID}")
     logger.info(f"  API token    : {'SET ✓' if config.DERIV_API_TOKEN else 'MISSING ✗'}")
     logger.info(f"  Symbols      : {config.PREDICTOR_SYMBOLS}  "
-                f"stake={config.SET_STAKE if config.SET_MODE else config.PREDICTOR_STAKE}")
+                f"min stake (PREDICTOR_STAKE)={config.PREDICTOR_STAKE}")
     logger.info(f"  Account mode : {config.DERIV_ACCOUNT_MODE}")
+    logger.info(f"  Trade window : minutes {config.TRADE_WINDOW_START_MINUTE}-{config.TRADE_WINDOW_END_MINUTE} of every hour (UTC), strict")
+    if not (os.environ.get("PREDICTOR_STAKE") or "").strip():
+        logger.warning("PREDICTOR_STAKE is not set on Render - using the default minimum stake %s", config.PREDICTOR_STAKE)
     if config.REDEPLOY_INTERVAL_SECONDS > 0:
         logger.info(f"  Redeploy     : every {config.REDEPLOY_INTERVAL_SECONDS:.0f}s")
     else:
@@ -82,10 +100,12 @@ if __name__ == "__main__":
     logger.info(f"  Port         : {config.PORT}")
 
     start_keep_alive()
-    start_restart_scheduler()
+    if config.REDEPLOY_INTERVAL_SECONDS > 0:
+        logger.warning("REDEPLOY_INTERVAL_SECONDS is ignored: the window scheduler redeploys (cache cleared) "
+                       "after every trade window instead")
 
     # Follower accounts: own thread + own event loop + Flask Blueprint. Fully optional:
-    # any failure here is logged and the collector below starts regardless.
+    # any failure here is logged and the main account below starts regardless.
     try:
         import follower_manager
         import follower_web
