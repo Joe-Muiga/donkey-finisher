@@ -1642,15 +1642,13 @@ RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # PREDICTOR_SYMBOLS is defined next to DIGIT_SYMBOLS above.
-# Trade window: the bot opens contracts ONLY while the clock (UTC) is between minute START and
-# minute END of the hour, inclusive: 53:00.0 up to and including 59:59.9. Outside it nothing is
-# bought (ticks keep feeding the predictor). TRADE_WINDOW_ENABLED=0 turns the restriction off.
-TRADE_WINDOW_ENABLED      = os.environ.get("TRADE_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-TRADE_WINDOW_START_MINUTE = int(float(os.environ.get("TRADE_WINDOW_START_MINUTE", "53") or 53))
-TRADE_WINDOW_END_MINUTE   = int(float(os.environ.get("TRADE_WINDOW_END_MINUTE", "59") or 59))
-if not (0 <= TRADE_WINDOW_START_MINUTE <= TRADE_WINDOW_END_MINUTE <= 59):
-    TRADE_WINDOW_START_MINUTE, TRADE_WINDOW_END_MINUTE = 53, 59
-PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 1000.0)     # flat stake per trade
+# Trade window: the bot opens contracts ONLY while the clock (UTC) is between minute 29 and minute 36
+# of the hour, inclusive: 29:00.0 up to and including 36:59.9. Strict - not an env var, so a stale value
+# on Render can never widen it. Outside it nothing is bought (ticks keep feeding the predictor).
+TRADE_WINDOW_ENABLED      = True
+TRADE_WINDOW_START_MINUTE = 29
+TRADE_WINDOW_END_MINUTE   = 36
+PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
 # Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
 # OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
@@ -1675,7 +1673,7 @@ PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates pr
 
 # ─── SET MODE: predict a set of next digits, buy the Over/Under that covers it ─────────────────────
 # (set_predictor.py + set_engine.py). ON by default; SET_MODE=0 runs the original single-contract engine.
-# It ignores TRADE_WINDOW_*, MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, never uses Matches/Differs/Even/Odd,
+# It honours TRADE_WINDOW_* (29-36), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, sizes stakes with the money rules (PREDICTOR_STAKE = minimum; SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
 # and is DEMO-ONLY unless SET_ALLOW_REAL=1.
 SET_MODE               = os.environ.get("SET_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
 SET_ALLOW_REAL         = os.environ.get("SET_ALLOW_REAL", "0").strip().lower() in ("1", "true", "yes", "on")
