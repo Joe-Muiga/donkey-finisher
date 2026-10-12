@@ -65,7 +65,6 @@ class BotEngine:
         self._drain_started: Optional[float] = None
         self._lag_obs: List[int] = []
         self._last_decision = "—"
-        self._delay_over_logged = False
         self.balance = 0.0
         self._target_done = asyncio.Event()   # set once the TARGET_BALANCE shutdown has finished
         # ── self-healing state ──
@@ -118,8 +117,31 @@ class BotEngine:
         self.client.on_balance(self._on_balance)
         self._seen_conn = self._conn_count()
 
-        for sym in self.symbols:
-            await self._init_symbol(sym)
+        ready = []
+        for sym in list(self.symbols):
+            ok = False
+            for attempt in (1, 2):                  # one retry: a hiccup must not drop a good symbol
+                try:
+                    await self._init_symbol(sym)
+                    ok = True
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("SYMBOL %s start-up attempt %d failed: %s", sym, attempt, exc)
+                    await asyncio.sleep(3)
+            if ok:
+                ready.append(sym)
+            else:
+                logger.error("SYMBOL SKIPPED %s: no tick history / no digit contract could be priced "
+                             "(not offered on this account?)", sym)
+                for d in (self.predictors, self._events, self._live, self._ratios, self._decimals,
+                          self._last_tick_wall, self._recent_epochs):
+                    d.pop(sym, None)
+        self.symbols = ready
+        if not self.symbols:
+            raise RuntimeError("no tradable symbol could be started")
+        logger.info("SYMBOLS ACTIVE (%d): %s", len(self.symbols), ",".join(self.symbols))
 
         tasks = [asyncio.create_task(self._worker(s)) for s in self.symbols]
         tasks += [asyncio.create_task(self._settle_loop()),
@@ -151,6 +173,10 @@ class BotEngine:
         self._live[sym] = collections.deque(maxlen=300)
         self._last_tick_wall[sym] = time.time()
         await self._fit_symbol(sym, initial=True)
+        if not self._recent_epochs.get(sym):
+            raise RuntimeError("no tick history")
+        if not self._ratios.get(sym):
+            raise RuntimeError("no digit contract could be priced")
         await self.client.subscribe_ticks(sym, lambda tick, s=sym: self._on_tick(s, tick))
         pr = self.predictors[sym]
         logger.info("READY %s: decimals=%d horizon=%d tradable contexts=%d",
@@ -238,23 +264,18 @@ class BotEngine:
         been missed, so the digit context would be wrong."""
         return self._conn_count() != self._seen_conn
 
-    def _startup_delay_left(self) -> float:
-        """Seconds left of the post-redeploy no-trade window (0 once it is over)."""
-        d = float(_cfg("STARTUP_DELAY_SECONDS", 0) or 0)
-        if d <= 0:
-            return 0.0
-        left = float(_cfg("PROCESS_START", 0.0)) + d - time.time()
-        if left <= 0:
-            if not self._delay_over_logged:
-                self._delay_over_logged = True
-                logger.info("STARTUP DELAY over - trading enabled")
-            return 0.0
-        return left
+    @staticmethod
+    def _in_trade_window(ts: float) -> bool:
+        """True when `ts` (epoch seconds, UTC) is inside the allowed minutes of the hour."""
+        if not _cfg("TRADE_WINDOW_ENABLED", False):
+            return True
+        minute = int(ts // 60) % 60
+        return int(_cfg("TRADE_WINDOW_START_MINUTE", 0)) <= minute <= int(_cfg("TRADE_WINDOW_END_MINUTE", 59))
 
     def _blocked(self) -> bool:
         # Only technical blocks remain: no socket, or predictor not yet re-synced after a
         # reconnect (a few seconds), or the optional scheduled redeploy (off by default).
-        return (self._startup_delay_left() > 0 or target_guard.is_reached()
+        return (not self._in_trade_window(time.time()) or target_guard.is_reached()
                 or restart_scheduler.is_redeploy_pending() or time.time() < self._halted_until
                 or not self.client.is_connected or self._needs_resync())
 
@@ -265,9 +286,10 @@ class BotEngine:
             await ev.wait()
             ev.clear()
             if self._blocked() or sym in self._busy:
-                left = self._startup_delay_left()
-                if left > 0:                       # signal dropped, not queued
-                    self._last_decision = f"startup delay: {int(left)}s left, no trading"
+                if not self._in_trade_window(time.time()):
+                    self._last_decision = (f"outside trade window "
+                                           f"(minutes {int(_cfg('TRADE_WINDOW_START_MINUTE', 0))}-"
+                                           f"{int(_cfg('TRADE_WINDOW_END_MINUTE', 59))})")
                 continue
             self._busy.add(sym)
             try:
@@ -278,13 +300,6 @@ class BotEngine:
                 logger.error("trade attempt error %s: %s", sym, exc, exc_info=True)
             finally:
                 self._busy.discard(sym)
-
-    @staticmethod
-    def _trade_cand(cand: pred.Candidate) -> pred.Candidate:
-        """INVERT: buy the opposite parity of the predictor's pick (Even/Odd only)."""
-        if _cfg("PREDICTOR_INVERT", False) and cand[0] in ("EVEN", "ODD"):
-            return ("ODD" if cand[0] == "EVEN" else "EVEN", None)
-        return cand
 
     def _contract_params(self, sym: str, cand: pred.Candidate, stake: float) -> dict:
         p = {"amount": stake, "basis": "stake",
@@ -321,20 +336,19 @@ class BotEngine:
         if not picks:
             return
         tick_epoch = self._last_epoch.get(sym)
+        if tick_epoch is not None and not self._in_trade_window(float(tick_epoch)):
+            return                                          # the signal tick itself is outside the window
         for pk in picks[: int(_cfg("PREDICTOR_MAX_PROPOSALS", 3))]:
             if self._blocked():
                 return
-            tc = self._trade_cand(pk.cand)                  # side actually bought (flipped if INVERT)
-            prop = await self._propose(sym, tc, self.stake)
+            prop = await self._propose(sym, pk.cand, self.stake)
             if not prop:
                 continue
             payout = float(prop.get("payout") or 0.0)
             ratio = payout / self.stake                     # live ratio, never hardcoded
-            self._ratios[sym][tc] = ratio
-            dec = pr.accept(pk, ratio)                      # same gates: the predictor decides WHEN
-            tag = f"{tc[0]}{'' if tc[1] is None else tc[1]}"
-            if tc != pk.cand:
-                tag += f"(inv {pk.cand[0]})"
+            self._ratios[sym][pk.cand] = ratio
+            dec = pr.accept(pk, ratio)
+            tag = f"{pk.cand[0]}{'' if pk.cand[1] is None else pk.cand[1]}"
             if not dec.ok:
                 self._last_decision = f"skip {tag}: {dec.reason}"
                 logger.info("SKIP %s %s: %s", sym, tag, dec.reason)
@@ -344,7 +358,7 @@ class BotEngine:
             ask = float(prop.get("ask_price") or self.stake)
             try:
                 if self._direct_buy:
-                    resp = await self._buy_direct(sym, tc, ask)
+                    resp = await self._buy_direct(sym, pk.cand, ask)
                 else:
                     try:
                         resp = await self.client._send({"buy": prop["id"], "price": ask}, timeout=10)
@@ -353,7 +367,7 @@ class BotEngine:
                             raise
                         logger.warning("Buy by proposal id was refused (%s) - retrying with a direct buy "
                                        "(buy=1 + parameters)", str(exc)[:120])
-                        resp = await self._buy_direct(sym, tc, ask)
+                        resp = await self._buy_direct(sym, pk.cand, ask)
                         self._direct_buy = True
                         logger.info("Direct buy worked - using it for all further trades")
             except Exception as exc:
@@ -368,11 +382,11 @@ class BotEngine:
             if _follower_mgr is not None:    # mirror to follower accounts: non-blocking, never raises
                 try:
                     _follower_mgr.publish_signal({
-                        "signal_id": cid, "symbol": sym, "contract_type": pred.contract_type(tc),
-                        "barrier": tc[1], "duration": int(self.duration), "signal_time": time.time()})
+                        "signal_id": cid, "symbol": sym, "contract_type": pred.contract_type(pk.cand),
+                        "barrier": pk.cand[1], "duration": int(self.duration), "signal_time": time.time()})
                 except Exception:
                     pass
-            self._open[cid] = {"sym": sym, "cand": tc, "stake": self.stake, "ratio": ratio,
+            self._open[cid] = {"sym": sym, "cand": pk.cand, "stake": self.stake, "ratio": ratio,
                                "opened_at": opened, "decision_epoch": tick_epoch, "t0": time.time(),
                                "ctx": pk.context, "p_lower": pk.p_lower}
             self._last_decision = f"BUY {tag} ctx={pk.context} lb={pk.p_lower:.3f} ratio={ratio:.3f}"
