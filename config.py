@@ -1645,7 +1645,9 @@ RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 # Trade window: the bot opens contracts ONLY while the clock (UTC) is between minute 29 and minute 36
 # of the hour, inclusive: 29:00.0 up to and including 36:59.9. Strict - not an env var, so a stale value
 # on Render can never widen it. Outside it nothing is bought (ticks keep feeding the predictor).
-TRADE_WINDOW_ENABLED      = True
+# SESSION_WINDOW_ENABLED (Render env var, default ON): 1 = trade only minutes 29-36, disconnected + redeployed
+# (cache cleared) the rest of the hour. 0 = window OFF: connected and trading every minute, no hourly redeploy.
+TRADE_WINDOW_ENABLED      = os.environ.get("SESSION_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 TRADE_WINDOW_START_MINUTE = 29
 TRADE_WINDOW_END_MINUTE   = 36
 PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
