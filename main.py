@@ -38,11 +38,18 @@ if not config.DERIV_API_TOKEN:
 
 def _run_bot():
     """Run the engine; if it ever exits or crashes, start it again (never sit idle)."""
-    from bot_engine import BotEngine
     import target_guard
+    if config.SET_MODE:
+        from set_engine import SetEngine as Engine, account_allowed
+        allowed, why = account_allowed()
+        if not allowed:
+            logger.critical("SET MODE REFUSED TO START: %s", why)
+            return                                   # no restart loop: this needs a config change
+    else:
+        from bot_engine import BotEngine as Engine
     while True:
         try:
-            asyncio.run(BotEngine().run())
+            asyncio.run(Engine().run())
             if target_guard.is_reached():
                 logger.warning("Balance target reached - bot stays stopped (no restart)")
                 return
@@ -58,10 +65,14 @@ if __name__ == "__main__":
     from keep_alive import app, start_keep_alive
     from restart_scheduler import start_restart_scheduler
 
-    logger.info("Starting digit predictor bot …")
+    logger.info("Starting digit predictor bot … (%s)",
+                "SET MODE: top-%d digit set -> covering Over/Under, all symbols in parallel" % config.SET_SIZE
+                if config.SET_MODE else "original single-contract mode")
     logger.info(f"  Deriv App ID : {config.DERIV_APP_ID}")
     logger.info(f"  API token    : {'SET ✓' if config.DERIV_API_TOKEN else 'MISSING ✗'}")
-    logger.info(f"  Symbols      : {config.PREDICTOR_SYMBOLS}  stake={config.PREDICTOR_STAKE}")
+    logger.info(f"  Symbols      : {config.PREDICTOR_SYMBOLS}  "
+                f"stake={config.SET_STAKE if config.SET_MODE else config.PREDICTOR_STAKE}")
+    logger.info(f"  Account mode : {config.DERIV_ACCOUNT_MODE}")
     if config.REDEPLOY_INTERVAL_SECONDS > 0:
         logger.info(f"  Redeploy     : every {config.REDEPLOY_INTERVAL_SECONDS:.0f}s")
     else:
