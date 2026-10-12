@@ -1655,7 +1655,7 @@ PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 1000.0)     # flat stake pe
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
 # OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
 # expectation, versus ~4.8% for OVER5/UNDER4 and ~6.3% for OVER6/UNDER3. 0 = no ceiling.
-MIN_PAYOUT_RATIO         = _env_f("MIN_PAYOUT_RATIO", 1.9)
+MIN_PAYOUT_RATIO         = _env_f("MIN_PAYOUT_RATIO", 2.0)
 MAX_PAYOUT_RATIO         = _env_f("MAX_PAYOUT_RATIO", 2.5)
 EDGE_MARGIN              = _env_f("EDGE_MARGIN", 0.01)
 WILSON_Z                 = _env_f("WILSON_Z", 2.0)
