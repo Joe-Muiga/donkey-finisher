@@ -11,15 +11,27 @@ so the balance already equals free money).
            the next reset even if the balance later falls back under L.  The third term applies
            only once peak > P (a gain exists); at peak == P it would equal P and leave nothing
            tradable right after a reset.
-  stake  = max(MIN_STAKE, 17.5% of tradable money), rounded DOWN to cents.
+  stake  = max(MIN_STAKE, 17.5% of tradable money)   [MIN_STAKE = PREDICTOR_STAKE env var], rounded DOWN to cents.
   buy rule (hard): only buy if balance - stake >= floor.
 """
 import math
+import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-MIN_STAKE = 0.35
+
+
+def _min_stake_from_env(default: float = 0.35) -> float:
+    """Minimum stake = the PREDICTOR_STAKE Render environment variable (not hard-coded)."""
+    try:
+        v = float((os.environ.get("PREDICTOR_STAKE") or "").strip())
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+MIN_STAKE = _min_stake_from_env()
 STAKE_FRACTION = 0.175
 FLOOR_FRACTION = 0.7
 PEAK_SHARE = 0.5
