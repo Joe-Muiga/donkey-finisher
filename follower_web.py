@@ -375,15 +375,15 @@ def verdict_page():
     tot_w = sum(int(r[1]) for r in minute_rows)
     tot_r = sum(float(r[3]) for r in minute_rows)
     tot_u = sum(float(r[4]) for r in minute_rows)
-    hist = ("no collector data yet" if not tot_n else
-            f"{tot_n} collector trades: win rate {_pct(tot_w / tot_n)} vs break-even "
+    hist = ("no main-account data yet" if not tot_n else
+            f"{tot_n} main-account trades: win rate {_pct(tot_w / tot_n)} vs break-even "
             f"{_pct(1 / (tot_r / tot_n)) if tot_r else '-'}; average profit per stake {tot_u / tot_n:+.3f}")
     head = (f"<div class='card'><p><b>Pre-registered hypothesis (not a finding):</b> minutes "
             f"{fc.DEFAULT_ZONE_START}-{fc.DEFAULT_ZONE_END} of every hour. Digit outcomes are random-number "
             f"generated, so no time zone may exist. This page reports whatever the data shows, including "
             f"negative results.</p><p class='mut'>Collector history: {hist}.</p>"
             f"<p class='mut'>Counted: follower trades placed after a zone snapshot only, one observation per "
-            f"collector signal (not per follower). Verdict needs {fc.VERDICT_MIN_TRADES}+ signals. "
+            f"main-account signal (not per follower). Verdict needs {fc.VERDICT_MIN_TRADES}+ signals. "
             f"Profit is in stakes per trade (win = payout-1, loss = -1) with a 95% CI.</p></div>")
     table = ("<div class='card'><h2>Followed signals</h2><table><tr><th>Group</th><th>Signals</th><th>Win</th>"
              "<th>Avg payout</th><th>Break-even</th><th>Profit/stake</th><th>95% CI</th><th>Verdict</th></tr>"
@@ -394,7 +394,7 @@ def verdict_page():
                    f"<th>Win</th><th>Break-even</th><th>Profit/stake</th></tr>"
                    f"<tr><td>In-zone (followed signals)</td><td>{res['all']['n']}</td><td>{_pct(res['all'].get('win_rate'))}</td>"
                    f"<td>{_pct(res['all'].get('break_even'))}</td><td>{_n(res['all'].get('mean'), 3)}</td></tr>"
-                   f"<tr><td>Out-of-zone (collector)</td><td>{oz['n']}</td><td>{_pct(oz.get('win_rate'))}</td>"
+                   f"<tr><td>Out-of-zone (main account)</td><td>{oz['n']}</td><td>{_pct(oz.get('win_rate'))}</td>"
                    f"<td>{_pct(oz.get('break_even'))}</td><td>{_n(oz.get('mean'), 3)}</td></tr></table>")
         if cmp_:
             oz_html += (f"<p class='mut'>Difference in profit/stake (in minus out): {cmp_['diff']:+.3f}, "
