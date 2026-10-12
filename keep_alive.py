@@ -1351,6 +1351,7 @@ def stats_route():
         "streak_label":       str(s.get("streak_label", "—")),
         "paused":             bool(s.get("paused_for_loss_limit", False)),
         "target_balance":     s.get("target_balance"),
+        "money":              s.get("money"),   # main-account profit floor / stake sizing
         "target_reached":     bool(s.get("target_reached", False)),
         "target_reached_balance": s.get("target_reached_balance"),
         "current_symbol":     str(s.get("current_symbol", "—")),
