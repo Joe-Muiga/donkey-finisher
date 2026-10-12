@@ -156,6 +156,11 @@ RISE_FALL_SYMBOLS = [
 _VOLATILITY_ALL = ["R_10", "R_25", "R_50", "R_75", "R_100",
                    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 _DEFAULT_BLOCK  = "stpRNG,STEP,BOOM,CRASH"
+# Shortcut ALL_SYMBOLS (the default): every digit-capable index the project knows - the ten
+# Volatility indices, the higher 1s Volatility tiers, Jump and Bear/Bull - minus the blocklist
+# above (Step, Boom, Crash). A symbol Deriv does not offer is skipped at start-up (see bot_engine).
+_ALL_SYMBOLS_LIST = (_VOLATILITY_ALL + ["1HZ150V", "1HZ200V", "1HZ250V"]
+                     + ["JD10", "JD25", "JD50", "JD75", "JD100"] + ["RDBEAR", "RDBULL"])
 
 
 def _parse_symbols(raw: str):
@@ -166,7 +171,10 @@ def _parse_symbols(raw: str):
         tok = tok.strip()
         if not tok:
             continue
-        wanted += _VOLATILITY_ALL if tok.upper() in ("ALL_VOLATILITY", "VOLATILITY", "ALL") else [tok]
+        if tok.upper() == "ALL_SYMBOLS":
+            wanted += _ALL_SYMBOLS_LIST
+        else:
+            wanted += _VOLATILITY_ALL if tok.upper() in ("ALL_VOLATILITY", "VOLATILITY", "ALL") else [tok]
     out = []
     for sym in wanted:
         if any(sym.upper().startswith(b) for b in block) or sym in out:
@@ -175,7 +183,7 @@ def _parse_symbols(raw: str):
     return out or ["R_100"]
 
 
-PREDICTOR_SYMBOLS = _parse_symbols(os.environ.get("PREDICTOR_SYMBOLS", "R_100"))
+PREDICTOR_SYMBOLS = _parse_symbols(os.environ.get("PREDICTOR_SYMBOLS", "ALL_SYMBOLS"))
 # signal_engine routes these symbols to predictor.py
 DIGIT_SYMBOLS = list(PREDICTOR_SYMBOLS)
 
@@ -1634,12 +1642,20 @@ RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # PREDICTOR_SYMBOLS is defined next to DIGIT_SYMBOLS above.
+# Trade window: the bot opens contracts ONLY while the clock (UTC) is between minute START and
+# minute END of the hour, inclusive: 53:00.0 up to and including 59:59.9. Outside it nothing is
+# bought (ticks keep feeding the predictor). TRADE_WINDOW_ENABLED=0 turns the restriction off.
+TRADE_WINDOW_ENABLED      = os.environ.get("TRADE_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+TRADE_WINDOW_START_MINUTE = int(float(os.environ.get("TRADE_WINDOW_START_MINUTE", "53") or 53))
+TRADE_WINDOW_END_MINUTE   = int(float(os.environ.get("TRADE_WINDOW_END_MINUTE", "59") or 59))
+if not (0 <= TRADE_WINDOW_START_MINUTE <= TRADE_WINDOW_END_MINUTE <= 59):
+    TRADE_WINDOW_START_MINUTE, TRADE_WINDOW_END_MINUTE = 53, 59
 PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 1000.0)     # flat stake per trade
 # Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
 # OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
 # expectation, versus ~4.8% for OVER5/UNDER4 and ~6.3% for OVER6/UNDER3. 0 = no ceiling.
-MIN_PAYOUT_RATIO         = _env_f("MIN_PAYOUT_RATIO", 1.9)   # EVEN/ODD pay ~1.95x, so the floor must sit below that
+MIN_PAYOUT_RATIO         = _env_f("MIN_PAYOUT_RATIO", 1.9)
 MAX_PAYOUT_RATIO         = _env_f("MAX_PAYOUT_RATIO", 2.5)
 EDGE_MARGIN              = _env_f("EDGE_MARGIN", 0.01)
 WILSON_Z                 = _env_f("WILSON_Z", 2.0)
@@ -1653,22 +1669,6 @@ CONTRACT_DURATION_TICKS  = _env_i("CONTRACT_DURATION_TICKS", 1)
 # proposal+buy round trip is shorter than one tick interval). Horizon = duration + this.
 PREDICTOR_ENTRY_DELAY_TICKS = _env_i("PREDICTOR_ENTRY_DELAY_TICKS", 0)
 PREDICTOR_BARRIERS       = _env_tuple("PREDICTOR_BARRIERS", tuple(range(10)))
-# Which digit contract kinds may trade: any of EVEN, ODD, OVER, UNDER (comma separated).
-# Default = Even/Odd only. Use "EVEN,ODD,OVER,UNDER" to allow Over/Under again (then also raise
-# MIN_PAYOUT_RATIO if you only want the higher-paying Over/Under contracts).
-PREDICTOR_CONTRACT_KINDS = tuple(k.strip().upper() for k in
-                                 os.environ.get("PREDICTOR_CONTRACT_KINDS", "EVEN,ODD").split(",") if k.strip())
-# Invert before execution: when on, a pick EVEN is bought as ODD (and ODD as EVEN). The predictor
-# still decides WHEN to trade (same gates); only the side is flipped. Even/Odd only; Over/Under
-# picks are never flipped. 1 = on, 0 = off (default: OFF, trade the predictor's own side).
-PREDICTOR_INVERT = os.environ.get("PREDICTOR_INVERT", "0").strip().lower() in ("1", "true", "yes", "on")
-
-# Startup delay: after every (re)deploy / process start the bot places NO trade for this many
-# seconds (default 300 = 5 minutes). Ticks keep feeding the predictor, but no signal is acted on
-# during the delay and none is queued for afterwards. 0 = no delay.
-import time as _time
-STARTUP_DELAY_SECONDS = float(os.environ.get("STARTUP_DELAY_SECONDS", "300") or 0)
-PROCESS_START = _time.time()
 PREDICTOR_ALPHA          = _env_f("PREDICTOR_ALPHA", 0.05)       # family-wise, Bonferroni-corrected
 PREDICTOR_PAYOUT_FACTOR  = _env_f("PREDICTOR_PAYOUT_FACTOR", 0.975)  # fallback payout estimate only
 PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates priced per tick
