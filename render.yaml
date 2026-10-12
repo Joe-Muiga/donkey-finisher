@@ -5,6 +5,9 @@
 # Optional (all have defaults, see CHANGES.md):
 #   DERIV_ACCOUNT_MODE (demo|real), DASHBOARD_PIN, PREDICTOR_SYMBOLS (default R_100),
 #   PREDICTOR_STAKE (1000), MIN_PAYOUT_RATIO (1.8) ...
+#   TRADE WINDOW: connected to Deriv only minutes 29-36 of each hour (UTC). When the window closes the bot
+#     disconnects and redeploys itself with the build cache CLEARED (needs RENDER_API_KEY, required now),
+#     then idles until ~40 s before minute 29 (WINDOW_PRECONNECT_SECONDS, default 40). REDEPLOY_INTERVAL_SECONDS is ignored.
 #   REDEPLOY_INTERVAL_SECONDS (0 = scheduled self-redeploy OFF, the default; the bot runs
 #     continuously and heals itself: reconnect-forever, stale-tick watchdog, periodic refit).
 #     If you set it > 0 you also need RENDER_API_KEY so the bot can trigger the redeploy.
@@ -15,7 +18,7 @@
 #     SUSPENDS this Render service. Needs RENDER_API_KEY (below) for the suspend step.
 #     TARGET_CHECK_SECONDS (3) = how often the balance is also polled directly.
 
-# ── Follower accounts (optional; the collector runs the same without them) ─────────────
+# ── Follower accounts (optional; the main account runs the same without them) ─────────────
 #   Set on Render (Environment tab; never put values in this file):
 #     DATABASE_URL    - Neon pooled connection string (already set)
 #     ADMIN_PASSWORD  - password for /followers /verdict /capacity (pages refuse to load without it)
@@ -26,7 +29,7 @@
 #       hour, inclusive: starts 53:00.0, last opening 59:59.9. A test, not a claimed edge.
 #     ZONE_MIN_TRADES (150), ZONE_MAX_PER_HOUR (3), VERDICT_MIN_TRADES (300),
 #     FOLLOWER_LOCK_THRESHOLD (5.0)
-#   Keep TARGET_BALANCE UNSET, otherwise the collector would stop.
+#   (the main account trades on its own; TARGET_BALANCE, if set, still stops it.)
 #   Demo/real is ONE global switch on the /followers page (typed confirmation), not an env var.
 
 services:
@@ -45,6 +48,8 @@ services:
       - key: REDEPLOY_INTERVAL_SECONDS
         value: "0"
       - key: RENDER_API_KEY
+        sync: false
+      - key: PREDICTOR_STAKE      # MINIMUM stake for the main account AND the followers (money rules size up from it)
         sync: false
       - key: TARGET_BALANCE
         sync: false
