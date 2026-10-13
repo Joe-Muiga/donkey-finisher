@@ -670,6 +670,16 @@ def _render_dashboard() -> str:
             start_balance=day_start or None,
         )
         svg_hourly  = _build_hourly_svg(s.get("hourly_pnl", {}))
+        chart_scope, bar_scope = "Today", "Hourly P&amp;L — Today (UTC)"
+        try:                                   # 24 h account history (MH mode) replaces both charts when available
+            import account_history as _ah
+            _b, _k = _ah.balance_svg(), _ah.bucket_svg()
+            if _b:
+                svg_balance, chart_scope = _b, "Last 24 h"
+            if _k:
+                svg_hourly, bar_scope = _k, "P&amp;L per 10 min — Last 24 h (UTC)"
+        except Exception:
+            pass
 
         # ── Recent trades table (last 100) ────────────────────────────────────
         recent_trades_list = s.get("recent_trades", [])
@@ -1053,7 +1063,7 @@ def _render_dashboard() -> str:
 
 <!-- ── 4. Balance Curve ── -->
 <div class="chart-card">
-  <div class="chart-title">Balance Curve — Today
+  <div class="chart-title">Balance Curve — {chart_scope}
     <span style="float:right;font-weight:400;color:#3fb950">● win</span>
     <span style="float:right;font-weight:400;color:#f85149;margin-right:10px">● loss</span>
     <span style="float:right;font-weight:400;color:#d29922;margin-right:10px">● timeout</span>
@@ -1063,7 +1073,7 @@ def _render_dashboard() -> str:
 
 <!-- ── 5. Hourly P&L ── -->
 <div class="chart-card">
-  <div class="chart-title">Hourly P&amp;L — Today (UTC)</div>
+  <div class="chart-title">{bar_scope}</div>
   {svg_hourly}
 </div>
 
@@ -1310,6 +1320,12 @@ def predictor_stats_api():
     _pin_fail.pop(ip, None)
     import predictor_stats
     return jsonify(predictor_stats.analyze(predictor_stats.get_stats().snapshot()))
+
+
+@app.route("/api/history24")
+def history24_api():
+    import account_history
+    return jsonify(account_history.get_series())
 
 
 @app.route("/health")
