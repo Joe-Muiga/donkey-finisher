@@ -1,13 +1,13 @@
 """
-mh_engine.py - MH MODE engine (subclass of SetEngine; money rules, client, watchdog, settle loop reused).
+mh_engine.py - MH MODE engine (subclass of SetEngine; client, watchdog, settle loop reused).
 
   * Boot: per symbol PROBE FIRST (timed -> rtt), then history (MH_HISTORY_TICKS), walk-forward in memory,
     symbols initialised concurrently, each worker starts as soon as ITS init is done.
   * Signal: every tick, horizons 1..MH_HMAX_TRADE, all 18 Over/Under covers from the calibrated blended
     distribution; admitted when p_lb * payout/stake - 1 > MH_MIN_EDGE (lag-mixed P_eff, deadline gate).
-  * Execution: rank by edge_lb/h, stakes computed sequentially (money.reserve), direct buys in parallel,
-    no trade-count cap (money reserve + API semaphore only).
-  * Everything new is in memory and rebuilt at boot; the 10-minute redeploy refits the models.
+  * Execution: rank by edge_lb/h, flat PREDICTOR_STAKE on every buy, direct buys in parallel,
+    no trade-count cap (API semaphore only).
+  * Everything new is in memory and rebuilt at boot; the timed redeploy (AUTO_REDEPLOY_SECONDS, 5 min) refits the models.
 """
 import asyncio
 import collections
@@ -507,13 +507,7 @@ class MHEngine(SetEngine):
             tk = (c.sig.sym, c.sig.idx + c.h)
             if self._tcount.get(tk, 0) >= self.max_per_target:
                 continue
-            stake = self._next_stake()                      # shrinks as pending grows: best candidate = biggest stake
-            if stake is None:
-                self._last_decision = "stopped by money rules (floor reached) - resumes at next reset"
-                break
-            if not self.money.reserve(stake):
-                self._last_decision = "skip: buying would breach the profit floor"
-                break
+            stake = self._next_stake()                      # flat PREDICTOR_STAKE
             self._tcount[tk] = self._tcount.get(tk, 0) + 1
             picks.append((c, stake))
         for c, stake in picks:
@@ -526,7 +520,6 @@ class MHEngine(SetEngine):
         sig, h, cand = c.sig, c.h, mp.COVERS[c.ci]
         sym = sig.sym
         tk = (sym, sig.idx + h)
-        released = False
         ok = False
         try:
             err: Optional[Exception] = None
@@ -547,9 +540,6 @@ class MHEngine(SetEngine):
                 await self._on_api_error("buy", err)
                 return
             buy = (resp or {}).get("buy") or {}
-            self.money.note_buy(buy)
-            self.money.release(stake)
-            released = True
             cid = str(buy.get("contract_id", ""))
             if not cid:
                 logger.warning("BUY returned no contract_id: %s", resp)
@@ -583,8 +573,6 @@ class MHEngine(SetEngine):
         except Exception as exc:
             logger.error("buy flow error %s: %s", sym, exc, exc_info=True)
         finally:
-            if not released:
-                self.money.release(stake)
             self._inflight -= 1
             if not ok:
                 self._tcount[tk] = max(0, self._tcount.get(tk, 1) - 1)
@@ -709,7 +697,7 @@ class MHEngine(SetEngine):
                     balance=round(self.client.balance, 2), session="MH MODE (demo)",
                     current_symbol=",".join(self.symbols), last_signal=self._last_decision,
                     tradeable_count=self._n_tradable(), open_contracts_count=len(self._open),
-                    target_balance=target_guard.target(), money=self.money.snapshot())
+                    target_balance=target_guard.target())
                 keep_alive.set_active_trades(len(self._open))
                 account_history.note_balance(self.client.balance)
             except Exception:
