@@ -1679,7 +1679,7 @@ PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates pr
 # and is DEMO-ONLY unless SET_ALLOW_REAL=1.
 SET_MODE               = os.environ.get("SET_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
 SET_ALLOW_REAL         = os.environ.get("SET_ALLOW_REAL", "0").strip().lower() in ("1", "true", "yes", "on")
-SET_SIZE               = _env_i("SET_SIZE", 3)                    # digits predicted per tick
+SET_SIZE               = _env_i("SET_SIZE", 4)                    # digits predicted per tick
 SET_MAX_COVER_WIDTH    = _env_i("SET_MAX_COVER_WIDTH", 5)         # "clustered": cover wins on <= this many digits
 SET_CONTEXT_SIZES      = _env_tuple("SET_CONTEXT_SIZES", (1, 2, 3))
 SET_PRIOR_STRENGTH     = _env_f("SET_PRIOR_STRENGTH", 50.0)       # shrinkage toward uniform
