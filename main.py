@@ -41,7 +41,14 @@ if not config.DERIV_API_TOKEN:
 def _run_bot():
     """Run the engine; if it ever exits or crashes, start it again (never sit idle)."""
     import target_guard
-    if config.SET_MODE:
+    if config.MH_MODE:
+        from mh_engine import MHEngine as Engine
+        from set_engine import account_allowed
+        allowed, why = account_allowed()
+        if not allowed:
+            logger.critical("MH MODE REFUSED TO START: %s", why)
+            return                                   # demo-only guard, same as set mode
+    elif config.SET_MODE:
         from set_engine import SetEngine as Engine, account_allowed
         allowed, why = account_allowed()
         if not allowed:
@@ -82,7 +89,8 @@ if __name__ == "__main__":
     from keep_alive import app, start_keep_alive
 
     logger.info("Starting digit predictor bot … (%s)",
-                "SET MODE: top-%d digit set -> covering Over/Under, all symbols in parallel" % config.SET_SIZE
+                "MH MODE: multi-horizon digit model, h<=%d, all 18 Over/Under covers, admitted on calibrated edge" % config.MH_HMAX_TRADE
+                if config.MH_MODE else "SET MODE: top-%d digit set -> covering Over/Under, all symbols in parallel" % config.SET_SIZE
                 if config.SET_MODE else "original single-contract mode")
     logger.info(f"  Deriv App ID : {config.DERIV_APP_ID}")
     logger.info(f"  API token    : {'SET ✓' if config.DERIV_API_TOKEN else 'MISSING ✗'}")
