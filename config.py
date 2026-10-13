@@ -1650,7 +1650,7 @@ RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 TRADE_WINDOW_ENABLED      = os.environ.get("SESSION_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 TRADE_WINDOW_START_MINUTE = 29
 TRADE_WINDOW_END_MINUTE   = 36
-PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
+PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # FLAT stake on every trade (Render env var PREDICTOR_STAKE); no money rules
 # Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
 # OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
@@ -1675,7 +1675,7 @@ PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates pr
 
 # ─── SET MODE: predict a set of next digits, buy the Over/Under that covers it ─────────────────────
 # (set_predictor.py + set_engine.py). ON by default; SET_MODE=0 runs the original single-contract engine.
-# It honours TRADE_WINDOW_* (29-36), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, sizes stakes with the money rules (PREDICTOR_STAKE = minimum; SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
+# It honours TRADE_WINDOW_* (29-36), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, uses the flat PREDICTOR_STAKE on every buy (SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
 # and is DEMO-ONLY unless SET_ALLOW_REAL=1.
 SET_MODE               = os.environ.get("SET_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
 SET_ALLOW_REAL         = os.environ.get("SET_ALLOW_REAL", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -1752,8 +1752,8 @@ STATS_PERSIST_TO_RENDER       = os.environ.get(
 #  AUTO REDEPLOY  -  EASY-EDIT SECTION (keep this block at the very bottom of the file)
 # ════════════════════════════════════════════════════════════════════════════════════════════
 #  Render env var  AUTO_REDEPLOY   1 / true / on  = bot redeploys itself every
-#                                                   AUTO_REDEPLOY_SECONDS (below)
-#                                  0 / unset      = OFF (bot runs continuously, no redeploy)
+#                                                   AUTO_REDEPLOY_SECONDS (below)  [DEFAULT: ON]
+#                                  0              = OFF (bot runs continuously, no redeploy)
 #  Flip it in Render > Environment; no code change needed. Needs RENDER_API_KEY set on Render.
 #
 #  A redeploy wipes the instance's local data - that is expected.
@@ -1761,15 +1761,13 @@ STATS_PERSIST_TO_RENDER       = os.environ.get(
 #  runs its own redeploy cycle and the two would fight each other. Each cycle the bot stops opening
 #  trades, drains open contracts (max REDEPLOY_DRAIN_MAX_SECONDS), then fires the Render redeploy.
 #
-#  >>> CHANGE THE INTERVAL HERE (seconds). 420 = 7 minutes. <<<
-AUTO_REDEPLOY_SECONDS = 420
+#  >>> CHANGE THE INTERVAL HERE (seconds). 300 = 5 minutes. <<<
+AUTO_REDEPLOY_SECONDS = 300
 # ────────────────────────────────────────────────────────────────────────────────────────────
-AUTO_REDEPLOY_ENABLED = os.environ.get("AUTO_REDEPLOY", "0").strip().lower() in ("1", "true", "yes", "on")
+AUTO_REDEPLOY_ENABLED = os.environ.get("AUTO_REDEPLOY", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Everything below applies the switch - no need to edit.
 REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
-if MH_MODE:
-    REDEPLOY_INTERVAL_SECONDS = 0.0       # MH mode: no timed redeploy (AUTO_REDEPLOY ignored); the hourly 29-36 window cycle applies
 _ri_env = (os.environ.get("REDEPLOY_INTERVAL_SECONDS") or "").strip()
 if _ri_env:                               # an explicit env value always wins (0 = off)
     try:
@@ -1778,7 +1776,7 @@ if _ri_env:                               # an explicit env value always wins (0
         pass
 REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0
 if REDEPLOY_INTERVAL_SECONDS > 0:
-    TRADE_WINDOW_ENABLED = False          # a timed redeploy replaces the hourly window (never the case in MH mode)
+    TRADE_WINDOW_ENABLED = False          # a timed redeploy replaces the hourly window
 STATS_PERSIST_TO_RENDER = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
     "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
