@@ -1702,14 +1702,20 @@ def _env_b(k, d):
 
 
 MH_MODE                = _env_b("MH_MODE", 1)
+MH_CLUSTER             = _env_b("MH_CLUSTER", 1)                  # 1 = SET-cluster contract choice inside MH; 0 = old MH edge logic
+MH_CLUSTER_WIDTHS      = _env_tuple("MH_CLUSTER_WIDTHS", (3, 4, 5))   # allowed cover widths (digits the cover wins on)
+MH_CLUSTER_PICK        = os.environ.get("MH_CLUSTER_PICK", "widest").strip().lower()   # widest = best win prob; tightest = best payout
+MH_MAX_OPEN            = _env_i("MH_MAX_OPEN", 0)                 # optional cap on open contracts; 0 = unlimited
+MH_MAX_PER_SCAN        = _env_i("MH_MAX_PER_SCAN", 0)             # optional cap on buys per scan; 0 = unlimited
+MH_MIN_PAYOUT_RATIO    = _env_f("MH_MIN_PAYOUT_RATIO", 1.9 if MH_CLUSTER else 2.0)   # real quote payout/stake floor
 MH_HISTORY_TICKS       = _env_i("MH_HISTORY_TICKS", 15000)        # ticks fetched per symbol at boot
 MH_BOOT_BUDGET_SECONDS = _env_f("MH_BOOT_BUDGET_SECONDS", 75)     # extra horizons are skipped past this
 MH_BOOT_CONCURRENCY    = _env_i("MH_BOOT_CONCURRENCY", 5)         # symbols initialised in parallel
-MH_HMAX_TRADE          = _env_i("MH_HMAX_TRADE", 5)               # trade horizons 1..N (paper-scored to 10)
+MH_HMAX_TRADE          = _env_i("MH_HMAX_TRADE", 4 if MH_CLUSTER else 5)               # trade horizons 1..N (paper-scored to 10)
 MH_DECAY               = _env_f("MH_DECAY", 0.998)                # per-observation decay of the models
 MH_GATE                = _env_i("MH_GATE", 1)                   # 0 = no log-loss gate: horizons trade even if not better than uniform
 MH_MIN_EDGE            = _env_f("MH_MIN_EDGE", 0.0)               # admit if p_lb * payout/stake - 1 > this
-MH_MAX_PER_TARGET      = _env_i("MH_MAX_PER_TARGET", 2)           # contracts per (symbol, target tick)
+MH_MAX_PER_TARGET      = _env_i("MH_MAX_PER_TARGET", 4 if MH_CLUSTER else 2)           # contracts per (symbol, target tick)
 MH_DEADLINE_FRAC       = _env_f("MH_DEADLINE_FRAC", 0.85)         # buy must land within this fraction of a tick
 MH_API_CONCURRENCY     = _env_i("MH_API_CONCURRENCY", 6)          # simultaneous proposal/buy requests
 MH_PRICE_TOL           = _env_f("MH_PRICE_TOL", 0.02)             # max buy price = stake * (1 + tol)
