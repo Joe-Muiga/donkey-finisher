@@ -80,6 +80,8 @@ class BotEngine:
         # After the first such failure we buy with the contract parameters directly
         # (buy="1" + parameters), which does not depend on a proposal id at all.
         self._direct_buy = False
+        self._worker_started: set = set()      # symbols whose worker an _init_symbols() already started
+        self._early_tasks: list = []
         # ── performance tracking (log only; nothing here ever blocks a trade) ──
         self._n_trades = 0
         self._n_wins = 0
@@ -126,33 +128,14 @@ class BotEngine:
         self.client.on_balance(self._on_balance)
         self._seen_conn = self._conn_count()
 
-        ready = []
-        for sym in list(self.symbols):
-            ok = False
-            for attempt in (1, 2):                  # one retry: a hiccup must not drop a good symbol
-                try:
-                    await self._init_symbol(sym)
-                    ok = True
-                    break
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.warning("SYMBOL %s start-up attempt %d failed: %s", sym, attempt, exc)
-                    await asyncio.sleep(3)
-            if ok:
-                ready.append(sym)
-            else:
-                logger.error("SYMBOL SKIPPED %s: no tick history / no digit contract could be priced "
-                             "(not offered on this account?)", sym)
-                for d in (self.predictors, self._events, self._live, self._ratios, self._decimals,
-                          self._last_tick_wall, self._recent_epochs):
-                    d.pop(sym, None)
+        ready = await self._init_symbols()
         self.symbols = ready
         if not self.symbols:
             raise RuntimeError("no tradable symbol could be started")
         logger.info("SYMBOLS ACTIVE (%d): %s", len(self.symbols), ",".join(self.symbols))
 
-        tasks = [asyncio.create_task(self._worker(s)) for s in self.symbols]
+        tasks = [asyncio.create_task(self._worker(s)) for s in self.symbols if s not in self._worker_started]
+        tasks += self._early_tasks
         tasks += [asyncio.create_task(self._settle_loop()),
                   asyncio.create_task(self._flush_loop()),
                   asyncio.create_task(self._dashboard_loop()),
@@ -177,6 +160,31 @@ class BotEngine:
                 t.cancel()
             stopper.cancel()
             ws_task.cancel()
+
+    async def _init_symbols(self) -> list:
+        """Initialise all symbols one after another (MHEngine overrides this with a concurrent boot)."""
+        ready = []
+        for sym in list(self.symbols):
+            ok = False
+            for attempt in (1, 2):                  # one retry: a hiccup must not drop a good symbol
+                try:
+                    await self._init_symbol(sym)
+                    ok = True
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("SYMBOL %s start-up attempt %d failed: %s", sym, attempt, exc)
+                    await asyncio.sleep(3)
+            if ok:
+                ready.append(sym)
+            else:
+                logger.error("SYMBOL SKIPPED %s: no tick history / no digit contract could be priced "
+                             "(not offered on this account?)", sym)
+                for d in (self.predictors, self._events, self._live, self._ratios, self._decimals,
+                          self._last_tick_wall, self._recent_epochs):
+                    d.pop(sym, None)
+        return ready
 
     def _extra_tasks(self) -> list:
         """Coroutines a subclass wants run next to the standard loops (none for the original engine)."""
@@ -323,22 +331,23 @@ class BotEngine:
             finally:
                 self._busy.discard(sym)
 
-    def _contract_params(self, sym: str, cand: pred.Candidate, stake: float) -> dict:
+    def _contract_params(self, sym: str, cand: pred.Candidate, stake: float, duration: Optional[int] = None) -> dict:
         p = {"amount": stake, "basis": "stake",
              "contract_type": pred.contract_type(cand), "currency": "USD",
-             "duration": int(self.duration), "duration_unit": "t", "underlying_symbol": sym}
+             "duration": int(self.duration if duration is None else duration), "duration_unit": "t", "underlying_symbol": sym}
         if cand[1] is not None:
             p["barrier"] = str(cand[1])
         return p
 
-    async def _buy_direct(self, sym: str, cand: pred.Candidate, price: float, stake: Optional[float] = None) -> dict:
+    async def _buy_direct(self, sym: str, cand: pred.Candidate, price: float, stake: Optional[float] = None,
+                          duration: Optional[int] = None) -> dict:
         """Buy without a proposal id: {"buy": "1", "price": max_price, "parameters": {...}}."""
         return await self.client._send(
-            {"buy": "1", "price": price, "parameters": self._contract_params(sym, cand, self.stake if stake is None else stake)},
+            {"buy": "1", "price": price, "parameters": self._contract_params(sym, cand, self.stake if stake is None else stake, duration)},
             timeout=10)
 
-    async def _propose(self, sym: str, cand: pred.Candidate, stake: float) -> Optional[dict]:
-        req = {"proposal": 1, **self._contract_params(sym, cand, stake)}
+    async def _propose(self, sym: str, cand: pred.Candidate, stake: float, duration: Optional[int] = None) -> Optional[dict]:
+        req = {"proposal": 1, **self._contract_params(sym, cand, stake, duration)}
         try:
             resp = await self.client._send(req, timeout=10)
             return resp.get("proposal") or None
@@ -671,6 +680,7 @@ class BotEngine:
     async def _settle_loop(self):
         max_wait = float(_cfg("REDEPLOY_DRAIN_MAX_SECONDS", 60))
         halt_max = float(_cfg("REDEPLOY_HALT_MAX_SECONDS", 600))
+        drain = bool(int(_cfg("REDEPLOY_DRAIN", 1)))          # 0 = redeploy at once, open contracts are not awaited
         while True:
             await asyncio.sleep(2)
             now = time.time()
@@ -685,9 +695,9 @@ class BotEngine:
             if self._drain_started is None:
                 self._drain_started = now
                 logger.warning("REDEPLOY DUE: no new trades; draining %d open contract(s)", len(self._open))
-            if self._open and now - self._drain_started < max_wait:
+            if drain and self._open and now - self._drain_started < max_wait:
                 continue
-            if self._open:
+            if self._open and drain:
                 logger.warning("Drain timeout: redeploying with %d contract(s) still open", len(self._open))
             await self.stats.flush(force=True)
             logger.warning("REDEPLOY: firing Render deploy")
