@@ -25,7 +25,7 @@ from bot_engine import BotEngine, _cfg
 from set_engine import SetEngine, account_allowed
 
 logger = logging.getLogger(__name__)
-RATIO_TTL = 90.0
+RATIO_TTL = float(getattr(config, "MH_RATIO_TTL", 600.0))   # digit-contract payout ratios are ~constant: cache long
 
 
 class MHSignal:
@@ -77,10 +77,16 @@ class MHEngine(SetEngine):
         self._throttled_until = 0.0
         self._boot_t0 = time.time()
         # proposal pacing (token-spacing): min seconds between two proposal requests
-        self._rl_base = float(_cfg("MH_PROPOSAL_MIN_INTERVAL", 0.15))
+        self._rl_base = float(_cfg("MH_PROPOSAL_MIN_INTERVAL", 0.30))
         self._rl_gap = self._rl_base
         self._rl_next = 0.0
         self._rl_lock: Optional[asyncio.Lock] = None
+        # rate-limit cooldown: while active NO proposal is sent (retrying while blocked only keeps us blocked)
+        self._rl_cool_base = float(_cfg("MH_RATE_COOLDOWN", 5.0))
+        self._rl_cool_until = 0.0
+        self._rl_strikes = 0
+        self._rl_last_end = 0.0
+        self._max_ratio_fetch = max(1, int(_cfg("MH_MAX_RATIO_FETCH", 10)))   # proposals per scan
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def run(self):
@@ -306,7 +312,11 @@ class MHEngine(SetEngine):
             self._rl_next = max(now, self._rl_next) + self._rl_gap
 
     async def _ratio_fetch(self, sym: str, ci: int, h: int) -> None:
+        if time.monotonic() < self._rl_cool_until:
+            return                                          # cooling down after a rate limit: send nothing
         await self._pace()
+        if time.monotonic() < self._rl_cool_until:
+            return
         async with self._sem:
             t0 = time.perf_counter()
             prop = await self._propose(sym, mp.COVERS[ci], self.stake, h)
@@ -317,26 +327,21 @@ class MHEngine(SetEngine):
     async def _on_api_error(self, what: str, exc: Exception):
         if "rate" in str(exc).lower():
             self._throttle()
-            # No sleep here: this can run while an API permit is held, and sleeping would
-            # only keep the permit busy. Proposal pacing (_pace) does the slowing down.
-            logger.warning("Deriv %s rate-limited (proposal gap now %.2fs): %s", what, self._rl_gap, str(exc)[:120])
             if what == "buy":
                 await asyncio.sleep(1.0)        # buys are not paced; brief backoff outside the permit
             return
         await super()._on_api_error(what, exc)
 
     def _throttle(self) -> None:
-        """After a rate-limit error: double the proposal spacing for 30 s, then restore it."""
-        now = time.time()
-        if now < self._throttled_until:
-            return
-        self._throttled_until = now + 30.0
-        self._rl_gap = self._rl_base * 2.0
-        logger.warning("RATE LIMIT: proposal interval %.2fs -> %.2fs for 30 s", self._rl_base, self._rl_gap)
-        asyncio.get_running_loop().call_later(30.0, self._restore_gap)
-
-    def _restore_gap(self) -> None:
-        self._rl_gap = self._rl_base
+        """Rate limit hit: stop sending proposals for a cooldown (doubles if it keeps happening, max 60 s)."""
+        now = time.monotonic()
+        if now < self._rl_cool_until:
+            return                                          # stragglers already in flight; cooldown running
+        self._rl_strikes = self._rl_strikes + 1 if now - self._rl_last_end < 15.0 else 1
+        cool = min(60.0, self._rl_cool_base * (2 ** (self._rl_strikes - 1)))
+        self._rl_cool_until = now + cool
+        self._rl_last_end = self._rl_cool_until
+        logger.warning("RATE LIMIT: no proposals for %.0f s (strike %d)", cool, self._rl_strikes)
 
     # ── scanner: admit, rank, stake sequentially, buy in parallel ────────────
     async def _scanner_loop(self):
@@ -367,13 +372,18 @@ class MHEngine(SetEngine):
             sigs.append(sig)
         if not sigs:
             return
-        need = set()                                        # live payout ratios still missing (top 3 per sym/h)
-        for sig in sigs:
-            for h, sc in sig.cands.items():
-                for ci, _p, _lb, _e in sc[:3]:
-                    if self._ratio_get(sig.sym, ci, h) is None:
-                        need.add((sig.sym, ci, h))
-        if need:
+        need: list = []                                     # payout ratios still missing (top 3 per sym/h)
+        seen = set()
+        for rank in range(3):                               # best cover of every (sym, h) first, then 2nd, then 3rd
+            for sig in sigs:
+                for h, sc in sig.cands.items():
+                    if rank < len(sc):
+                        k = (sig.sym, sc[rank][0], h)
+                        if k not in seen and self._ratio_get(*k) is None:
+                            seen.add(k)
+                            need.append(k)
+        need = need[: self._max_ratio_fetch]                # cap per scan; the cache fills over the next scans
+        if need and time.monotonic() >= self._rl_cool_until:
             await asyncio.gather(*(self._ratio_fetch(*k) for k in need), return_exceptions=True)
         cands: List[Cand] = []
         for sig in sigs:
