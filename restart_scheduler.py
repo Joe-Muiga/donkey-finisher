@@ -93,7 +93,7 @@ async def run_scheduler():
 
     while True:
         try:
-            interval_secs = float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 150))
+            interval_secs = float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 600))
             _last_scheduled_at = time.time()
 
             next_fire = datetime.fromtimestamp(
@@ -181,7 +181,7 @@ def trigger_redeploy() -> None:
             "REDEPLOY HOOK NOT CONFIGURED\n"
             "Neither RENDER_API_KEY nor RENDER_DEPLOY_HOOK_URL is set. trigger_redeploy() is clearing "
             "the pending flag and starting a brand-new "
-            f"{getattr(config, 'REDEPLOY_INTERVAL_SECONDS', 150)}s window WITHOUT an "
+            f"{getattr(config, 'REDEPLOY_INTERVAL_SECONDS', 600)}s window WITHOUT an "
             "actual redeploy happening. The rolling-restart mechanism is "
             "effectively disabled until RENDER_DEPLOY_HOOK_URL is configured in "
             "the deployment environment.\n" + "=" * 78
@@ -258,7 +258,7 @@ async def _watchdog_loop():
     while True:
         try:
             await asyncio.sleep(check_interval_secs)
-            interval_secs = float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 150))
+            interval_secs = float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 600))
             baseline = _last_confirmed_redeploy_at or _process_start_time
             uptime_secs = time.time() - baseline
             overdue_by = uptime_secs - interval_secs
