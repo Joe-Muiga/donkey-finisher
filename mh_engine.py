@@ -104,18 +104,17 @@ class MHEngine(SetEngine):
         sem = asyncio.Semaphore(max(1, int(_cfg("MH_BOOT_CONCURRENCY", 5))))
 
         async def one(sym: str) -> Optional[str]:
-            async with sem:
-                for attempt in (1, 2):                      # one retry: a hiccup must not drop a good symbol
-                    try:
-                        await self._init_symbol(sym)
-                        self._worker_started.add(sym)       # worker starts now, not after the slowest symbol
-                        self._early_tasks.append(asyncio.create_task(self._worker(sym)))
-                        return sym
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.warning("SYMBOL %s start-up attempt %d failed: %s", sym, attempt, exc)
-                        await asyncio.sleep(3)
+            for attempt in (1, 2):                          # one retry: a hiccup must not drop a good symbol
+                try:
+                    await self._init_symbol(sym, sem)       # probe runs at once for every symbol; history is gated by sem
+                    self._worker_started.add(sym)           # worker starts now, not after the slowest symbol
+                    self._early_tasks.append(asyncio.create_task(self._worker(sym)))
+                    return sym
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("SYMBOL %s start-up attempt %d failed: %s", sym, attempt, exc)
+                    await asyncio.sleep(3)
             logger.error("SYMBOL SKIPPED %s: no tick history / no digit contract could be priced "
                          "(not offered on this account?)", sym)
             for d in (self.predictors, self._events, self._live, self._ratios, self._decimals,
@@ -128,7 +127,7 @@ class MHEngine(SetEngine):
         logger.info("MH BOOT done in %.1fs, rtt estimate %.3fs", time.time() - self._boot_t0, self._rtt or 0.0)
         return [s for s in res if s]
 
-    async def _init_symbol(self, sym: str):
+    async def _init_symbol(self, sym: str, sem: Optional[asyncio.Semaphore] = None):
         self._events[sym] = asyncio.Event()
         self._live[sym] = collections.deque(maxlen=10)
         self._pre[sym] = collections.deque(maxlen=5000)
@@ -137,7 +136,11 @@ class MHEngine(SetEngine):
         try:
             await self._probe_timed(sym)                    # 1) probe (no history download if it fails)
             await self.client.subscribe_ticks(sym, lambda tick, s=sym: self._on_tick(s, tick))   # buffer from now on
-            await self._build_symbol(sym)                   # 2) history + walk-forward
+            if sem is None:
+                await self._build_symbol(sym)               # 2) history + walk-forward
+            else:
+                async with sem:                             # only MH_BOOT_CONCURRENCY histories download at once
+                    await self._build_symbol(sym)
         except BaseException:
             try:
                 await self.client.unsubscribe_ticks(sym)
