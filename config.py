@@ -155,7 +155,7 @@ RISE_FALL_SYMBOLS = [
 # filter with PREDICTOR_SYMBOL_BLOCKLIST (comma separated, case-insensitive prefixes).
 _VOLATILITY_ALL = ["R_10", "R_25", "R_50", "R_75", "R_100",
                    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
-_DEFAULT_BLOCK  = "stpRNG,STEP,BOOM,CRASH"
+_DEFAULT_BLOCK  = "stpRNG,STEP,BOOM,CRASH,JD,RDB"   # prefixes: Step, Boom, Crash, all Jump, Bear/Bull
 # Shortcut ALL_SYMBOLS (the default): every digit-capable index the project knows - the ten
 # Volatility indices, the higher 1s Volatility tiers, Jump and Bear/Bull - minus the blocklist
 # above (Step, Boom, Crash). A symbol Deriv does not offer is skipped at start-up (see bot_engine).
@@ -1694,6 +1694,25 @@ SET_COALESCE_SECONDS   = _env_f("SET_COALESCE_SECONDS", 0.05)     # wait so simu
 SET_MIN_SCAN_GAP       = _env_f("SET_MIN_SCAN_GAP", 0.25)         # min seconds between scans (API rate limits)
 SET_SIGNAL_MAX_AGE_FRAC = _env_f("SET_SIGNAL_MAX_AGE_FRAC", 0.6)  # a signal dies after this fraction of a tick interval
 SET_REPORT_SECONDS     = _env_f("SET_REPORT_SECONDS", 300)        # accuracy/performance report period
+
+# ─── MH MODE: multi-horizon digit model (mh_predictor.py + mh_engine.py), ON by default ─────────────
+# MH_MODE=0 -> old behaviour (SET_MODE / original engine). Everything MH keeps lives in memory only.
+def _env_b(k, d):
+    return os.environ.get(k, str(d)).strip().lower() in ("1", "true", "yes", "on")
+
+
+MH_MODE                = _env_b("MH_MODE", 1)
+MH_HISTORY_TICKS       = _env_i("MH_HISTORY_TICKS", 15000)        # ticks fetched per symbol at boot
+MH_BOOT_BUDGET_SECONDS = _env_f("MH_BOOT_BUDGET_SECONDS", 75)     # extra horizons are skipped past this
+MH_BOOT_CONCURRENCY    = _env_i("MH_BOOT_CONCURRENCY", 5)         # symbols initialised in parallel
+MH_HMAX_TRADE          = _env_i("MH_HMAX_TRADE", 5)               # trade horizons 1..N (paper-scored to 10)
+MH_DECAY               = _env_f("MH_DECAY", 0.998)                # per-observation decay of the models
+MH_MIN_EDGE            = _env_f("MH_MIN_EDGE", 0.0)               # admit if p_lb * payout/stake - 1 > this
+MH_MAX_PER_TARGET      = _env_i("MH_MAX_PER_TARGET", 2)           # contracts per (symbol, target tick)
+MH_DEADLINE_FRAC       = _env_f("MH_DEADLINE_FRAC", 0.85)         # buy must land within this fraction of a tick
+MH_API_CONCURRENCY     = _env_i("MH_API_CONCURRENCY", 6)          # simultaneous proposal/buy requests
+MH_PRICE_TOL           = _env_f("MH_PRICE_TOL", 0.02)             # max buy price = stake * (1 + tol)
+REDEPLOY_DRAIN         = _env_i("REDEPLOY_DRAIN", 0 if MH_MODE else 1)   # 0 = redeploy without waiting for open contracts
 PREDICTOR_STATS_FLUSH_SECONDS = _env_f("PREDICTOR_STATS_FLUSH_SECONDS", 30)
 MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
 WINDOW_MINUTES           = _env_i("WINDOW_MINUTES", 10)
@@ -1742,8 +1761,16 @@ AUTO_REDEPLOY_ENABLED = os.environ.get("AUTO_REDEPLOY", "0").strip().lower() in 
 
 # Everything below applies the switch - no need to edit.
 REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
+if MH_MODE and not AUTO_REDEPLOY_ENABLED:
+    REDEPLOY_INTERVAL_SECONDS = 600.0     # MH mode: redeploy every 10 min by default (refits the models)
+_ri_env = (os.environ.get("REDEPLOY_INTERVAL_SECONDS") or "").strip()
+if _ri_env:                               # an explicit env value always wins (0 = off)
+    try:
+        REDEPLOY_INTERVAL_SECONDS = float(_ri_env)
+    except ValueError:
+        pass
 REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0
-if AUTO_REDEPLOY_ENABLED:
+if AUTO_REDEPLOY_ENABLED or (MH_MODE and REDEPLOY_INTERVAL_SECONDS > 0):
     TRADE_WINDOW_ENABLED = False          # continuous trading; the 7-min redeploy replaces the hourly one
 STATS_PERSIST_TO_RENDER = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
