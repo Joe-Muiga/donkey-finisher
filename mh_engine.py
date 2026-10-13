@@ -48,6 +48,7 @@ class MHEngine(SetEngine):
         super().__init__()
         self.hmax = int(_cfg("MH_HMAX_TRADE", 5))
         self.min_edge = float(_cfg("MH_MIN_EDGE", 0.0))
+        self.min_ratio = float(_cfg("MH_MIN_PAYOUT_RATIO", 2.0))   # payout/stake must be >= this
         self.max_per_target = int(_cfg("MH_MAX_PER_TARGET", 2))
         self.deadline_frac = float(_cfg("MH_DEADLINE_FRAC", 0.85))
         self.price_tol = float(_cfg("MH_PRICE_TOL", 0.02))
@@ -96,8 +97,8 @@ class MHEngine(SetEngine):
             return
         self._sem = asyncio.Semaphore(self.api_n)
         self._rl_lock = asyncio.Lock()
-        logger.info("MH MODE: %s | horizons 1..%d, 18 covers, min stake %.2f, api concurrency %d, min edge %.3f",
-                    why, self.hmax, self.stake, self.api_n, self.min_edge)
+        logger.info("MH MODE: %s | horizons 1..%d, 18 covers, min stake %.2f, api concurrency %d, min edge %.3f, min payout ratio %.2f",
+                    why, self.hmax, self.stake, self.api_n, self.min_edge, self.min_ratio)
         await BotEngine.run(self)
 
     def _extra_tasks(self) -> list:
@@ -391,7 +392,7 @@ class MHEngine(SetEngine):
                 best = None
                 for ci, p, lb, _e in sc:
                     r = self._ratio_get(sig.sym, ci, h)
-                    if r is None:
+                    if r is None or r < self.min_ratio:
                         continue
                     edge = lb * r - 1.0
                     if edge > self.min_edge and (best is None or edge > best.edge):
