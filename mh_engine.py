@@ -16,10 +16,13 @@ import statistics
 import time
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 import account_history
 import config
 import mh_predictor as mp
 import predictor as pred
+import set_predictor as sp
 import target_guard
 from bot_engine import BotEngine, _cfg
 from set_engine import SetEngine, account_allowed
@@ -29,18 +32,44 @@ RATIO_TTL = float(getattr(config, "MH_RATIO_TTL", 600.0))   # digit-contract pay
 
 
 class MHSignal:
-    __slots__ = ("sym", "idx", "recv", "epoch", "cands", "done")
+    __slots__ = ("sym", "idx", "recv", "epoch", "cands", "done", "info")
 
-    def __init__(self, sym, idx, recv, epoch, cands):
+    def __init__(self, sym, idx, recv, epoch, cands, info=None):
         self.sym, self.idx, self.recv, self.epoch, self.cands, self.done = sym, idx, recv, epoch, cands, False
+        self.info = info or {}                           # cluster mode: {h: (cluster digits, mass)}
 
 
 class Cand:
-    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score")
+    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score", "cl")
 
     def __init__(self, sig, h, ci, p, lb, r, edge):
         self.sig, self.h, self.ci, self.p, self.lb, self.r, self.edge = sig, h, ci, p, lb, r, edge
         self.score = edge / h
+        self.cl = None                                   # cluster mode: (cluster, mass, width)
+
+
+def p_eff_mix(ph, pn, q: float):
+    """Lag mix (1-q)*P_h + q*P_(h+1), floored at 1e-4 and renormalised; pn None -> P_h."""
+    if pn is None:
+        return ph
+    p = np.maximum((1.0 - q) * np.asarray(ph) + q * np.asarray(pn), 1e-4)
+    return p / p.sum()
+
+
+def top_cluster(p, size: int) -> Tuple[int, ...]:
+    """The `size` most probable digits (ties -> lower digit), sorted ascending."""
+    return tuple(sorted(sorted(range(10), key=lambda d: (-float(p[d]), d))[:size]))
+
+
+def cover_width(cand) -> int:
+    return 9 - cand[1] if cand[0] == "OVER" else cand[1]
+
+
+def pick_fits(cluster, max_width: int, widths, pick: str):
+    """Covering contracts of the cluster, filtered by allowed widths, ordered by the pick rule."""
+    fits = [(c, w) for c, w in sp.covering_contracts(cluster, max_width) if w in widths]
+    fits.sort(key=lambda x: x[1], reverse=(pick != "tightest"))
+    return fits
 
 
 class MHEngine(SetEngine):
@@ -50,6 +79,20 @@ class MHEngine(SetEngine):
         self.min_edge = float(_cfg("MH_MIN_EDGE", 0.0))
         self.min_ratio = float(_cfg("MH_MIN_PAYOUT_RATIO", 2.0))   # payout/stake must be >= this
         self.max_per_target = int(_cfg("MH_MAX_PER_TARGET", 2))
+        self.cluster = bool(int(_cfg("MH_CLUSTER", 1)))
+        self.set_size = int(_cfg("SET_SIZE", 3))
+        self.max_width = int(_cfg("SET_MAX_COVER_WIDTH", 5))
+        self.widths = tuple(int(w) for w in (_cfg("MH_CLUSTER_WIDTHS", (3, 4, 5)) or (3, 4, 5)))
+        pk = str(_cfg("MH_CLUSTER_PICK", "widest")).strip().lower()
+        self.pick = pk if pk in ("widest", "tightest") else "widest"
+        self.min_set_prob = float(_cfg("SET_MIN_SET_PROB", 0.0))
+        self.max_open = int(_cfg("MH_MAX_OPEN", 0))
+        self.max_per_scan = int(_cfg("MH_MAX_PER_SCAN", 0))
+        self._cl_formed = 0                               # cluster counters (memory only)
+        self._cl_spread = 0
+        self._cl_floor = 0
+        self._cl_cover = collections.Counter()
+        self._cl_width = collections.Counter()
         self.deadline_frac = float(_cfg("MH_DEADLINE_FRAC", 0.85))
         self.price_tol = float(_cfg("MH_PRICE_TOL", 0.02))
         self.api_n = max(2, int(_cfg("MH_API_CONCURRENCY", 6)))
@@ -97,8 +140,9 @@ class MHEngine(SetEngine):
             return
         self._sem = asyncio.Semaphore(self.api_n)
         self._rl_lock = asyncio.Lock()
-        logger.info("MH MODE: %s | horizons 1..%d, 18 covers, min stake %.2f, api concurrency %d, min edge %.3f, min payout ratio %.2f",
-                    why, self.hmax, self.stake, self.api_n, self.min_edge, self.min_ratio)
+        logger.info("MH MODE: %s | horizons 1..%d, 18 covers, min stake %.2f, api concurrency %d, min edge %.3f, min payout ratio %.2f | cluster=%s size=%d widths=%s pick=%s max/target=%d",
+                    why, self.hmax, self.stake, self.api_n, self.min_edge, self.min_ratio,
+                    self.cluster, self.set_size, self.widths, self.pick, self.max_per_target)
         await BotEngine.run(self)
 
     def _extra_tasks(self) -> list:
@@ -269,13 +313,19 @@ class MHEngine(SetEngine):
                     continue
                 q = self._q.get(sym, 0.1)
                 cands = {}
+                info = {}
                 for h in range(1, self.hmax + 1):
+                    if self.cluster:
+                        r = self._cluster_cands(mhs, h, q)
+                        if r:
+                            cands[h], info[h] = r[0], r[1]
+                        continue
                     sc = mhs.screen(h, q, self.min_edge)
                     if sc:
                         cands[h] = sc
                 if cands:
                     self._sig[sym] = MHSignal(sym, self._idx[sym], self._recv.get(sym, time.time()),
-                                              self._last_epoch.get(sym), cands)
+                                              self._last_epoch.get(sym), cands, info)
                     self._scan_event.set()
                 else:
                     self._sig.pop(sym, None)
@@ -284,6 +334,30 @@ class MHEngine(SetEngine):
             except Exception as exc:
                 logger.error("signal error %s: %s", sym, exc, exc_info=True)
                 self._sig.pop(sym, None)
+
+    def _cluster_cands(self, mhs: mp.MHSymbol, h: int, q: float):
+        """Cluster mode: top-SET_SIZE digits of P_eff -> covering Over/Under contracts, ordered by the pick rule."""
+        hs = mhs.hs.get(h)
+        if hs is None or hs.cur is None:
+            return None
+        nxt = mhs.hs.get(h + 1)
+        p = p_eff_mix(hs.cur[1], nxt.cur[1] if (nxt is not None and nxt.cur is not None) else None, q)
+        cl = top_cluster(p, self.set_size)
+        mass = float(sum(p[d] for d in cl))
+        if self.min_set_prob > 0 and mass < self.min_set_prob:
+            return None
+        self._cl_formed += 1
+        fits = pick_fits(cl, self.max_width, self.widths, self.pick)[:3]
+        if not fits:
+            self._cl_spread += 1
+            return None
+        out = []
+        for cand, _w in fits:
+            ci = mp.COVERS.index(cand)
+            pc = float(p @ mp.W[:, ci])
+            pcal = float(hs.cal[ci](pc)[0]) if hs.cal else pc
+            out.append((ci, pcal, pcal, mass))
+        return out, (cl, mass)
 
     # ── timing / rtt ─────────────────────────────────────────────────────────
     def _note_rtt(self, dt: float) -> None:
@@ -388,6 +462,21 @@ class MHEngine(SetEngine):
             await asyncio.gather(*(self._ratio_fetch(*k) for k in need), return_exceptions=True)
         cands: List[Cand] = []
         for sig in sigs:
+            if self.cluster:                                # first cover (pick order) whose real quote passes the floor
+                for h, sc in sig.cands.items():
+                    for ci, p, lb, mass in sc:
+                        r = self._ratio_get(sig.sym, ci, h)
+                        if r is None:
+                            continue
+                        if r < self.min_ratio:
+                            self._cl_floor += 1
+                            continue
+                        c = Cand(sig, h, ci, p, lb, r, lb * r - 1.0)
+                        c.score = mass
+                        c.cl = (sig.info.get(h, ((), mass))[0], mass, cover_width(mp.COVERS[ci]))
+                        cands.append(c)
+                        break
+                continue
             for h, sc in sig.cands.items():
                 best = None
                 for ci, p, lb, _e in sc:
@@ -406,11 +495,15 @@ class MHEngine(SetEngine):
         if not cands:
             self._last_decision = f"scan {self._scans}: {len(sigs)} signal(s), none admitted"
             return
-        cands.sort(key=lambda c: -c.score)
+        cands.sort(key=(lambda c: (-c.score, -c.p)) if self.cluster else (lambda c: -c.score))
         picks: List[Tuple[Cand, float]] = []
         for c in cands:
             if self._late(c.sig) or self._blocked():
                 continue
+            if self.max_open and len(self._open) + self._inflight + len(picks) >= self.max_open:
+                break
+            if self.max_per_scan and len(picks) >= self.max_per_scan:
+                break
             tk = (c.sig.sym, c.sig.idx + c.h)
             if self._tcount.get(tk, 0) >= self.max_per_target:
                 continue
@@ -470,10 +563,15 @@ class MHEngine(SetEngine):
                                "decision_epoch": sig.epoch, "t0": time.time(), "h": h, "sig_idx": sig.idx,
                                "p_cal": c.p, "p_lb": c.lb, "score": c.score, "pred_digits": (), "pred_ranked": ()}
             tg = f"{cand[0]}{cand[1]}"
+            cl_s = ""
+            if c.cl is not None:
+                self._cl_cover[tg] += 1
+                self._cl_width[c.cl[2]] += 1
+                cl_s = " cluster=%s mass=%.2f width=%d pick=%s" % (list(c.cl[0]), c.cl[1], c.cl[2], self.pick)
             self._last_decision = f"BUY {sym} {tg} h={h} p={c.p:.3f} lb={c.lb:.3f} r={ratio:.3f} edge_lb={c.edge:+.3f}"
             logger.info("MH TRADE %s %s %s h=%d p_cal=%.3f p_lb=%.3f paid=%.2f payout=%.2f ratio=%.3f edge_lb=%+.3f "
                         "score=%.4f q=%.2f shortcode=%s", cid, sym, tg, h, c.p, c.lb, price_paid, payout, ratio, c.edge,
-                        c.score, self._q.get(sym, 0.0), buy.get("shortcode", "?"))
+                        c.score, self._q.get(sym, 0.0), str(buy.get("shortcode", "?")) + cl_s)
             self.client._contract_symbol_map[cid] = sym
             try:
                 await self.client.subscribe_contract(
@@ -580,6 +678,8 @@ class MHEngine(SetEngine):
 
     # ── reporting ────────────────────────────────────────────────────────────
     def _n_tradable(self) -> int:
+        if self.cluster:
+            return sum(1 for m in self.mh.values() if m.ready())     # symbols with a fitted MH state
         return sum(1 for m in self.mh.values() for h, hs in m.hs.items() if hs.tradable and h <= self.hmax and not hs.muted())
 
     def report_text(self) -> str:
@@ -589,8 +689,14 @@ class MHEngine(SetEngine):
         per_h = " ".join(f"h{h}:{self._hs_n[h]}t/{self._hs_w[h]}w exc{self._hs_w[h] - self._hs_p[h]:+.1f}"
                          for h in range(1, self.hmax + 1) if self._hs_n[h]) or "no settled trades"
         qs = ",".join(f"{s}:{self._q.get(s, 0.1):.2f}" for s in self.symbols)
-        total = sum(1 for m in self.mh.values() for h in m.hs if h <= self.hmax)
-        return (f"SET REPORT | MH {trade} | per-h {per_h} | tradable (sym,h) {self._n_tradable()}/{total} | "
+        total = len(self.symbols) if self.cluster else sum(1 for m in self.mh.values() for h in m.hs if h <= self.hmax)
+        cl = ""
+        if self.cluster:
+            cv = " ".join(f"{k}:{v}" for k, v in sorted(self._cl_cover.items())) or "-"
+            wd = " ".join(f"w{k}:{v}" for k, v in sorted(self._cl_width.items())) or "-"
+            cl = (f"CLUSTER formed {self._cl_formed} spread-out {self._cl_spread} floor-rejected {self._cl_floor} | "
+                  f"covers {cv} | widths {wd} | ")
+        return (f"SET REPORT | MH {trade} | {cl}per-h {per_h} | tradable (sym,h) {self._n_tradable()}/{total} | "
                 f"q {qs} | muted {sorted(self._muted) or '-'} | open {len(self._open)} | signals {len(self._sig)} | "
                 f"scans {self._scans} | rtt {self._rtt or 0:.3f}s")
 
