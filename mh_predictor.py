@@ -18,9 +18,11 @@ from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+import config
 import predictor as P
 
 LN10 = math.log(10.0)
+GATE = bool(int(getattr(config, "MH_GATE", 1)))   # False: skip the better-than-uniform checks
 FLOOR = 1e-4
 A1 = 5.0            # M1 shrinkage toward uniform
 S2 = 20.0           # M2 back-off strength
@@ -232,7 +234,7 @@ class HState:
 
     def muted(self) -> bool:
         m = self.roll_mean()
-        return m is not None and m >= LN10
+        return GATE and m is not None and m >= LN10
 
 
 class MHSymbol:
@@ -278,7 +280,7 @@ class MHSymbol:
         hs.val_ll = ll
         pc, oc = PB @ W, W[tgt]
         hs.cal = [Calibrator(pc[:, c], oc[:, c]) for c in range(len(COVERS))]
-        hs.tradable = h <= self.hmax_trade and ll < LN10
+        hs.tradable = h <= self.hmax_trade and (ll < LN10 or not GATE)
 
     def on_tick(self, digit: int, epoch: Optional[float] = None) -> bool:
         if epoch is not None:
