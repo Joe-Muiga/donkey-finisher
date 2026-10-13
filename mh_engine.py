@@ -76,6 +76,11 @@ class MHEngine(SetEngine):
         self._sem: Optional[asyncio.Semaphore] = None
         self._throttled_until = 0.0
         self._boot_t0 = time.time()
+        # proposal pacing (token-spacing): min seconds between two proposal requests
+        self._rl_base = float(_cfg("MH_PROPOSAL_MIN_INTERVAL", 0.15))
+        self._rl_gap = self._rl_base
+        self._rl_next = 0.0
+        self._rl_lock: Optional[asyncio.Lock] = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def run(self):
@@ -84,6 +89,7 @@ class MHEngine(SetEngine):
             logger.critical("MH MODE REFUSED TO START: %s", why)
             return
         self._sem = asyncio.Semaphore(self.api_n)
+        self._rl_lock = asyncio.Lock()
         logger.info("MH MODE: %s | horizons 1..%d, 18 covers, min stake %.2f, api concurrency %d, min edge %.3f",
                     why, self.hmax, self.stake, self.api_n, self.min_edge)
         await BotEngine.run(self)
@@ -288,7 +294,19 @@ class MHEngine(SetEngine):
         v = self._ratio_cache.get((sym, ci, h))
         return v[0] if v and time.time() - v[1] < RATIO_TTL else None
 
+    async def _pace(self) -> None:
+        """Space proposal requests at least self._rl_gap seconds apart (called BEFORE taking an API permit)."""
+        if self._rl_lock is None:
+            self._rl_lock = asyncio.Lock()
+        async with self._rl_lock:
+            now = time.monotonic()
+            if self._rl_next > now:
+                await asyncio.sleep(self._rl_next - now)
+                now = time.monotonic()
+            self._rl_next = max(now, self._rl_next) + self._rl_gap
+
     async def _ratio_fetch(self, sym: str, ci: int, h: int) -> None:
+        await self._pace()
         async with self._sem:
             t0 = time.perf_counter()
             prop = await self._propose(sym, mp.COVERS[ci], self.stake, h)
@@ -299,28 +317,26 @@ class MHEngine(SetEngine):
     async def _on_api_error(self, what: str, exc: Exception):
         if "rate" in str(exc).lower():
             self._throttle()
+            # No sleep here: this can run while an API permit is held, and sleeping would
+            # only keep the permit busy. Proposal pacing (_pace) does the slowing down.
+            logger.warning("Deriv %s rate-limited (proposal gap now %.2fs): %s", what, self._rl_gap, str(exc)[:120])
+            if what == "buy":
+                await asyncio.sleep(1.0)        # buys are not paced; brief backoff outside the permit
+            return
         await super()._on_api_error(what, exc)
 
     def _throttle(self) -> None:
+        """After a rate-limit error: double the proposal spacing for 30 s, then restore it."""
         now = time.time()
         if now < self._throttled_until:
             return
         self._throttled_until = now + 30.0
-        asyncio.get_running_loop().create_task(self._ballast())
+        self._rl_gap = self._rl_base * 2.0
+        logger.warning("RATE LIMIT: proposal interval %.2fs -> %.2fs for 30 s", self._rl_base, self._rl_gap)
+        asyncio.get_running_loop().call_later(30.0, self._restore_gap)
 
-    async def _ballast(self) -> None:
-        """Hold half of the API permits for 30 s after a rate-limit error."""
-        got = 0
-        try:
-            for _ in range(self.api_n // 2):
-                await asyncio.wait_for(self._sem.acquire(), timeout=5)
-                got += 1
-        except asyncio.TimeoutError:
-            pass
-        logger.warning("RATE LIMIT: api concurrency %d -> %d for 30 s", self.api_n, self.api_n - got)
-        await asyncio.sleep(max(0.0, self._throttled_until - time.time()))
-        for _ in range(got):
-            self._sem.release()
+    def _restore_gap(self) -> None:
+        self._rl_gap = self._rl_base
 
     # ── scanner: admit, rank, stake sequentially, buy in parallel ────────────
     async def _scanner_loop(self):
