@@ -1642,14 +1642,14 @@ RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # PREDICTOR_SYMBOLS is defined next to DIGIT_SYMBOLS above.
-# Trade window: the bot opens contracts ONLY while the clock (UTC) is between minute 29 and minute 36
-# of the hour, inclusive: 29:00.0 up to and including 36:59.9. Strict - not an env var, so a stale value
+# Trade window: the bot opens contracts ONLY while the clock (UTC) is between minute 29 and minute 44
+# of the hour, inclusive: 29:00.0 up to and including 44:59.9. Strict - not an env var, so a stale value
 # on Render can never widen it. Outside it nothing is bought (ticks keep feeding the predictor).
-# SESSION_WINDOW_ENABLED (Render env var, default ON): 1 = trade only minutes 29-36, disconnected + redeployed
+# SESSION_WINDOW_ENABLED (Render env var, default ON): 1 = trade only minutes 29-44, disconnected + redeployed
 # (cache cleared) the rest of the hour. 0 = window OFF: connected and trading every minute, no hourly redeploy.
 TRADE_WINDOW_ENABLED      = os.environ.get("SESSION_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 TRADE_WINDOW_START_MINUTE = 29
-TRADE_WINDOW_END_MINUTE   = 36
+TRADE_WINDOW_END_MINUTE   = 44
 PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
 # Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
@@ -1675,7 +1675,7 @@ PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates pr
 
 # ─── SET MODE: predict a set of next digits, buy the Over/Under that covers it ─────────────────────
 # (set_predictor.py + set_engine.py). ON by default; SET_MODE=0 runs the original single-contract engine.
-# It honours TRADE_WINDOW_* (29-36), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, sizes stakes with the money rules (PREDICTOR_STAKE = minimum; SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
+# It honours TRADE_WINDOW_* (29-44), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, sizes stakes with the money rules (PREDICTOR_STAKE = minimum; SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
 # and is DEMO-ONLY unless SET_ALLOW_REAL=1.
 SET_MODE               = os.environ.get("SET_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
 SET_ALLOW_REAL         = os.environ.get("SET_ALLOW_REAL", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -1757,7 +1757,7 @@ STATS_PERSIST_TO_RENDER       = os.environ.get(
 #  Flip it in Render > Environment; no code change needed. Needs RENDER_API_KEY set on Render.
 #
 #  A redeploy wipes the instance's local data - that is expected.
-#  While ON, the hourly trade window (minutes 29-36) is switched OFF, because the window scheduler
+#  While ON, the hourly trade window (minutes 29-44) is switched OFF, because the window scheduler
 #  runs its own redeploy cycle and the two would fight each other. Each cycle the bot stops opening
 #  trades, drains open contracts (max REDEPLOY_DRAIN_MAX_SECONDS), then fires the Render redeploy.
 #
@@ -1769,7 +1769,7 @@ AUTO_REDEPLOY_ENABLED = os.environ.get("AUTO_REDEPLOY", "0").strip().lower() in 
 # Everything below applies the switch - no need to edit.
 REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
 if MH_MODE:
-    REDEPLOY_INTERVAL_SECONDS = 600.0     # MH mode: redeploy every 10 min whatever AUTO_REDEPLOY says (refits the models)
+    REDEPLOY_INTERVAL_SECONDS = 0.0       # MH mode: no timed redeploy (AUTO_REDEPLOY ignored); the hourly 29-44 window cycle applies
 _ri_env = (os.environ.get("REDEPLOY_INTERVAL_SECONDS") or "").strip()
 if _ri_env:                               # an explicit env value always wins (0 = off)
     try:
@@ -1777,8 +1777,8 @@ if _ri_env:                               # an explicit env value always wins (0
     except ValueError:
         pass
 REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0
-if AUTO_REDEPLOY_ENABLED or (MH_MODE and REDEPLOY_INTERVAL_SECONDS > 0):
-    TRADE_WINDOW_ENABLED = False          # continuous trading; the 7-min redeploy replaces the hourly one
+if REDEPLOY_INTERVAL_SECONDS > 0:
+    TRADE_WINDOW_ENABLED = False          # a timed redeploy replaces the hourly window (never the case in MH mode)
 STATS_PERSIST_TO_RENDER = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
     "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
