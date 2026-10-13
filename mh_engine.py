@@ -65,14 +65,6 @@ def cover_width(cand) -> int:
     return 9 - cand[1] if cand[0] == "OVER" else cand[1]
 
 
-def flip_cover(cand):
-    """Opposite side, same barrier (OVER 6 <-> UNDER 6); None if Deriv has no such contract."""
-    k = cand[1]
-    if cand[0] == "OVER":
-        return ("UNDER", k) if 1 <= k <= 9 else None
-    return ("OVER", k) if 0 <= k <= 8 else None
-
-
 def pick_fits(cluster, max_width: int, widths, pick: str):
     """Covering contracts of the cluster, filtered by allowed widths, ordered by the pick rule."""
     fits = [(c, w) for c, w in sp.covering_contracts(cluster, max_width) if w in widths]
@@ -96,9 +88,6 @@ class MHEngine(SetEngine):
         self.min_set_prob = float(_cfg("SET_MIN_SET_PROB", 0.0))
         self.max_open = int(_cfg("MH_MAX_OPEN", 0))
         self.max_per_scan = int(_cfg("MH_MAX_PER_SCAN", 0))
-        self.invert = self.cluster and bool(int(_cfg("MH_INVERT", 1)))   # test: trade the opposite of the cluster cover
-        if self.invert:
-            self.min_ratio = 0.0                          # payout floor is off while inverting
         self._cl_formed = 0                               # cluster counters (memory only)
         self._cl_spread = 0
         self._cl_floor = 0
@@ -151,9 +140,9 @@ class MHEngine(SetEngine):
             return
         self._sem = asyncio.Semaphore(self.api_n)
         self._rl_lock = asyncio.Lock()
-        logger.info("MH MODE: %s | horizons 1..%d, 18 covers, min stake %.2f, api concurrency %d, min edge %.3f, min payout ratio %.2f | cluster=%s invert=%s size=%d widths=%s pick=%s max/target=%d",
+        logger.info("MH MODE: %s | horizons 1..%d, 18 covers, min stake %.2f, api concurrency %d, min edge %.3f, min payout ratio %.2f | cluster=%s size=%d widths=%s pick=%s max/target=%d",
                     why, self.hmax, self.stake, self.api_n, self.min_edge, self.min_ratio,
-                    self.cluster, self.invert, self.set_size, self.widths, self.pick, self.max_per_target)
+                    self.cluster, self.set_size, self.widths, self.pick, self.max_per_target)
         await BotEngine.run(self)
 
     def _extra_tasks(self) -> list:
@@ -364,15 +353,11 @@ class MHEngine(SetEngine):
             return None
         out = []
         for cand, _w in fits:
-            if self.invert:                                  # flip just before placing: OVER 6 -> UNDER 6
-                cand = flip_cover(cand)
-                if cand is None or cand not in mp.COVERS:
-                    continue
             ci = mp.COVERS.index(cand)
             pc = float(p @ mp.W[:, ci])
             pcal = float(hs.cal[ci](pc)[0]) if hs.cal else pc
             out.append((ci, pcal, pcal, mass))
-        return (out, (cl, mass)) if out else None
+        return out, (cl, mass)
 
     # ── timing / rtt ─────────────────────────────────────────────────────────
     def _note_rtt(self, dt: float) -> None:
@@ -473,7 +458,7 @@ class MHEngine(SetEngine):
                             seen.add(k)
                             need.append(k)
         need = need[: self._max_ratio_fetch]                # cap per scan; the cache fills over the next scans
-        if need and not self.invert and time.monotonic() >= self._rl_cool_until:   # invert: no quotes needed, buy at once
+        if need and time.monotonic() >= self._rl_cool_until:
             await asyncio.gather(*(self._ratio_fetch(*k) for k in need), return_exceptions=True)
         cands: List[Cand] = []
         for sig in sigs:
@@ -482,9 +467,7 @@ class MHEngine(SetEngine):
                     for ci, p, lb, mass in sc:
                         r = self._ratio_get(sig.sym, ci, h)
                         if r is None:
-                            if not self.invert:
-                                continue
-                            r = pred.estimated_payout_ratio(mp.COVERS[ci])   # no floor: do not wait for a quote
+                            continue
                         if r < self.min_ratio:
                             self._cl_floor += 1
                             continue
@@ -585,9 +568,6 @@ class MHEngine(SetEngine):
                 self._cl_cover[tg] += 1
                 self._cl_width[c.cl[2]] += 1
                 cl_s = " cluster=%s mass=%.2f width=%d pick=%s" % (list(c.cl[0]), c.cl[1], c.cl[2], self.pick)
-                if self.invert:
-                    fc = flip_cover(cand)
-                    cl_s += " inv=%s%s->%s%s" % (fc[0], fc[1], cand[0], cand[1])
             self._last_decision = f"BUY {sym} {tg} h={h} p={c.p:.3f} lb={c.lb:.3f} r={ratio:.3f} edge_lb={c.edge:+.3f}"
             logger.info("MH TRADE %s %s %s h=%d p_cal=%.3f p_lb=%.3f paid=%.2f payout=%.2f ratio=%.3f edge_lb=%+.3f "
                         "score=%.4f q=%.2f shortcode=%s", cid, sym, tg, h, c.p, c.lb, price_paid, payout, ratio, c.edge,
@@ -714,7 +694,7 @@ class MHEngine(SetEngine):
         if self.cluster:
             cv = " ".join(f"{k}:{v}" for k, v in sorted(self._cl_cover.items())) or "-"
             wd = " ".join(f"w{k}:{v}" for k, v in sorted(self._cl_width.items())) or "-"
-            cl = (f"CLUSTER{' INVERTED' if self.invert else ''} formed {self._cl_formed} spread-out {self._cl_spread} floor-rejected {self._cl_floor} | "
+            cl = (f"CLUSTER formed {self._cl_formed} spread-out {self._cl_spread} floor-rejected {self._cl_floor} | "
                   f"covers {cv} | widths {wd} | ")
         return (f"SET REPORT | MH {trade} | {cl}per-h {per_h} | tradable (sym,h) {self._n_tradable()}/{total} | "
                 f"q {qs} | muted {sorted(self._muted) or '-'} | open {len(self._open)} | signals {len(self._sig)} | "
