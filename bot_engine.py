@@ -25,7 +25,6 @@ from typing import Dict, List, Optional
 
 import config
 import predictor as pred
-import main_money
 import predictor_stats
 import restart_scheduler
 import target_guard
@@ -52,7 +51,6 @@ class BotEngine:
         self.client = DerivClient()
         self.symbols: List[str] = list(_cfg("PREDICTOR_SYMBOLS", ["R_100"]))
         self.stake = float(_cfg("PREDICTOR_STAKE", 0.35))     # MINIMUM stake (env) - also the probe stake
-        self.money = main_money.MainMoney()                  # profit-securing money rules (floor / stake sizing)
         self.duration = int(_cfg("CONTRACT_DURATION_TICKS", 1))
         self.stats = predictor_stats.get_stats()
         self.predictors: Dict[str, pred.Predictor] = {}
@@ -89,12 +87,12 @@ class BotEngine:
         self._fair_mean = 0.0         # sum of expected profit (in stakes) if every digit were fair
         self._fair_var = 0.0          # sum of variance (in stakes^2) under the same assumption
         self._total_pnl = 0.0
-        self._stakes_won = 0.0        # sum of profit/stake (stakes vary with the money rules)
+        self._stakes_won = 0.0        # sum of profit/stake
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def run(self):
         logger.info("=" * 64)
-        logger.info("  Digit predictor bot  –  min stake %.2f (PREDICTOR_STAKE), symbols %s", self.stake, self.symbols)
+        logger.info("  Digit predictor bot  –  flat stake %.2f (PREDICTOR_STAKE), symbols %s", self.stake, self.symbols)
         logger.info("=" * 64)
         ws_task = asyncio.create_task(self.client.connect())
         for _ in range(60):
@@ -121,10 +119,6 @@ class BotEngine:
                 return
         else:
             logger.info("TARGET GUARD: TARGET_BALANCE not set - no balance target")
-        try:
-            await self.money.start(self.client)          # saved floor/P, live balance, midnight reset
-        except Exception as exc:
-            logger.error("MAIN MONEY could not start (%s) - the bot will not trade until it can", exc)
         self.client.on_balance(self._on_balance)
         self._seen_conn = self._conn_count()
 
@@ -298,9 +292,9 @@ class BotEngine:
         minute = int(ts // 60) % 60
         return int(_cfg("TRADE_WINDOW_START_MINUTE", 0)) <= minute <= int(_cfg("TRADE_WINDOW_END_MINUTE", 59))
 
-    def _next_stake(self) -> Optional[float]:
-        """Stake from the money rules for the next buy; None = stopped (floor reached) or not ready."""
-        return self.money.next_stake()
+    def _next_stake(self) -> float:
+        """Flat stake for every buy = the PREDICTOR_STAKE Render environment variable."""
+        return self.stake
 
     def _blocked(self) -> bool:
         # Only technical blocks remain: no socket, or predictor not yet re-synced after a
@@ -369,10 +363,7 @@ class BotEngine:
         tick_epoch = self._last_epoch.get(sym)
         if tick_epoch is not None and not self._in_trade_window(float(tick_epoch)):
             return                                          # the signal tick itself is outside the window
-        stake = self._next_stake()                          # money rules: None = stopped / floor reached
-        if stake is None:
-            self._last_decision = "stopped by money rules (floor reached) - resumes at next reset"
-            return
+        stake = self._next_stake()                          # flat PREDICTOR_STAKE
         for pk in picks[: int(_cfg("PREDICTOR_MAX_PROPOSALS", 3))]:
             if self._blocked():
                 return
@@ -391,9 +382,6 @@ class BotEngine:
             if self._blocked():
                 return
             ask = float(prop.get("ask_price") or stake)
-            if not self.money.reserve(stake):               # hard rule: balance - stake must stay >= floor
-                self._last_decision = "skip: buying would breach the profit floor"
-                return
             try:
                 if self._direct_buy:
                     resp = await self._buy_direct(sym, pk.cand, ask, stake)
@@ -409,12 +397,9 @@ class BotEngine:
                         self._direct_buy = True
                         logger.info("Direct buy worked - using it for all further trades")
             except Exception as exc:
-                self.money.release(stake)
                 await self._on_api_error("buy", exc)        # error handling, not a gate
                 return
             buy = resp.get("buy") or {}
-            self.money.note_buy(buy)
-            self.money.release(stake)
             cid = str(buy.get("contract_id", ""))
             if not cid:
                 logger.warning("BUY returned no contract_id: %s", resp)
@@ -492,7 +477,6 @@ class BotEngine:
     def _on_balance(self, bal: float):
         """Runs on EVERY live balance update from Deriv (inside the event loop)."""
         self.balance = bal
-        self.money.on_balance(bal)
         if target_guard.should_stop(bal) and target_guard.mark_reached(bal):
             # flag is already set (no new trade can start); do the slow part as a task
             asyncio.get_running_loop().create_task(self._shutdown_for_target(bal))
@@ -724,7 +708,7 @@ class BotEngine:
                     current_symbol=",".join(self.symbols), last_signal=self._last_decision,
                     tradeable_count=sum(len(p.selected) for p in self.predictors.values()),
                     open_contracts_count=len(self._open),
-                    target_balance=target_guard.target(), money=self.money.snapshot())
+                    target_balance=target_guard.target())
                 keep_alive.set_active_trades(len(self._open))
             except Exception:
                 pass
