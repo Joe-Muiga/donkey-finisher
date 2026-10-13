@@ -80,7 +80,7 @@ class MHEngine(SetEngine):
         self.min_ratio = float(_cfg("MH_MIN_PAYOUT_RATIO", 2.0))   # payout/stake must be >= this
         self.max_per_target = int(_cfg("MH_MAX_PER_TARGET", 2))
         self.cluster = bool(int(_cfg("MH_CLUSTER", 1)))
-        self.set_size = int(_cfg("SET_SIZE", 3))
+        self.set_size = int(_cfg("SET_SIZE", 4))
         self.max_width = int(_cfg("SET_MAX_COVER_WIDTH", 5))
         self.widths = tuple(int(w) for w in (_cfg("MH_CLUSTER_WIDTHS", (3, 4, 5)) or (3, 4, 5)))
         pk = str(_cfg("MH_CLUSTER_PICK", "widest")).strip().lower()
