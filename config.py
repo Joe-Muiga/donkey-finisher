@@ -1707,6 +1707,7 @@ MH_BOOT_BUDGET_SECONDS = _env_f("MH_BOOT_BUDGET_SECONDS", 75)     # extra horizo
 MH_BOOT_CONCURRENCY    = _env_i("MH_BOOT_CONCURRENCY", 5)         # symbols initialised in parallel
 MH_HMAX_TRADE          = _env_i("MH_HMAX_TRADE", 5)               # trade horizons 1..N (paper-scored to 10)
 MH_DECAY               = _env_f("MH_DECAY", 0.998)                # per-observation decay of the models
+MH_GATE                = _env_i("MH_GATE", 1)                   # 0 = no log-loss gate: horizons trade even if not better than uniform
 MH_MIN_EDGE            = _env_f("MH_MIN_EDGE", 0.0)               # admit if p_lb * payout/stake - 1 > this
 MH_MAX_PER_TARGET      = _env_i("MH_MAX_PER_TARGET", 2)           # contracts per (symbol, target tick)
 MH_DEADLINE_FRAC       = _env_f("MH_DEADLINE_FRAC", 0.85)         # buy must land within this fraction of a tick
@@ -1738,7 +1739,7 @@ TICK_HISTORY_PAGE_SIZE        = _env_i("TICK_HISTORY_PAGE_SIZE", 1000)
 # (it can restart the service). Only needed when self-redeploying; off otherwise.
 STATS_PERSIST_TO_RENDER       = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
-    "1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0").strip().lower() in ("1", "true", "yes", "on")
+    "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
@@ -1761,8 +1762,8 @@ AUTO_REDEPLOY_ENABLED = os.environ.get("AUTO_REDEPLOY", "0").strip().lower() in 
 
 # Everything below applies the switch - no need to edit.
 REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
-if MH_MODE and not AUTO_REDEPLOY_ENABLED:
-    REDEPLOY_INTERVAL_SECONDS = 600.0     # MH mode: redeploy every 10 min by default (refits the models)
+if MH_MODE:
+    REDEPLOY_INTERVAL_SECONDS = 600.0     # MH mode: redeploy every 10 min whatever AUTO_REDEPLOY says (refits the models)
 _ri_env = (os.environ.get("REDEPLOY_INTERVAL_SECONDS") or "").strip()
 if _ri_env:                               # an explicit env value always wins (0 = off)
     try:
@@ -1774,4 +1775,4 @@ if AUTO_REDEPLOY_ENABLED or (MH_MODE and REDEPLOY_INTERVAL_SECONDS > 0):
     TRADE_WINDOW_ENABLED = False          # continuous trading; the 7-min redeploy replaces the hourly one
 STATS_PERSIST_TO_RENDER = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
-    "1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0").strip().lower() in ("1", "true", "yes", "on")
+    "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
