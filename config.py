@@ -1650,7 +1650,7 @@ RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 TRADE_WINDOW_ENABLED      = os.environ.get("SESSION_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 TRADE_WINDOW_START_MINUTE = 29
 TRADE_WINDOW_END_MINUTE   = 36
-PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # FLAT stake on every trade (Render env var PREDICTOR_STAKE); no money rules
+PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
 # Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
 # OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
@@ -1675,7 +1675,7 @@ PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates pr
 
 # ─── SET MODE: predict a set of next digits, buy the Over/Under that covers it ─────────────────────
 # (set_predictor.py + set_engine.py). ON by default; SET_MODE=0 runs the original single-contract engine.
-# It honours TRADE_WINDOW_* (29-36), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, uses the flat PREDICTOR_STAKE on every buy (SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
+# It honours TRADE_WINDOW_* (29-36), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, sizes stakes with the money rules (PREDICTOR_STAKE = minimum; SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
 # and is DEMO-ONLY unless SET_ALLOW_REAL=1.
 SET_MODE               = os.environ.get("SET_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
 SET_ALLOW_REAL         = os.environ.get("SET_ALLOW_REAL", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -1714,6 +1714,7 @@ MH_BOOT_CONCURRENCY    = _env_i("MH_BOOT_CONCURRENCY", 5)         # symbols init
 MH_HMAX_TRADE          = _env_i("MH_HMAX_TRADE", 4 if MH_CLUSTER else 5)               # trade horizons 1..N (paper-scored to 10)
 MH_DECAY               = _env_f("MH_DECAY", 0.998)                # per-observation decay of the models
 MH_GATE                = _env_i("MH_GATE", 1)                   # 0 = no log-loss gate: horizons trade even if not better than uniform
+MH_GATE_Z              = _env_f("MH_GATE_Z", 1.96)              # gate: lower CI bound of (ln10 - log-loss) must be > 0 at this z
 MH_MIN_EDGE            = _env_f("MH_MIN_EDGE", 0.0)               # admit if p_lb * payout/stake - 1 > this
 MH_MAX_PER_TARGET      = _env_i("MH_MAX_PER_TARGET", 4 if MH_CLUSTER else 2)           # contracts per (symbol, target tick)
 MH_DEADLINE_FRAC       = _env_f("MH_DEADLINE_FRAC", 0.85)         # buy must land within this fraction of a tick
@@ -1752,8 +1753,8 @@ STATS_PERSIST_TO_RENDER       = os.environ.get(
 #  AUTO REDEPLOY  -  EASY-EDIT SECTION (keep this block at the very bottom of the file)
 # ════════════════════════════════════════════════════════════════════════════════════════════
 #  Render env var  AUTO_REDEPLOY   1 / true / on  = bot redeploys itself every
-#                                                   AUTO_REDEPLOY_SECONDS (below)  [DEFAULT: ON]
-#                                  0              = OFF (bot runs continuously, no redeploy)
+#                                                   AUTO_REDEPLOY_SECONDS (below)
+#                                  0 / unset      = OFF (bot runs continuously, no redeploy)
 #  Flip it in Render > Environment; no code change needed. Needs RENDER_API_KEY set on Render.
 #
 #  A redeploy wipes the instance's local data - that is expected.
@@ -1761,13 +1762,14 @@ STATS_PERSIST_TO_RENDER       = os.environ.get(
 #  runs its own redeploy cycle and the two would fight each other. Each cycle the bot stops opening
 #  trades, drains open contracts (max REDEPLOY_DRAIN_MAX_SECONDS), then fires the Render redeploy.
 #
-#  >>> CHANGE THE INTERVAL HERE (seconds). 300 = 5 minutes. <<<
-AUTO_REDEPLOY_SECONDS = 300
+#  >>> CHANGE THE INTERVAL HERE (seconds). 780 = 13 minutes. <<<
+AUTO_REDEPLOY_SECONDS = 780
 # ────────────────────────────────────────────────────────────────────────────────────────────
-AUTO_REDEPLOY_ENABLED = os.environ.get("AUTO_REDEPLOY", "1").strip().lower() in ("1", "true", "yes", "on")
+AUTO_REDEPLOY_ENABLED = os.environ.get("AUTO_REDEPLOY", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Everything below applies the switch - no need to edit.
 REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
+# (MH mode no longer ignores AUTO_REDEPLOY: AUTO_REDEPLOY=1 turns the 13-minute cycle on, 0/unset leaves it off.)
 _ri_env = (os.environ.get("REDEPLOY_INTERVAL_SECONDS") or "").strip()
 if _ri_env:                               # an explicit env value always wins (0 = off)
     try:
@@ -1780,3 +1782,44 @@ if REDEPLOY_INTERVAL_SECONDS > 0:
 STATS_PERSIST_TO_RENDER = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
     "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
+
+if AUTO_REDEPLOY_ENABLED and "REDEPLOY_DRAIN" not in os.environ:
+    REDEPLOY_DRAIN = 1                    # the cycle must drain open contracts before redeploying (explicit env still wins)
+
+# ─── Redeploy cycle safety (restart_scheduler.py / redeploy_guard.py) ─────────────────────────────
+# Deploys are ALWAYS requested with clearCache="do_not_clear" (latest commit); nothing in this path clears the cache.
+REDEPLOY_BUY_BLOCK_SECONDS     = _env_f("REDEPLOY_BUY_BLOCK_SECONDS", 20)      # no new buys in the last N s before a redeploy
+REDEPLOY_HEALTH_TIMEOUT_SECONDS = _env_f("REDEPLOY_HEALTH_TIMEOUT_SECONDS", 180)  # new deploy must be live within this
+REDEPLOY_BACKOFF_BASE_SECONDS  = _env_f("REDEPLOY_BACKOFF_BASE_SECONDS", 300)  # after a failed deploy: base * 2^(fails-1)
+REDEPLOY_BACKOFF_MAX_SECONDS   = _env_f("REDEPLOY_BACKOFF_MAX_SECONDS", 7200)
+REDEPLOY_MIN_UPTIME_SECONDS    = _env_f("REDEPLOY_MIN_UPTIME_SECONDS", 120)    # never redeploy an instance younger than this
+
+# ─── TEST MODE: pre-registered, frozen experiment (exp_mode.py) ──────────────────────────────────
+# Primary test: all non-blocklisted symbols, h=1, OVER5 / UNDER4, fixed zone threshold, flat stake, demo only.
+# Everything below is part of the FROZEN CONFIG whose hash is logged at start and in every report.
+TEST_MODE             = _env_b("TEST_MODE", 0)                  # default OFF
+TEST_STAKE            = _env_f("TEST_STAKE", 1.0)               # one fixed flat stake
+TEST_ZONE_THRESHOLD   = _env_f("TEST_ZONE_THRESHOLD", 0.45)     # fire only if a zone's CALIBRATED total >= this (fixed in advance)
+TEST_MAX_OPEN         = _env_i("TEST_MAX_OPEN", 20)             # cap on open contracts (both arms)
+TEST_MAX_TRADES       = _env_i("TEST_MAX_TRADES", 4000)         # pre-set stopping rule (settled + open test-arm trades)
+TEST_APPLY_GATE       = _env_b("TEST_APPLY_GATE", 0)            # 1 = also require the per-symbol significance gate to fire
+TEST_GATE_Z           = _env_f("TEST_GATE_Z", 2.58)             # gate z in test mode (only used if TEST_APPLY_GATE=1)
+TEST_HONOUR_MUTE      = _env_b("TEST_HONOUR_MUTE", 1)           # breaker-muted symbols do not fire
+TEST_CONTROL          = _env_b("TEST_CONTROL", 1)               # control arm on
+TEST_CONTROL_MODE     = os.environ.get("TEST_CONTROL_MODE", "random").strip().lower()   # random | over | under
+TEST_CONTROL_SEED     = _env_i("TEST_CONTROL_SEED", 12345)
+TEST_VERDICT_MIN      = _env_i("TEST_VERDICT_MIN", 500)         # fewer signals -> "not enough data"
+TEST_SPRT             = _env_b("TEST_SPRT", 0)                  # sequential early stopping, OFF unless enabled
+TEST_SPRT_P1          = _env_f("TEST_SPRT_P1", 0.45)            # alternative hit rate (null = true base rate 0.40)
+TEST_SPRT_ALPHA       = _env_f("TEST_SPRT_ALPHA", 0.05)
+TEST_SPRT_BETA        = _env_f("TEST_SPRT_BETA", 0.20)
+TEST_RESCORE_HMAX     = _env_i("TEST_RESCORE_HMAX", 5)          # horizons stored per signal for re-scoring late trades
+TEST_EPOCH_DUP_MAX    = _env_f("TEST_EPOCH_DUP_MAX", 0.005)     # epoch-resolution flag: duplicate-epoch tick share
+TEST_DIAG_BLOCK       = _env_i("TEST_DIAG_BLOCK", 1000)         # digits per diagnostics block
+LEDGER_LOG_ALL_TICKS  = _env_b("LEDGER_LOG_ALL_TICKS", 1)       # 1 = every tick's prediction + outcome (large!); 0 = fired only
+LEDGER_PATH           = os.environ.get("LEDGER_PATH", "")       # SQLite file when DATABASE_URL is not set
+MH_MUTE_TTL_SECONDS   = _env_f("MH_MUTE_TTL_SECONDS", 0)        # 0 = a breaker mute never expires (restored from the ledger)
+MH_DEADLINE_RTT       = os.environ.get("MH_DEADLINE_RTT", "p50").strip().lower()   # rtt used by the deadline gate: p50 | p95 | ewma
+
+if TEST_MODE:
+    MH_MODE = True                        # test mode lives in the MH engine
