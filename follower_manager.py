@@ -15,7 +15,7 @@ Flow
     from the session start; opening stops at the session end; followers disconnect once their
     open contracts have settled (30 s grace) and whenever no zone is active.
   * After a redeploy mid-session: the hour's snapshot is read back from the DB (never
-    recomputed) and each follower's P/peak/floor are reloaded from the DB.
+    recomputed). Followers stake a flat amount (PREDICTOR_STAKE) on every buy.
 Nothing here claims an edge exists; the 53-59 window is a hypothesis under test.
 """
 import asyncio
@@ -25,12 +25,10 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from typing import Dict, List, Optional
 
 import db
 import follower_config as fc
-import money_rules as mr
 import token_crypto
 import zone_engine as ze
 from follower_client import FollowerClient
@@ -115,9 +113,6 @@ class FollowerRuntime:
         self.id = int(row["id"])
         self.label = row.get("label") or f"#{self.id}"
         self.client = FollowerClient(self.label, token, row.get("app_id") or "", mode)
-        self.state = mr.FState(p=row.get("p_base"), peak=row.get("peak"), floor=row.get("floor_amt"),
-                               last_reset_date=row.get("last_reset_date"),
-                               milestone_hit=bool(row.get("milestone_hit")))
         self.last_balance: Optional[float] = row.get("last_balance")
         self.result_text: Optional[str] = row.get("last_window_result")
         self.ready = False
@@ -157,22 +152,18 @@ class FollowerRuntime:
             await self._fail(f"live balance failed: {str(exc)[:80]}")
             return
         self.last_balance = bal
-        await self._reset_or_update(bal)
         self._init_done = True
         self.ready = True
-        logger.info("FOLLOWER %s ready: balance=%.2f P=%s floor=%s tier=%s", self.label, bal,
-                    _fmt(self.state.p), _fmt(self.state.floor), self.state.tier)
+        logger.info("FOLLOWER %s ready: balance=%.2f flat stake=%.2f", self.label, bal, fc.STAKE)
 
     async def ensure_reset(self) -> None:
-        """Lazy midnight reset for a connection that stays up across 21:00 UTC."""
+        """Kept for the manager's call sites: just refreshes the cached balance."""
         if not self.ready:
             return
         try:
-            bal = await self.client.fetch_balance_live(timeout=6)
-            self.last_balance = bal
-            await self._reset_or_update(bal)
+            self.last_balance = await self.client.fetch_balance_live(timeout=6)
         except Exception as exc:
-            logger.warning("FOLLOWER %s reset check failed: %s", self.label, str(exc)[:80])
+            logger.warning("FOLLOWER %s balance refresh failed: %s", self.label, str(exc)[:80])
 
     async def stop(self) -> None:
         self.ready = False
@@ -200,39 +191,13 @@ class FollowerRuntime:
         if self._task is not None:
             self._task.cancel()
 
-    # -- money state ----------------------------------------------------------
-    async def _reset_or_update(self, bal: float) -> None:
-        today = mr.kenya_day_ts(server_now())
-        if mr.needs_reset(self.state, today):
-            self.state = mr.apply_reset(self.state, bal, fc.LOCK_THRESHOLD, today)
-            logger.info("FOLLOWER %s reset (Kenya midnight): P=%.2f tier=%s floor=%s", self.label, bal,
-                        self.state.tier, _fmt(self.state.floor))
-            await self._persist_now()
-        else:
-            new = mr.update_on_balance(self.state, bal, fc.LOCK_THRESHOLD)
-            if new != self.state:
-                self.state = new
-                await self._persist_now()
-
+    # -- state ----------------------------------------------------------------
     def _on_balance(self, bal: float) -> None:
         self.last_balance = bal
-        if not self._init_done:
-            return
-        new = mr.update_on_balance(self.state, bal, fc.LOCK_THRESHOLD)
-        if new != self.state:
-            self.state = new
-            self._persist_soon()
-        ms = mr.milestone(self.state)
-        if ms and not self.state.milestone_hit and bal >= ms:
-            self.state = replace(self.state, milestone_hit=True)
-            logger.info("FOLLOWER %s milestone %.2f reached (balance %.2f) - trading continues",
-                        self.label, ms, bal)
-            self._persist_soon()
 
     def _state_dict(self) -> dict:
-        s = self.state
-        return {"p": s.p, "peak": s.peak, "floor": s.floor, "tier": s.tier,
-                "last_reset_date": s.last_reset_date, "milestone_hit": s.milestone_hit,
+        return {"p": None, "peak": None, "floor": None, "tier": None,
+                "last_reset_date": None, "milestone_hit": False,
                 "last_balance": self.last_balance, "last_window_result": self.result_text}
 
     async def _persist_now(self) -> None:
@@ -276,14 +241,12 @@ class FollowerRuntime:
                 if time.time() - sig["signal_time"] > fc.SIGNAL_MAX_AGE:
                     METRICS["dropped_old"] = int(METRICS["dropped_old"]) + 1
                     return
-            bal = mr.effective_balance(c.balance, self._pending)
-            stake = mr.stake_for(self.state, bal)
-            if stake is None or not mr.can_buy(self.state, bal, stake):
+            bal = c.balance - self._pending
+            stake = fc.STAKE
+            if bal < stake - 1e-9:                           # cannot pay for the buy: Deriv would reject it
                 if not self._stop_logged and not self.open and self._pending == 0:
                     self._stop_logged = True
-                    logger.info("FOLLOWER %s stopped: tradable money %.2f < %.2f (balance %.2f, floor %s)",
-                                self.label, mr.tradable(self.state, bal), mr.MIN_STAKE, bal,
-                                _fmt(self.state.floor))
+                    logger.info("FOLLOWER %s waiting: balance %.2f < stake %.2f", self.label, bal, stake)
                 return
             self._stop_logged = False
             self._pending += stake
@@ -361,10 +324,6 @@ class FollowerRuntime:
         w[2] += profit
         self.result_text = f"{info['wid']}: {int(w[0])} trades, {int(w[1])} wins, pnl {w[2]:+.2f}"
         self._persist_soon()
-
-
-def _fmt(x: Optional[float]) -> str:
-    return "-" if x is None else f"{x:.2f}"
 
 
 # ── manager ──────────────────────────────────────────────────────────────────
