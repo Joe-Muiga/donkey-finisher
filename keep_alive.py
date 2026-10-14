@@ -1322,6 +1322,25 @@ def predictor_stats_api():
     return jsonify(predictor_stats.analyze(predictor_stats.get_stats().snapshot()))
 
 
+@app.route("/api/exp_report")
+def exp_report_api():
+    """Pre-registered test report: verdict, balance vs expected path, three numbers, diagnostics (PIN protected)."""
+    ip  = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
+    now = time.time()
+    cnt, since = _pin_fail.get(ip, (0, now))
+    if now - since > 60:
+        cnt, since = 0, now
+    if cnt >= 5:
+        return jsonify({"error": "too many attempts"}), 429
+    pin = request.headers.get("X-Pin") or request.args.get("pin", "")
+    if not _check_pin(pin):
+        _pin_fail[ip] = (cnt + 1, since)
+        return jsonify({"error": "bad pin"}), 403
+    _pin_fail.pop(ip, None)
+    import exp_stats
+    return jsonify(exp_stats.EXP.latest())
+
+
 @app.route("/api/history24")
 def history24_api():
     import account_history
