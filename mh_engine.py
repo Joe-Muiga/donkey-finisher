@@ -1,17 +1,20 @@
 """
-mh_engine.py - MH MODE engine (subclass of SetEngine; client, watchdog, settle loop reused).
+mh_engine.py - MH MODE engine (subclass of SetEngine; money rules, client, watchdog, settle loop reused).
 
   * Boot: per symbol PROBE FIRST (timed -> rtt), then history (MH_HISTORY_TICKS), walk-forward in memory,
     symbols initialised concurrently, each worker starts as soon as ITS init is done.
   * Signal: every tick, horizons 1..MH_HMAX_TRADE, all 18 Over/Under covers from the calibrated blended
     distribution; admitted when p_lb * payout/stake - 1 > MH_MIN_EDGE (lag-mixed P_eff, deadline gate).
-  * Execution: rank by edge_lb/h, flat PREDICTOR_STAKE on every buy, direct buys in parallel,
-    no trade-count cap (API semaphore only).
-  * Everything new is in memory and rebuilt at boot; the timed redeploy (AUTO_REDEPLOY_SECONDS, 5 min) refits the models.
+  * Execution: rank by edge_lb/h, stakes computed sequentially (money.reserve), direct buys in parallel,
+    no trade-count cap (money reserve + API semaphore only).
+  * Everything new is in memory and rebuilt at boot; the 10-minute redeploy refits the models.
 """
 import asyncio
 import collections
+import json
 import logging
+import os
+import random
 import statistics
 import time
 from typing import Dict, List, Optional, Tuple
@@ -20,6 +23,10 @@ import numpy as np
 
 import account_history
 import config
+import exp_mode
+import restart_scheduler
+import stream_diag
+from exp_stats import EXP
 import mh_predictor as mp
 import predictor as pred
 import set_predictor as sp
@@ -32,20 +39,23 @@ RATIO_TTL = float(getattr(config, "MH_RATIO_TTL", 600.0))   # digit-contract pay
 
 
 class MHSignal:
-    __slots__ = ("sym", "idx", "recv", "epoch", "cands", "done", "info")
+    __slots__ = ("sym", "idx", "recv", "epoch", "cands", "done", "info", "test")
 
     def __init__(self, sym, idx, recv, epoch, cands, info=None):
         self.sym, self.idx, self.recv, self.epoch, self.cands, self.done = sym, idx, recv, epoch, cands, False
         self.info = info or {}                           # cluster mode: {h: (cluster digits, mass)}
+        self.test = None                                 # test mode: {"zd": ZoneDecision, "p_by_h": {h: probs}}
 
 
 class Cand:
-    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score", "cl")
+    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score", "cl", "arm", "extra")
 
     def __init__(self, sig, h, ci, p, lb, r, edge):
         self.sig, self.h, self.ci, self.p, self.lb, self.r, self.edge = sig, h, ci, p, lb, r, edge
         self.score = edge / h
         self.cl = None                                   # cluster mode: (cluster, mass, width)
+        self.arm = None                                  # test mode: "test" | "ctl"
+        self.extra = None                                # extra fields stored with the open contract
 
 
 def p_eff_mix(ph, pn, q: float):
@@ -131,6 +141,30 @@ class MHEngine(SetEngine):
         self._rl_strikes = 0
         self._rl_last_end = 0.0
         self._max_ratio_fetch = max(1, int(_cfg("MH_MAX_RATIO_FETCH", 10)))   # proposals per scan
+        self._cl_gate = 0                                 # cluster safeguards: horizons refused by gate/mute, covers refused by edge
+        self._cl_edge = 0
+        self._mute_ts: Dict[str, float] = {}
+        self._rtt_hist: Dict[str, collections.deque] = {}
+        # ── pre-registered test mode (exp_mode.py) ──
+        self.test_mode = bool(_cfg("TEST_MODE", False))
+        self.ledger = None
+        self._ledger_on = self.test_mode or bool(int(os.environ.get("LEDGER_ENABLED", "0") or 0))
+        self.diag = stream_diag.StreamDiag(int(_cfg("TEST_DIAG_BLOCK", 1000)))
+        self._shadow: Dict[str, tuple] = {}               # sym -> (tick idx, top digit, zone, fired) awaiting its outcome
+        self._dup: collections.Counter = collections.Counter()
+        self._ntick: collections.Counter = collections.Counter()
+        self._unk_h: collections.Counter = collections.Counter()
+        self._set_n: collections.Counter = collections.Counter()
+        self._inflight_test = 0
+        self._test_pending = 0.0
+        self._stop_t0 = 0.0
+        self._rng = random.Random(int(_cfg("TEST_CONTROL_SEED", 12345)))
+        if self.test_mode:
+            self.stake = float(_cfg("TEST_STAKE", 1.0))   # one flat stake, also the pricing stake
+            self.max_per_target = 1                       # max one contract per (symbol, target tick) per arm
+            self.max_open = int(_cfg("TEST_MAX_OPEN", 20))
+            self._feed_followers = False                  # follower mirroring OFF
+            self.cluster = False
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def run(self):
@@ -140,13 +174,21 @@ class MHEngine(SetEngine):
             return
         self._sem = asyncio.Semaphore(self.api_n)
         self._rl_lock = asyncio.Lock()
+        if self.test_mode:
+            logger.warning("TEST MODE (pre-registered primary test) | config hash %s | stake %.2f flat | threshold %.3f | "
+                           "h=1 OVER5/UNDER4 | max open %d | max trades %d | control=%s(%s) | demo only",
+                           exp_mode.config_hash(), self.stake, float(_cfg("TEST_ZONE_THRESHOLD", 0.45)), self.max_open,
+                           int(_cfg("TEST_MAX_TRADES", 4000)), bool(_cfg("TEST_CONTROL", True)), _cfg("TEST_CONTROL_MODE", "random"))
         logger.info("MH MODE: %s | horizons 1..%d, 18 covers, min stake %.2f, api concurrency %d, min edge %.3f, min payout ratio %.2f | cluster=%s size=%d widths=%s pick=%s max/target=%d",
                     why, self.hmax, self.stake, self.api_n, self.min_edge, self.min_ratio,
                     self.cluster, self.set_size, self.widths, self.pick, self.max_per_target)
         await BotEngine.run(self)
 
     def _extra_tasks(self) -> list:
-        return [self._scanner_loop(), self._report_loop(), account_history.run(self.client)]
+        t = [self._scanner_loop(), self._report_loop(), account_history.run(self.client)]
+        if self._ledger_on:
+            t.append(self._exp_loop())
+        return t
 
     def _on_balance(self, bal: float):
         super()._on_balance(bal)
@@ -155,9 +197,25 @@ class MHEngine(SetEngine):
         except Exception:
             pass
 
+    def _blocked(self) -> bool:
+        if super()._blocked() or restart_scheduler.buys_blocked():
+            return True                                    # includes the last REDEPLOY_BUY_BLOCK_SECONDS before a redeploy
+        try:
+            import kill_switch
+            if kill_switch.is_paused():
+                return True
+        except Exception:
+            pass
+        return bool(self.test_mode and EXP.stop_reason(self._open_test()))
+
+    def _open_test(self) -> int:
+        return sum(1 for i in self._open.values() if i.get("arm") == "test")
+
     # ── boot: concurrent init, probe first ───────────────────────────────────
     async def _init_symbols(self) -> list:
         self._boot_t0 = time.time()
+        if self._ledger_on:
+            await self._exp_boot()
         sem = asyncio.Semaphore(max(1, int(_cfg("MH_BOOT_CONCURRENCY", 5))))
 
         async def one(sym: str) -> Optional[str]:
@@ -182,6 +240,8 @@ class MHEngine(SetEngine):
         res = await asyncio.gather(*(one(s) for s in list(self.symbols)))
         self._rtt_ready = True
         logger.info("MH BOOT done in %.1fs, rtt estimate %.3fs", time.time() - self._boot_t0, self._rtt or 0.0)
+        if self._ledger_on:
+            await self._exp_ready()
         return [s for s in res if s]
 
     async def _init_symbol(self, sym: str, sem: Optional[asyncio.Semaphore] = None):
@@ -219,7 +279,7 @@ class MHEngine(SetEngine):
         ratio = float(prop["payout"]) / self.stake
         self._ratios.setdefault(sym, {})[cand] = ratio
         self._ratio_cache[(sym, mp.COVERS.index(cand), 1)] = (ratio, time.time())
-        self._note_rtt(dt)
+        self._note_rtt(dt, sym)
 
     def _horizon_deadline(self) -> float:
         budget = float(_cfg("MH_BOOT_BUDGET_SECONDS", 75))
@@ -236,6 +296,8 @@ class MHEngine(SetEngine):
             self._decimals[sym] = int(pred.infer_decimals(quotes) if dec is None else dec)
         dec = self._decimals[sym]
         digits = pred.digits_from_quotes(quotes, dec)
+        if self.test_mode and sym not in self.diag.sym:
+            self.diag.add_many(sym, digits)
         last_ep = ticks[-1]["epoch"]
         mhs = mp.MHSymbol(sym, self.hmax, 10, float(_cfg("MH_DECAY", 0.998)))
         rep = await mhs.fit(digits, last_ep, deadline=self._horizon_deadline())
@@ -279,6 +341,8 @@ class MHEngine(SetEngine):
         self._last_epoch[sym] = ep
         if i % 50 == 0:
             self._T[sym] = self._median_gap(list(q))
+        if self.test_mode:
+            self._exp_on_digit(sym, i, digit)
         return True
 
     def _on_tick(self, sym: str, tick: dict):
@@ -289,6 +353,11 @@ class MHEngine(SetEngine):
         now = time.time()
         self._last_tick_wall[sym] = now
         mhs = self.mh.get(sym)
+        if mhs is not None and mhs.last_epoch is not None and sym not in self._hold:
+            if ep <= mhs.last_epoch:
+                self._dup[sym] += 1                       # duplicate / out-of-order epoch: tick dropped (1 s resolution)
+            else:
+                self._ntick[sym] += 1
         if mhs is None or sym in self._hold:
             buf = self._pre.get(sym)
             if buf is not None:
@@ -308,6 +377,12 @@ class MHEngine(SetEngine):
             ev.clear()
             try:
                 mhs = self.mh.get(sym)
+                if self.test_mode:
+                    if mhs is None or sym in self._hold or not mhs.ready():
+                        self._sig.pop(sym, None)
+                    else:
+                        self._test_step(sym, mhs)
+                    continue
                 if mhs is None or sym in self._hold or sym in self._muted or not mhs.ready():
                     self._sig.pop(sym, None)
                     continue
@@ -340,6 +415,9 @@ class MHEngine(SetEngine):
         hs = mhs.hs.get(h)
         if hs is None or hs.cur is None:
             return None
+        if not hs.tradable or hs.muted() or not hs.cal:    # significance gate (log-loss CI vs uniform) + per-horizon mute
+            self._cl_gate += 1
+            return None
         nxt = mhs.hs.get(h + 1)
         p = p_eff_mix(hs.cur[1], nxt.cur[1] if (nxt is not None and nxt.cur is not None) else None, q)
         cl = top_cluster(p, self.set_size)
@@ -355,20 +433,47 @@ class MHEngine(SetEngine):
         for cand, _w in fits:
             ci = mp.COVERS.index(cand)
             pc = float(p @ mp.W[:, ci])
-            pcal = float(hs.cal[ci](pc)[0]) if hs.cal else pc
-            out.append((ci, pcal, pcal, mass))
+            pcal, plb = hs.cal[ci](pc)                       # calibrated p and its Wilson lower bound
+            out.append((ci, float(pcal), float(plb), mass))
         return out, (cl, mass)
 
     # ── timing / rtt ─────────────────────────────────────────────────────────
-    def _note_rtt(self, dt: float) -> None:
+    def _note_rtt(self, dt: float, sym: Optional[str] = None) -> None:
+        if sym is not None:
+            self._rtt_hist.setdefault(sym, collections.deque(maxlen=200)).append(dt)
         if not self._rtt_ready:
             self._rtt = dt if self._rtt is None else min(self._rtt, dt)    # boot: best probe
         else:
             self._rtt = 0.8 * self._rtt + 0.2 * dt
 
+    def _rtt_q(self, sym: str, q: float) -> Optional[float]:
+        h = self._rtt_hist.get(sym)
+        if not h or len(h) < 20:
+            return None
+        v = sorted(h)
+        return v[min(len(v) - 1, int(q * len(v)))]
+
+    def _rtt_for(self, sym: str) -> float:
+        mode = str(_cfg("MH_DEADLINE_RTT", "p50")).lower()
+        if mode in ("p50", "p95"):
+            v = self._rtt_q(sym, 0.5 if mode == "p50" else 0.95)
+            if v is not None:
+                return v
+        return self._rtt or 0.3
+
     def _late(self, sig: MHSignal, extra: float = 0.0) -> bool:
+        """Hard deadline gate: time since tick arrival + measured RTT must stay under MH_DEADLINE_FRAC x tick gap."""
         T = self._T.get(sig.sym, 2.0)
-        return (time.time() - sig.recv) + (self._rtt or 0.3) + extra > self.deadline_frac * T
+        return (time.time() - sig.recv) + self._rtt_for(sig.sym) + extra > self.deadline_frac * T
+
+    def _skip_late(self, sig: MHSignal, where: str) -> None:
+        EXP.skipped_late[sig.sym] += 1
+        n = sum(EXP.skipped_late.values())
+        if n % 50 == 1:
+            logger.info("skipped_late %s idx=%d (%s) - %d so far", sig.sym, sig.idx, where, n)
+        if self.ledger is not None and self.test_mode:
+            self.ledger.event("skipped_late", sym=sig.sym, idx=sig.idx, where=where,
+                              age=round(time.time() - sig.recv, 4), rtt=round(self._rtt_for(sig.sym), 4))
 
     # ── API helpers ──────────────────────────────────────────────────────────
     def _ratio_get(self, sym: str, ci: int, h: int) -> Optional[float]:
@@ -395,7 +500,7 @@ class MHEngine(SetEngine):
         async with self._sem:
             t0 = time.perf_counter()
             prop = await self._propose(sym, mp.COVERS[ci], self.stake, h)
-            self._note_rtt(time.perf_counter() - t0)
+            self._note_rtt(time.perf_counter() - t0, sym)
         if prop and prop.get("payout"):
             self._ratio_cache[(sym, ci, h)] = (float(prop["payout"]) / self.stake, time.time())
 
@@ -443,9 +548,13 @@ class MHEngine(SetEngine):
                 continue
             sig.done = True                                 # each signal is evaluated exactly once
             if self._late(sig):
+                self._skip_late(sig, "scan")
                 continue
             sigs.append(sig)
         if not sigs:
+            return
+        if self.test_mode:
+            await self._scan_test(sigs)
             return
         need: list = []                                     # payout ratios still missing (top 3 per sym/h)
         seen = set()
@@ -470,6 +579,9 @@ class MHEngine(SetEngine):
                             continue
                         if r < self.min_ratio:
                             self._cl_floor += 1
+                            continue
+                        if lb * r - 1.0 <= self.min_edge:           # real Wilson lower bound x real quote must beat MH_MIN_EDGE
+                            self._cl_edge += 1
                             continue
                         c = Cand(sig, h, ci, p, lb, r, lb * r - 1.0)
                         c.score = mass
@@ -507,7 +619,13 @@ class MHEngine(SetEngine):
             tk = (c.sig.sym, c.sig.idx + c.h)
             if self._tcount.get(tk, 0) >= self.max_per_target:
                 continue
-            stake = self._next_stake()                      # flat PREDICTOR_STAKE
+            stake = self._next_stake()                      # shrinks as pending grows: best candidate = biggest stake
+            if stake is None:
+                self._last_decision = "stopped by money rules (floor reached) - resumes at next reset"
+                break
+            if not self.money.reserve(stake):
+                self._last_decision = "skip: buying would breach the profit floor"
+                break
             self._tcount[tk] = self._tcount.get(tk, 0) + 1
             picks.append((c, stake))
         for c, stake in picks:
@@ -519,13 +637,15 @@ class MHEngine(SetEngine):
     async def _buy_one(self, c: Cand, stake: float) -> None:
         sig, h, cand = c.sig, c.h, mp.COVERS[c.ci]
         sym = sig.sym
-        tk = (sym, sig.idx + h)
+        tk = (sym, sig.idx + h, c.arm) if c.arm else (sym, sig.idx + h)
+        released = False
         ok = False
         try:
             err: Optional[Exception] = None
             resp = None
             async with self._sem:
                 if self._late(sig):                         # waited too long for a permit
+                    self._skip_late(sig, "buy")
                     return
                 t0 = time.perf_counter()
                 try:
@@ -535,11 +655,14 @@ class MHEngine(SetEngine):
                     raise
                 except Exception as exc:
                     err = exc
-                self._note_rtt(time.perf_counter() - t0)
+                self._note_rtt(time.perf_counter() - t0, sym)
             if err is not None:
                 await self._on_api_error("buy", err)
                 return
             buy = (resp or {}).get("buy") or {}
+            self.money.note_buy(buy)
+            self.money.release(stake)
+            released = True
             cid = str(buy.get("contract_id", ""))
             if not cid:
                 logger.warning("BUY returned no contract_id: %s", resp)
@@ -551,7 +674,13 @@ class MHEngine(SetEngine):
             self._open[cid] = {"sym": sym, "cand": cand, "stake": price_paid, "ratio": ratio,
                                "opened_at": float(buy.get("purchase_time") or time.time()),
                                "decision_epoch": sig.epoch, "t0": time.time(), "h": h, "sig_idx": sig.idx,
-                               "p_cal": c.p, "p_lb": c.lb, "score": c.score, "pred_digits": (), "pred_ranked": ()}
+                               "p_cal": c.p, "p_lb": c.lb, "score": c.score, "pred_digits": (), "pred_ranked": (),
+                               "arm": c.arm or ("test" if self.test_mode else "mh"), "buy_ts": time.time(),
+                               **(c.extra or {})}
+            if self.ledger is not None:
+                self.ledger.event("buy", cid=cid, sym=sym, idx=sig.idx, h=h, arm=c.arm or "mh", contract=f"{cand[0]}{cand[1]}",
+                                  stake=price_paid, ratio=round(ratio, 4), rtt=round(self._rtt_for(sym), 4),
+                                  age=round(time.time() - sig.recv, 4))
             tg = f"{cand[0]}{cand[1]}"
             cl_s = ""
             if c.cl is not None:
@@ -573,9 +702,323 @@ class MHEngine(SetEngine):
         except Exception as exc:
             logger.error("buy flow error %s: %s", sym, exc, exc_info=True)
         finally:
+            if not released:
+                self.money.release(stake)
             self._inflight -= 1
+            if c.arm == "test":
+                self._inflight_test = max(0, self._inflight_test - 1)
+            if c.arm:
+                self._test_pending = max(0.0, self._test_pending - stake)
             if not ok:
                 self._tcount[tk] = max(0, self._tcount.get(tk, 1) - 1)
+
+    # ── TEST MODE: frozen zone rule, shadow scoring, control arm ─────────────
+    def _test_step(self, sym: str, mhs: mp.MHSymbol) -> None:
+        """One tick: model -> zone totals -> frozen decision -> ledger row BEFORE the outcome -> signal (if it fires)."""
+        hs = mhs.hs.get(1)
+        if hs is None or hs.cur is None:
+            self._sig.pop(sym, None)
+            return
+        p = hs.cur[1]
+        ci_o, ci_u = mp.COVERS.index(exp_mode.OVER5), mp.COVERS.index(exp_mode.UNDER4)
+        cal = hs.cal
+        cal_o = (lambda x: float(cal[ci_o](x)[0])) if cal else None
+        cal_u = (lambda x: float(cal[ci_u](x)[0])) if cal else None
+        thr = float(_cfg("TEST_ZONE_THRESHOLD", 0.45))
+        zd = exp_mode.zone_decision(p, cal_o, cal_u, thr)
+        fire, reason = zd.fire, zd.reason
+        gate = bool(_cfg("TEST_APPLY_GATE", False))
+        if fire and gate and (not hs.tradable or hs.muted()):          # optional significance gate + horizon mute
+            fire, reason = False, "skip_gate"
+        elif fire and bool(_cfg("TEST_HONOUR_MUTE", True)) and sym in self._muted:   # per-symbol breaker mute
+            fire, reason = False, "skip_muted"
+        idx = self._idx[sym]
+        self._shadow[sym] = (idx, int(zd.top), exp_mode.best_zone(zd), bool(fire))   # scored when tick idx+1 arrives
+        if self.ledger is not None and (fire or bool(_cfg("LEDGER_LOG_ALL_TICKS", True))):
+            self.ledger.prediction(epoch=self._last_epoch.get(sym), sym=sym, idx=idx, h=1,
+                                   probs=",".join(f"{x:.5f}" for x in p), zone_over=zd.zo, zone_under=zd.zu,
+                                   cal_over=zd.co, cal_under=zd.cu, threshold=thr, decision=reason,
+                                   cfg_hash=exp_mode.config_hash())
+        if not fire:
+            self._sig.pop(sym, None)
+            return
+        k = int(_cfg("TEST_RESCORE_HMAX", 5))
+        p_by_h = {h: [float(x) for x in st.cur[1]] for h, st in mhs.hs.items() if h <= k and st.cur is not None}
+        ci = mp.COVERS.index(zd.cand)
+        sig = MHSignal(sym, idx, self._recv.get(sym, time.time()), self._last_epoch.get(sym),
+                       {1: [(ci, float(zd.p_cal), float(zd.p_cal), float(zd.p_cal))]}, {})
+        sig.test = {"zd": zd, "p_by_h": p_by_h}
+        self._sig[sym] = sig
+        self._scan_event.set()
+
+    def _exp_on_digit(self, sym: str, i: int, digit: int) -> None:
+        """Every tick: stream diagnostics + shadow outcome of the prediction made on the previous tick (no money)."""
+        self.diag.add(sym, digit)
+        pend = self._shadow.pop(sym, None)
+        if not pend or pend[0] != i - 1:
+            return
+        _, top, zone, fired = pend
+        top_hit, zh = (top == digit), exp_mode.zone_hit(zone, digit)
+        EXP.add_shadow(sym, top_hit, zh, fired)
+        if self.ledger is not None and (fired or bool(_cfg("LEDGER_LOG_ALL_TICKS", True))):
+            self.ledger.outcome(sym=sym, idx=i, digit=int(digit), top_hit=int(top_hit), zone=zone, zone_hit=int(zh), fired=int(fired))
+
+    async def _scan_test(self, sigs: List[MHSignal]) -> None:
+        ci_o, ci_u = mp.COVERS.index(exp_mode.OVER5), mp.COVERS.index(exp_mode.UNDER4)
+        control = bool(_cfg("TEST_CONTROL", True))
+        need, seen = [], set()
+        for sig in sigs:
+            for ci in ((ci_o, ci_u) if control else (sig.cands[1][0][0],)):
+                k = (sig.sym, ci, 1)
+                if k not in seen and self._ratio_get(*k) is None:
+                    seen.add(k)
+                    need.append(k)
+        need = need[: self._max_ratio_fetch]
+        if need and time.monotonic() >= self._rl_cool_until:
+            await asyncio.gather(*(self._ratio_fetch(*k) for k in need), return_exceptions=True)
+        for sym in {s.sym for s in sigs}:                   # forget old target counters
+            cut = self._idx.get(sym, 0) - 30
+            for k in [k for k in self._tcount if k[0] == sym and k[1] < cut]:
+                self._tcount.pop(k, None)
+        sigs = sorted(sigs, key=lambda s: (-s.cands[1][0][1], s.sym))
+        stake = self.stake                                   # ONE flat stake, no money-rules sizing
+        picks: List[Tuple[Cand, float]] = []
+        n_test_new = 0
+        cap = int(_cfg("TEST_MAX_TRADES", 4000))
+        for sig in sigs:
+            ci, p, _lb, _m = sig.cands[1][0]
+            r = self._ratio_get(sig.sym, ci, 1)
+            if r is None or r < 1.0:
+                continue
+            arms = [("test", ci, p, r)]
+            if control:
+                cci = mp.COVERS.index(exp_mode.control_cover(str(_cfg("TEST_CONTROL_MODE", "random")), self._rng))
+                cr = self._ratio_get(sig.sym, cci, 1)
+                if cr is not None and cr >= 1.0:
+                    arms.append(("ctl", cci, exp_mode.BASE_RATE, cr))
+            n_need = len(arms)
+            if self._blocked() or self._late(sig):
+                if self._late(sig):
+                    self._skip_late(sig, "scan2")
+                continue
+            if self.max_open and len(self._open) + self._inflight + len(picks) + n_need > self.max_open:
+                break
+            if EXP.n_test() + self._open_test() + self._inflight_test + n_test_new + 1 > cap:
+                break
+            if any(self._tcount.get((sig.sym, sig.idx + 1, a[0]), 0) >= 1 for a in arms):
+                continue
+            if self.client.balance - self._test_pending < stake * n_need:
+                self._last_decision = "skip: demo balance below flat stake"
+                break
+            for arm, aci, ap, ar in arms:
+                c = Cand(sig, 1, aci, ap, ap, ar, ap * ar - 1.0)
+                c.arm = arm
+                c.score = ap
+                c.extra = {"p_by_h": sig.test["p_by_h"], "zone_over": sig.test["zd"].zo, "zone_under": sig.test["zd"].zu,
+                           "cal_zone": sig.test["zd"].p_cal, "signal_cfg": exp_mode.config_hash()}
+                self._tcount[(sig.sym, sig.idx + 1, arm)] = 1
+                self._test_pending += stake
+                if arm == "test":
+                    self._inflight_test += 1
+                    n_test_new += 1
+                picks.append((c, stake))
+        for c, st in picks:
+            self._inflight += 1
+            t = asyncio.create_task(self._buy_one(c, st))
+            self._tasks.add(t)
+            t.add_done_callback(self._tasks.discard)
+        if picks:
+            self._last_decision = f"TEST scan {self._scans}: {len(picks)} order(s) from {len(sigs)} signal(s)"
+
+    # ── ledger / restore / cycle accounting ──────────────────────────────────
+    async def _exp_boot(self) -> None:
+        import exp_ledger
+        self.ledger = await asyncio.to_thread(lambda: exp_ledger.get_ledger())
+        try:
+            await asyncio.to_thread(self._exp_restore)
+        except Exception as exc:
+            logger.error("LEDGER restore failed (starting from zero): %s", exc, exc_info=True)
+        if EXP.start_balance is None:
+            try:
+                EXP.start_balance = float(self.client.balance)
+                self.ledger.event("start_balance", value=EXP.start_balance)
+            except Exception:
+                pass
+        self.ledger.event("boot", cfg_hash=exp_mode.config_hash(), pid=os.getpid())
+
+    def _exp_restore(self) -> None:
+        led = self.ledger
+        now = time.time()
+        n = 0
+        for r in led.settlements():
+            arm = r["arm"]
+            row = {k: r[k] for k in ("ts", "arm", "sym", "won", "profit", "stake", "ratio", "h", "realized_h", "align", "p_cal", "p_rescored")}
+            row["won"] = bool(row["won"])
+            if arm in ("test", "ctl"):
+                EXP.add_settlement(row)
+            if arm == "ctl":
+                continue
+            n += 1
+            h, won, p = int(r["h"] or 1), bool(r["won"]), float(r["p_cal"] or 0.0)
+            ratio = max(float(r["ratio"] or 1.0), 1.0001)
+            self._n_trades += 1
+            self._n_wins += int(won)
+            self._be_sum += 1.0 / ratio
+            self._total_pnl += float(r["profit"] or 0.0)
+            self._stakes_won += float(r["profit"] or 0.0) / max(float(r["stake"] or self.stake), 1e-9)
+            self._set_trades += 1
+            self._hs_n[h] += 1
+            self._hs_w[h] += int(won)
+            self._hs_p[h] += p
+            try:
+                kind, bar = r["contract"][:-1], int(r["contract"][-1])
+                pt = pred.true_probability((kind, bar))
+                self._fair_mean += pt * ratio - 1.0
+                self._fair_var += pt * (1.0 - pt) * ratio * ratio
+            except Exception:
+                pass
+            if arm == "test":
+                self._brk.setdefault(r["sym"], collections.deque(maxlen=80)).append((1.0 if won else 0.0, p))
+        ttl = float(_cfg("MH_MUTE_TTL_SECONDS", 0))
+        muted = {}
+        for e in led.events("mute") + led.events("unmute"):
+            if e["kind"] == "mute":
+                muted[e["data"].get("sym")] = e["ts"]
+            else:
+                muted.pop(e["data"].get("sym"), None)
+        for sym, ts in muted.items():
+            if sym and (ttl <= 0 or now - ts < ttl):
+                self._muted.add(sym)
+                self._mute_ts[sym] = ts
+        sh = led.last_event("shadow_snapshot")
+        if sh:
+            EXP.load_shadow(sh["data"])
+        sb = led.last_event("start_balance")
+        if sb:
+            EXP.start_balance = float(sb["data"].get("value"))
+        fv = led.last_event("final_verdict")
+        if fv:
+            EXP.final, EXP.done_reason = fv["data"], str(fv["data"].get("reason", "finished"))
+        dg = led.last_event("donkey_guard_state")
+        if dg and dg["data"].get("state"):
+            os.environ["DONKEY_GUARD_STATE"] = dg["data"]["state"]
+            try:
+                import donkey_guard
+                donkey_guard.get_guard().load_from_env()
+            except Exception:
+                pass
+        logger.info("LEDGER RESTORE: %d settled trade(s) (test arm %d, control %d), muted=%s, final=%s, shadow ticks=%d",
+                    n, EXP.n_test(), len(EXP.ctl), sorted(self._muted) or "-", bool(EXP.final), EXP.shadow.get("ticks", 0))
+
+    async def _exp_ready(self) -> None:
+        """Boot finished: log how long this redeploy cycle cost (uptime of the previous instance vs downtime)."""
+        import redeploy_guard
+        now = time.time()
+        led = self.ledger
+        prev_ready, trig = led.last_event("ready"), led.last_event("deploy_triggered")
+        boot_s = now - getattr(restart_scheduler, "_process_start_time", self._boot_t0)
+        fit_s = now - self._boot_t0
+        data = {"boot_seconds": round(boot_s, 1), "fit_seconds": round(fit_s, 1)}
+        if trig and (not prev_ready or trig["ts"] > prev_ready["ts"]):
+            down = now - trig["ts"]
+            up = (trig["ts"] - prev_ready["ts"]) if prev_ready else None
+            Tm = [self._T.get(s, 2.0) for s in self.symbols]
+            lost = sum(down / max(t, 0.5) for t in Tm)
+            data.update(downtime_seconds=round(down, 1), prev_uptime_seconds=None if up is None else round(up, 1),
+                        trading_fraction=None if up is None else round(up / (up + down), 4), ticks_lost_est=int(lost))
+            logger.warning("REDEPLOY CYCLE: previous instance uptime %s | downtime %.0fs (process boot %.0fs of which "
+                           "history+model fit %.0fs) | trading fraction %s | ~%d symbol-ticks not evaluated",
+                           "n/a" if up is None else f"{up:.0f}s", down, boot_s, fit_s,
+                           "n/a" if up is None else f"{100 * up / (up + down):.1f}%", int(lost))
+        else:
+            logger.info("BOOT: process %.0fs, history+fit %.0fs (no earlier deploy_triggered event in the ledger)", boot_s, fit_s)
+        led.event("ready", **data)
+        EXP.cycle = data
+        redeploy_guard.mark_engine_ready()
+
+    async def _before_redeploy(self) -> None:
+        led = self.ledger
+        if led is None:
+            return
+        for cid, info in list(self._open.items()):
+            led.event("abandoned_at_redeploy", cid=cid, sym=info.get("sym"), arm=info.get("arm"), h=info.get("h"))
+        led.event("shadow_snapshot", **EXP.shadow_snapshot())
+        try:
+            from donkey_guard import get_guard
+            led.event("donkey_guard_state", state=get_guard().export_state())
+        except Exception:
+            pass
+        led.event("deploy_triggered", open_contracts=len(self._open))
+        await asyncio.to_thread(led.flush, 10.0)
+
+    def _rtt_report(self) -> dict:
+        out = {}
+        for sym in self.symbols:
+            a, b = self._rtt_q(sym, 0.5), self._rtt_q(sym, 0.95)
+            if a is not None:
+                out[sym] = {"p50": round(a, 4), "p95": round(b, 4), "n": len(self._rtt_hist[sym]), "T": self._T.get(sym)}
+        return out
+
+    def _epoch_report(self) -> dict:
+        """realized_h comes from mapping the contract's exit epoch to a tick index; epochs have 1 s resolution.
+        A symbol is flagged when duplicate-epoch ticks, unmappable exits or irregular gaps make that unreliable."""
+        out = {}
+        for sym in self.symbols:
+            nt, dup = self._ntick[sym] + self._dup[sym], self._dup[sym]
+            q = list(self._epq.get(sym, ()))
+            T = self._T.get(sym, 2.0)
+            gaps = [b - a for a, b in zip(q, q[1:])]
+            irr = (sum(1 for g in gaps if g != round(T)) / len(gaps)) if gaps else 0.0
+            sn, un = self._set_n[sym], self._unk_h[sym]
+            why = []
+            if nt >= 200 and dup / nt > float(_cfg("TEST_EPOCH_DUP_MAX", 0.005)):
+                why.append(f"dup-epoch ticks {100 * dup / nt:.2f}%")
+            if sn >= 20 and un / sn > 0.05:
+                why.append(f"{100 * un / sn:.0f}% exit ticks not mappable")
+            if T <= 1.5 and irr > 0.02:
+                why.append(f"{100 * irr:.1f}% irregular gaps at T={T:.0f}s")
+            out[sym] = {"T": T, "dup_rate": round(dup / nt, 5) if nt else None, "irregular_gaps": round(irr, 4),
+                        "settled": sn, "unmapped": un, "unreliable": bool(why), "why": why}
+        return out
+
+    def _exp_publish(self) -> None:
+        EXP.rtt = self._rtt_report()
+        EXP.epoch = self._epoch_report()
+        EXP.ledger_stats = self.ledger.stats() if self.ledger else {}
+        EXP.engine = {"balance": round(self.client.balance, 2), "open": len(self._open), "symbols": len(self.symbols),
+                      "muted": sorted(self._muted), "stop": EXP.stop_reason(self._open_test()),
+                      "redeploy_in": None if not restart_scheduler._due_at else round(restart_scheduler._due_at - time.time())}
+        EXP.publish()
+
+    async def _exp_loop(self) -> None:
+        last_pub = last_diag = last_shadow = 0.0
+        while True:
+            await asyncio.sleep(5)
+            try:
+                now = time.time()
+                if self.test_mode:
+                    open_test = self._open_test()
+                    reason = EXP.stop_reason(open_test)
+                    if reason and not EXP.is_done():
+                        self._stop_t0 = self._stop_t0 or now
+                        if open_test == 0 or now - self._stop_t0 > 120:
+                            final = EXP.finalize(reason)
+                            logger.warning(EXP.banner())
+                            self.ledger.event("final_verdict", **final)
+                            await asyncio.to_thread(self.ledger.flush, 10.0)
+                    if now - last_diag >= 30:
+                        last_diag = now
+                        EXP.diag = self.diag.snapshot()
+                if now - last_shadow >= 60:
+                    last_shadow = now
+                    self.ledger.event("shadow_snapshot", **EXP.shadow_snapshot())
+                if now - last_pub >= 10:
+                    last_pub = now
+                    self._exp_publish()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("exp loop error: %s", exc, exc_info=True)
 
     # ── settlement: lag EWMA, per-horizon stats, per-symbol breaker ──────────
     def _inspect_settlement(self, cid: str, info: dict, poc: dict) -> None:
@@ -590,22 +1033,60 @@ class MHEngine(SetEngine):
         profit = float(poc.get("profit") or 0.0)
         won = profit > 0
         p = float(info.get("p_cal") or 0.0)
-        self._set_trades += 1
-        self._hs_n[h] += 1
-        self._hs_w[h] += int(won)
-        self._hs_p[h] += p
+        arm = info.get("arm") or ("test" if self.test_mode else "mh")
         realized = None
         try:                                                # late = settled on a later tick than intended
             ex = poc.get("exit_tick_time")
             m = self._ep2idx.get(sym, {})
             if ex is not None and int(float(ex)) in m:
                 realized = m[int(float(ex))] - int(info["sig_idx"])
-                late = 1.0 if realized > h else 0.0
-                self._q[sym] = 0.95 * self._q.get(sym, 0.1) + 0.05 * late
+                if arm != "ctl":
+                    late = 1.0 if realized > h else 0.0
+                    self._q[sym] = 0.95 * self._q.get(sym, 0.1) + 0.05 * late
         except Exception:
             pass
-        logger.info("MH RESULT %s %s h=%d %s realized_h=%s q=%.2f p_cal=%.3f profit=%+.2f", cid, sym, h,
-                    "WIN" if won else "LOSS", realized, self._q.get(sym, 0.1), p, profit)
+        align = exp_mode.label_alignment(realized, h)
+        self._set_n[sym] += 1
+        if realized is None:
+            self._unk_h[sym] += 1
+        exit_digit = None
+        try:
+            raw = poc.get("exit_tick")
+            raw = poc.get("exit_tick_display_value") if raw is None else raw
+            exit_digit = pred.last_digit(float(raw), self._decimals[sym])
+        except Exception:
+            pass
+        p_resc = None
+        if align == "LATE" and arm == "test" and info.get("p_by_h"):   # re-score against the horizon that actually settled
+            try:
+                pk = (info["p_by_h"].get(realized) or info["p_by_h"].get(str(realized)))
+                if pk is not None:
+                    ci = mp.COVERS.index(cand)
+                    raw_p = float(np.asarray(pk) @ mp.W[:, ci])
+                    hk = self.mh[sym].hs.get(realized)
+                    p_resc = float(hk.cal[ci](raw_p)[0]) if (hk is not None and hk.cal) else raw_p
+            except Exception:
+                p_resc = None
+        stake_v = float(info.get("stake") or self.stake)
+        ratio_v = float(info.get("ratio") or 0.0)
+        tag = f"{cand[0]}{cand[1]}"
+        if self.ledger is not None:
+            self.ledger.settlement(cid=cid, sym=sym, sig_idx=int(info["sig_idx"]), h=h, realized_h=realized, align=align,
+                                   arm=arm, contract=tag, stake=stake_v, ratio=ratio_v, profit=profit, won=int(won),
+                                   exit_digit=exit_digit, p_cal=p, p_rescored=p_resc,
+                                   rtt=round(self._rtt_for(sym), 4), cfg_hash=exp_mode.config_hash())
+        if arm in ("test", "ctl"):
+            EXP.add_settlement({"ts": time.time(), "arm": arm, "sym": sym, "won": won, "profit": profit, "stake": stake_v,
+                                "ratio": ratio_v, "h": h, "realized_h": realized, "align": align, "p_cal": p, "p_rescored": p_resc})
+        logger.info("MH RESULT %s %s %s h=%d %s %s arm=%s realized_h=%s q=%.2f p_cal=%.3f profit=%+.2f%s", cid, sym, tag, h,
+                    "WIN" if won else "LOSS", align, arm, realized, self._q.get(sym, 0.1), p, profit,
+                    "" if p_resc is None else f" p_rescored={p_resc:.3f}")
+        if arm == "ctl":                                    # control arm: evidence only, never feeds the model's breaker/stats
+            return
+        self._set_trades += 1
+        self._hs_n[h] += 1
+        self._hs_w[h] += int(won)
+        self._hs_p[h] += p
         dq = self._brk.setdefault(sym, collections.deque(maxlen=80))
         dq.append((1.0 if won else 0.0, p))
         if sym not in self._muted and len(dq) >= 40:
@@ -613,8 +1094,11 @@ class MHEngine(SetEngine):
             z = sum(w - pp for w, pp in dq) / (var ** 0.5) if var > 0 else 0.0
             if z < -2.0:
                 self._muted.add(sym)
+                self._mute_ts[sym] = time.time()
                 self._sig.pop(sym, None)
-                logger.warning("MH BREAKER: %s muted for the rest of this life (z=%.2f over %d trades)", sym, z, len(dq))
+                if self.ledger is not None:
+                    self.ledger.event("mute", sym=sym, z=round(z, 3), n=len(dq))
+                logger.warning("MH BREAKER: %s muted (persisted in the ledger; z=%.2f over %d trades)", sym, z, len(dq))
         try:
             account_history.note_pnl(profit)
         except Exception:
@@ -684,6 +1168,16 @@ class MHEngine(SetEngine):
             wd = " ".join(f"w{k}:{v}" for k, v in sorted(self._cl_width.items())) or "-"
             cl = (f"CLUSTER formed {self._cl_formed} spread-out {self._cl_spread} floor-rejected {self._cl_floor} | "
                   f"covers {cv} | widths {wd} | ")
+        if self.cluster:
+            cl += f"gate/mute-refused {self._cl_gate} edge-refused {self._cl_edge} | "
+        if self.test_mode:
+            v = EXP.verdict()
+            tn = EXP.summary()["three_numbers"]
+            pc = lambda x: "-" if x is None else f"{100 * x:.1f}%"
+            cl += (f"TEST[{exp_mode.config_hash()}] n={v['n']}/{int(_cfg('TEST_MAX_TRADES', 4000))} state={v['state']} "
+                   f"shadow={pc(tn['shadow_hit_rate'])} aligned={pc(tn['aligned']['win_rate'])}({tn['aligned']['n']}) "
+                   f"late={pc(tn['late']['win_rate'])}({tn['late']['n']}) ctl={EXP.summary()['control']['n']} "
+                   f"skipped_late={sum(EXP.skipped_late.values())} | ")
         return (f"SET REPORT | MH {trade} | {cl}per-h {per_h} | tradable (sym,h) {self._n_tradable()}/{total} | "
                 f"q {qs} | muted {sorted(self._muted) or '-'} | open {len(self._open)} | signals {len(self._sig)} | "
                 f"scans {self._scans} | rtt {self._rtt or 0:.3f}s")
@@ -697,7 +1191,7 @@ class MHEngine(SetEngine):
                     balance=round(self.client.balance, 2), session="MH MODE (demo)",
                     current_symbol=",".join(self.symbols), last_signal=self._last_decision,
                     tradeable_count=self._n_tradable(), open_contracts_count=len(self._open),
-                    target_balance=target_guard.target())
+                    target_balance=target_guard.target(), money=self.money.snapshot())
                 keep_alive.set_active_trades(len(self._open))
                 account_history.note_balance(self.client.balance)
             except Exception:
