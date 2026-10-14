@@ -169,6 +169,8 @@ class HState:
         self.roll: Deque[float] = deque(maxlen=ROLL)
         self.cal: Optional[List[Calibrator]] = None       # one per cover
         self.val_ll: Optional[float] = None
+        self.gate_gain: Optional[float] = None            # mean (ln10 - log-loss) on the out-of-sample slice
+        self.gate_lb: Optional[float] = None              # its lower confidence bound; tradable needs > 0
         self.tradable = False
         self.n_scored = 0
 
@@ -269,6 +271,9 @@ class MHSymbol:
         return rep
 
     def _calibrate(self, hs: HState, res: dict, D: np.ndarray) -> None:
+        """Validation slice = last min(3000, 30%) predictions, split in time: the OLDER 60% fits the per-cover
+        calibrators, the NEWER 40% is the out-of-sample slice for the significance gate (log-loss improvement vs
+        uniform, ln10 - loss, must have a lower CI bound > 0).  Calibration and gate no longer share data."""
         h, t, qi = hs.h, res["t"], res["ok"]
         if len(qi) < 400:
             return
@@ -276,11 +281,17 @@ class MHSymbol:
         sel = qi[-V:]
         PB = res["PB"][sel]
         tgt = D[t[sel] + h]
-        ll = float(-np.log(PB[np.arange(V), tgt]).mean())
-        hs.val_ll = ll
-        pc, oc = PB @ W, W[tgt]
+        loss = -np.log(PB[np.arange(V), tgt])
+        k = int(0.6 * V)
+        pc, oc = PB[:k] @ W, W[tgt[:k]]
         hs.cal = [Calibrator(pc[:, c], oc[:, c]) for c in range(len(COVERS))]
-        hs.tradable = h <= self.hmax_trade and (ll < LN10 or not GATE)
+        gain = LN10 - loss[k:]                         # >0 = better than uniform, out-of-sample
+        m = float(gain.mean())
+        se = float(gain.std(ddof=1) / math.sqrt(len(gain))) if len(gain) > 1 else float("inf")
+        z = float(getattr(config, "TEST_GATE_Z", 2.58) if getattr(config, "TEST_MODE", False) else getattr(config, "MH_GATE_Z", 1.96))
+        hs.val_ll = LN10 - m
+        hs.gate_gain, hs.gate_lb = m, m - z * se
+        hs.tradable = h <= self.hmax_trade and (hs.gate_lb > 0 or not GATE)
 
     def on_tick(self, digit: int, epoch: Optional[float] = None) -> bool:
         if epoch is not None:
