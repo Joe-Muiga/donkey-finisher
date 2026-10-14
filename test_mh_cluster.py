@@ -36,9 +36,20 @@ def test_lag_mix():
     p = me.p_eff_mix(ph, pn, 0.3)
     assert abs(p.sum() - 1) < 1e-12 and p.min() >= 1e-4 / 1.01 and me.p_eff_mix(ph, None, 0.3) is ph
 
+class FakeCal:
+    def __init__(self, p, lb):
+        self.p, self.lb = p, lb
+    def __call__(self, x):
+        return self.p, self.lb
+
 class FakeHS:
-    def __init__(self, p):
-        self.cur, self.cal = (None, np.asarray(p) / np.sum(p)), None
+    """Cluster mode now needs a tradable horizon with calibrators: (p_cal, Wilson lower bound) per cover."""
+    def __init__(self, p, lb=0.6, tradable=True, muted=False):
+        self.cur = (None, np.asarray(p) / np.sum(p))
+        self.cal = [FakeCal(0.62, lb) for _ in mp.COVERS]
+        self.tradable, self._muted = tradable, muted
+    def muted(self):
+        return self._muted
 
 class FakeMoney:
     reserve = release = lambda self, s: True
@@ -46,7 +57,7 @@ class FakeMoney:
 def make(cluster=True):
     e = me.MHEngine()
     e.cluster = cluster
-    e.min_ratio, e.max_per_target, e.hmax = 1.9, 4, 4
+    e.min_ratio, e.max_per_target, e.hmax, e.set_size = 1.9, 4, 4, 3     # set_size 3: the tests are written for top-3 clusters
     e.money, e._next_stake, e._blocked = FakeMoney(), (lambda: 1.0), (lambda: False)
     e._T["R_10"], e._rtt, e.symbols = 2.0, 0.1, ["R_10"]
     e.bought = []
@@ -89,6 +100,21 @@ def test_engine():
     n1, n2 = sum(1 for h, _ in e.bought if h == 1), sum(1 for h, _ in e.bought if h == 2)
     run_scan(e, 102, TOP(7, 8, 9), full)
     assert n1 == 1 and e._tcount[("R_10", 104)] == 4 and sum(1 for h, _ in e.bought if h == 2) == n2   # 2nd scan's h=2 blocked
+    e = make()                                                                       # safeguards restored in cluster mode
+    ratios = {(ci[n], h): 2.0 for n in ci for h in range(1, 5)}
+    mhs = types.SimpleNamespace(hs={h: FakeHS(TOP(7, 8, 9), tradable=False) for h in range(1, 6)})
+    assert all(e._cluster_cands(mhs, h, 0.0) is None for h in range(1, 5)) and e._cl_gate == 4     # not significant
+    mhs = types.SimpleNamespace(hs={h: FakeHS(TOP(7, 8, 9), muted=True) for h in range(1, 6)})
+    assert e._cluster_cands(mhs, 1, 0.0) is None                                                  # horizon muted
+    e = make()
+    mhs = types.SimpleNamespace(hs={h: FakeHS(TOP(7, 8, 9), lb=0.45) for h in range(1, 6)})        # lb*2.0-1 < 0
+    e._idx["R_10"] = 100
+    out = e._cluster_cands(mhs, 1, 0.0)
+    e._sig["R_10"] = me.MHSignal("R_10", 100, time.time(), 0, {1: out[0]}, {1: out[1]})
+    for k, v in ratios.items():
+        e._ratio_cache[("R_10",) + k] = (v, time.time())
+    asyncio.run(e._scan_once())
+    assert not e.bought and e._cl_edge == 3                                                       # Wilson edge check applies
     e = make(cluster=False)                                                          # legacy path untouched
     e._sig["R_10"] = me.MHSignal("R_10", 5, time.time(), 0, {}); e._idx["R_10"] = 5
     asyncio.run(e._scan_once())
