@@ -6,7 +6,7 @@ main.py – entry point (Render web service).
                    and is restarted if it crashes – there is no cycle, cooldown or idle phase.
   • keep-alive   : self-ping of /health.
   • restart sched: OFF by default. Render env var AUTO_REDEPLOY=1 turns it on; the interval is
-                   config.AUTO_REDEPLOY_SECONDS (bottom of config.py, default 420 = 7 min). It sets
+                   config.AUTO_REDEPLOY_SECONDS (bottom of config.py, default 780 = 13 min). It sets
                    the "redeploy pending" flag every N seconds; bot_engine then stops opening
                    trades, drains open contracts, flushes stats and triggers a Render redeploy.
 
@@ -97,6 +97,9 @@ if __name__ == "__main__":
     logger.info(f"  Symbols      : {config.PREDICTOR_SYMBOLS}  "
                 f"min stake (PREDICTOR_STAKE)={config.PREDICTOR_STAKE}")
     logger.info(f"  Account mode : {config.DERIV_ACCOUNT_MODE}")
+    if config.TEST_MODE:
+        import exp_mode
+        logger.warning("  TEST MODE ON : frozen config hash %s | demo only | flat stake %s | followers OFF", exp_mode.config_hash(), config.TEST_STAKE)
     logger.info("  Trade window : %s" % (f"minutes {config.TRADE_WINDOW_START_MINUTE}-{config.TRADE_WINDOW_END_MINUTE} of every hour (UTC), strict"
                                          if config.TRADE_WINDOW_ENABLED else "OFF (SESSION_WINDOW_ENABLED=0) - trading all hours, no hourly redeploy"))
     if not (os.environ.get("PREDICTOR_STAKE") or "").strip():
@@ -118,6 +121,8 @@ if __name__ == "__main__":
     # Follower accounts: own thread + own event loop + Flask Blueprint. Fully optional:
     # any failure here is logged and the main account below starts regardless.
     try:
+        if config.TEST_MODE:
+            raise RuntimeError("TEST_MODE: follower mirroring is OFF")
         import follower_manager
         import follower_web
         follower_web.register(app)
@@ -130,7 +135,7 @@ if __name__ == "__main__":
         import signal
         signal.signal(signal.SIGTERM, _on_sigterm)
     except Exception as exc:
-        logger.error(f"Follower system not started: {exc}", exc_info=True)
+        logger.error(f"Follower system not started: {exc}", exc_info=not config.TEST_MODE)
     threading.Thread(target=_run_bot, name="bot-engine", daemon=True).start()
     logger.info("Bot engine thread started ✓")
     app.run(host="0.0.0.0", port=config.PORT, use_reloader=False, threaded=True)
