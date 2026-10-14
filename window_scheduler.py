@@ -70,9 +70,11 @@ def redeploy_clear_cache() -> bool:
     headers = {"Authorization": f"Bearer {render_api.api_key()}", "Accept": "application/json",
                "Content-Type": "application/json"}
     try:
-        r = requests.post(url, headers=headers, json={"clearCache": "clear"}, timeout=20)
+        # With the timed AUTO_REDEPLOY cycle on, nothing may clear the build cache (slow boots, lost uptime).
+        mode = "do_not_clear" if float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 0)) > 0 else "clear"
+        r = requests.post(url, headers=headers, json={"clearCache": mode}, timeout=20)
         if r.status_code in (200, 201, 202):
-            logger.warning("REDEPLOY accepted by Render (build cache CLEARED): HTTP %s", r.status_code)
+            logger.warning("REDEPLOY accepted by Render (clearCache=%s): HTTP %s", mode, r.status_code)
             return True
         logger.error("REDEPLOY refused by Render: HTTP %s %s", r.status_code, r.text[:200])
     except Exception as exc:
