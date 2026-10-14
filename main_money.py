@@ -1,141 +1,212 @@
 """
-main.py – entry point (Render web service).
+main_money.py - profit-securing money rules for the MAIN (collector) account.
 
-  • Main thread  : Flask (dashboard + /health) – always running.
-  • bot-engine   : asyncio thread running the digit predictor. Starts on EVERY boot
-                   and is restarted if it crashes – there is no cycle, cooldown or idle phase.
-  • keep-alive   : self-ping of /health.
-  • restart sched: OFF by default. Render env var AUTO_REDEPLOY=1 turns it on; the interval is
-                   config.AUTO_REDEPLOY_SECONDS (bottom of config.py, default 780 = 13 min). It sets
-                   the "redeploy pending" flag every N seconds; bot_engine then stops opening
-                   trades, drains open contracts, flushes stats and triggers a Render redeploy.
+Same rules as the follower accounts (see money_rules.py), wrapped in a small stateful object the
+engines call:
 
-Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (redeploy + stats persistence),
-optional DERIV_APP_ID, DERIV_ACCOUNT_MODE ("demo" default / "real" picks which
-account the token's OTP is minted for), DASHBOARD_PIN, PREDICTOR_SYMBOLS, ...
-(see CHANGES.md).
+    start(client)   once at boot: load saved P/floor, read the live balance, apply the midnight reset
+    on_balance(b)   every live balance update from Deriv (sync, runs inside the event loop)
+    next_stake()    stake for the next buy, or None = stopped (floor reached) / not ready
+    reserve(stake)  hard rule: only True if balance - pending - stake >= floor; holds the stake
+    note_buy(buy)   feed the buy response so the cached balance drops immediately
+    release(stake)  drop the hold taken by reserve()
+    snapshot()      dict for the dashboard (keep_alive "money")
 
-Follower accounts (optional): DATABASE_URL, ADMIN_PASSWORD, ENCRYPTION_KEY - see render.yaml.
+Reset = midnight Kenya time (21:00 UTC). Floor is sticky until the next reset.
+State survives redeploys via the Render env var MAIN_MONEY_STATE (needs RENDER_API_KEY +
+RENDER_SERVICE_ID, same as predictor_stats) and a local file as a same-container fallback.
+Env: MAIN_LOCK_THRESHOLD (default 5.0) - balance at/above which the floor is armed.
 """
 import asyncio
+import json
 import logging
 import os
-import sys
-import threading
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
+from typing import Optional
 
-import config
+import money_rules as mr
 
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
-)
-logger = logging.getLogger("main")
+logger = logging.getLogger(__name__)
 
-if not config.DERIV_API_TOKEN:
-    logger.critical("DERIV_API_TOKEN is not set! Add it in the Render service environment.")
+ENV_KEY = "MAIN_MONEY_STATE"
+STATE_FILE = os.environ.get("MAIN_MONEY_STATE_FILE", "/tmp/main_money_state.json")
+PERSIST_MIN_INTERVAL = 300.0     # seconds between Render env writes (each write can trigger a deploy)
 
 
-def _run_bot():
-    """Run the engine; if it ever exits or crashes, start it again (never sit idle)."""
-    import target_guard
-    if config.MH_MODE:
-        from mh_engine import MHEngine as Engine
-        from set_engine import account_allowed
-        allowed, why = account_allowed()
-        if not allowed:
-            logger.critical("MH MODE REFUSED TO START: %s", why)
-            return                                   # demo-only guard, same as set mode
-    elif config.SET_MODE:
-        from set_engine import SetEngine as Engine, account_allowed
-        allowed, why = account_allowed()
-        if not allowed:
-            logger.critical("SET MODE REFUSED TO START: %s", why)
-            return                                   # no restart loop: this needs a config change
-    else:
-        from bot_engine import BotEngine as Engine
-    import window_scheduler as ws
-    import keep_alive
-    while True:
-        now = time.time()
-        if not ws.should_be_connected(now):              # outside the window: NOT connected to Deriv
-            wait = ws.seconds_until_open(now)
-            keep_alive.update_status(session=f"IDLE - disconnected, next window in {int(wait // 60)} min")
-            time.sleep(min(15.0, max(1.0, wait - ws._preconnect())))
-            continue
-        eng = Engine()
-        try:
-            asyncio.run(eng.run())
-        except Exception as exc:
-            logger.error(f"Bot crashed: {exc}", exc_info=True)
-        if target_guard.is_reached():
-            logger.warning("Balance target reached - bot stays stopped (no restart)")
-            return
-        if getattr(eng, "_session_over", False):
-            # the window ran and closed: redeploy with a cleared build cache BEFORE the next connect
-            keep_alive.update_status(session="IDLE - redeploying (build cache cleared)")
-            if ws.redeploy_clear_cache():
-                time.sleep(900)                          # Render replaces this instance; just wait
-            else:
-                time.sleep(60)                           # no redeploy possible: reconnect at next window anyway
-            continue
-        logger.warning("Bot engine returned inside the window; restarting in 5 s")
-        time.sleep(5)
-
-
-if __name__ == "__main__":
-    from keep_alive import app, start_keep_alive
-
-    logger.info("Starting digit predictor bot … (%s)",
-                "MH MODE: multi-horizon digit model, h<=%d, all 18 Over/Under covers, admitted on calibrated edge" % config.MH_HMAX_TRADE
-                if config.MH_MODE else "SET MODE: top-%d digit set -> covering Over/Under, all symbols in parallel" % config.SET_SIZE
-                if config.SET_MODE else "original single-contract mode")
-    logger.info(f"  Deriv App ID : {config.DERIV_APP_ID}")
-    logger.info(f"  API token    : {'SET ✓' if config.DERIV_API_TOKEN else 'MISSING ✗'}")
-    logger.info(f"  Symbols      : {config.PREDICTOR_SYMBOLS}  "
-                f"min stake (PREDICTOR_STAKE)={config.PREDICTOR_STAKE}")
-    logger.info(f"  Account mode : {config.DERIV_ACCOUNT_MODE}")
-    if config.TEST_MODE:
-        import exp_mode
-        logger.warning("  TEST MODE ON : frozen config hash %s | demo only | flat stake %s | followers OFF", exp_mode.config_hash(), config.TEST_STAKE)
-    logger.info("  Trade window : %s" % (f"minutes {config.TRADE_WINDOW_START_MINUTE}-{config.TRADE_WINDOW_END_MINUTE} of every hour (UTC), strict"
-                                         if config.TRADE_WINDOW_ENABLED else "OFF (SESSION_WINDOW_ENABLED=0) - trading all hours, no hourly redeploy"))
-    if not (os.environ.get("PREDICTOR_STAKE") or "").strip():
-        logger.warning("PREDICTOR_STAKE is not set on Render - using the default minimum stake %s", config.PREDICTOR_STAKE)
-    if config.REDEPLOY_INTERVAL_SECONDS > 0:
-        logger.info(f"  Redeploy     : AUTO_REDEPLOY ON - every {config.REDEPLOY_INTERVAL_SECONDS:.0f}s "
-                    f"({config.REDEPLOY_INTERVAL_SECONDS / 60:.1f} min); hourly trade window forced OFF")
-    else:
-        logger.info("  Redeploy     : OFF (set AUTO_REDEPLOY=1 on Render to enable)")
-    import target_guard as _tg
-    logger.info(f"  Balance target: {_tg.target() if _tg.target() else 'OFF (TARGET_BALANCE not set)'}")
-    logger.info(f"  Port         : {config.PORT}")
-
-    start_keep_alive()
-    if config.REDEPLOY_INTERVAL_SECONDS > 0:
-        import restart_scheduler
-        restart_scheduler.start_restart_scheduler()      # rolling timer + watchdog (own thread)
-
-    # Follower accounts: own thread + own event loop + Flask Blueprint. Fully optional:
-    # any failure here is logged and the main account below starts regardless.
+def _lock_threshold() -> float:
     try:
-        if config.TEST_MODE:
-            raise RuntimeError("TEST_MODE: follower mirroring is OFF")
-        import follower_manager
-        import follower_web
-        follower_web.register(app)
-        follower_manager.start()
+        return float((os.environ.get("MAIN_LOCK_THRESHOLD") or "").strip() or 5.0)
+    except ValueError:
+        return 5.0
 
-        def _on_sigterm(signum, frame):
-            logger.warning("SIGTERM - flushing follower DB buffers")
-            follower_manager.shutdown_blocking(8.0)
-            raise SystemExit(0)
-        import signal
-        signal.signal(signal.SIGTERM, _on_sigterm)
-    except Exception as exc:
-        logger.error(f"Follower system not started: {exc}", exc_info=not config.TEST_MODE)
-    threading.Thread(target=_run_bot, name="bot-engine", daemon=True).start()
-    logger.info("Bot engine thread started ✓")
-    app.run(host="0.0.0.0", port=config.PORT, use_reloader=False, threaded=True)
+
+def _fmt(x: Optional[float]) -> str:
+    return "-" if x is None else f"{x:.2f}"
+
+
+class MainMoney:
+    def __init__(self):
+        self.state = mr.FState()
+        self.lock_threshold = _lock_threshold()
+        self.balance: Optional[float] = None
+        self.ready = False
+        self._pending = 0.0           # stakes reserved but not yet reflected in the balance
+        self._credit = 0.0            # part of the holds already reflected via note_buy()
+        self._last_persist = 0.0
+        self._persisted_key = None
+        self._persist_task: Optional[asyncio.Task] = None
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
+    async def start(self, client) -> None:
+        self._load()
+        try:
+            bal = await client.fetch_balance_live()
+        except Exception as exc:
+            logger.warning("MAIN MONEY: live balance fetch failed (%s) - using cached value", exc)
+            bal = float(getattr(client, "balance", 0.0) or 0.0)
+        if bal <= 0:
+            raise RuntimeError(f"no usable balance ({bal})")
+        self.balance = bal
+        self._reset_or_update(bal, boot=True)
+        self.ready = True
+        logger.info("MAIN MONEY ready: balance=%.2f P=%s tier=%s floor=%s lock>=%.2f min stake=%.2f",
+                    bal, _fmt(self.state.p), self.state.tier, _fmt(self.state.floor),
+                    self.lock_threshold, mr.MIN_STAKE)
+
+    def _reset_or_update(self, bal: float, boot: bool = False) -> None:
+        today = mr.kenya_day_ts(time.time())
+        if mr.needs_reset(self.state, today):
+            self.state = mr.apply_reset(self.state, bal, self.lock_threshold, today)
+            logger.info("MAIN MONEY reset (Kenya midnight%s): P=%.2f tier=%s floor=%s",
+                        ", boot" if boot else "", bal, self.state.tier, _fmt(self.state.floor))
+            self._persist(force=True)
+            return
+        new = mr.update_on_balance(self.state, bal, self.lock_threshold)
+        if new != self.state:
+            if new.floor != self.state.floor:
+                logger.info("MAIN MONEY floor %s -> %s (peak %s)", _fmt(self.state.floor),
+                            _fmt(new.floor), _fmt(new.peak))
+            self.state = new
+            self._persist()
+
+    # ── balance feed ─────────────────────────────────────────────────────────
+    def on_balance(self, bal: float) -> None:
+        try:
+            bal = float(bal)
+        except (TypeError, ValueError):
+            return
+        self.balance = bal
+        if not self.ready:
+            return
+        self._reset_or_update(bal)
+        ms = mr.milestone(self.state)
+        if ms and not self.state.milestone_hit and bal >= ms:
+            self.state = replace(self.state, milestone_hit=True)
+            logger.info("MAIN MONEY milestone %.2f reached (balance %.2f) - trading continues", ms, bal)
+            self._persist()
+
+    # ── stake / buy rule ─────────────────────────────────────────────────────
+    def _eff(self) -> Optional[float]:
+        if not self.ready or self.balance is None:
+            return None
+        return mr.effective_balance(self.balance, self._pending)
+
+    def next_stake(self) -> Optional[float]:
+        eff = self._eff()
+        if eff is None:
+            return None
+        return mr.stake_for(self.state, eff)
+
+    def reserve(self, stake: float) -> bool:
+        eff = self._eff()
+        if eff is None or not mr.can_buy(self.state, eff, stake):
+            return False
+        self._pending += stake
+        return True
+
+    def note_buy(self, buy: dict) -> None:
+        """Deriv deducts the buy price at once; use balance_after so the next reserve() is exact."""
+        try:
+            price = float((buy or {}).get("buy_price") or 0.0)
+            after = (buy or {}).get("balance_after")
+            if after is not None:
+                self.on_balance(float(after))
+            elif self.balance is not None and price:
+                self.on_balance(self.balance - price)
+            moved = min(self._pending, price)     # that money is now out of the balance itself
+            self._pending -= moved
+            self._credit += moved
+        except Exception as exc:
+            logger.debug("MAIN MONEY note_buy ignored: %s", exc)
+
+    def release(self, stake: float) -> None:
+        if self._credit >= stake - mr.EPS:
+            self._credit -= stake
+        else:
+            self._pending -= stake
+        self._pending = max(self._pending, 0.0)
+        self._credit = max(self._credit, 0.0)
+
+    # ── dashboard ────────────────────────────────────────────────────────────
+    def snapshot(self) -> dict:
+        s, bal = self.state, self.balance
+        stopped = bool(self.ready and bal is not None and mr.is_stopped(s, mr.effective_balance(bal, self._pending)))
+        return {"ready": self.ready, "tier": s.tier, "p": s.p, "peak": s.peak, "floor": s.floor,
+                "balance": bal, "tradable": None if bal is None else round(mr.tradable(s, bal), 2),
+                "next_stake": self.next_stake(), "stopped": stopped, "milestone": mr.milestone(s),
+                "milestone_hit": s.milestone_hit, "last_reset_date": s.last_reset_date,
+                "lock_threshold": self.lock_threshold}
+
+    # ── persistence ──────────────────────────────────────────────────────────
+    def _payload(self) -> dict:
+        s = self.state
+        return {"p": s.p, "peak": s.peak, "floor": s.floor,
+                "last_reset_date": s.last_reset_date, "milestone_hit": s.milestone_hit}
+
+    def _load(self) -> None:
+        raw = (os.environ.get(ENV_KEY) or "").strip()
+        if not raw and os.path.exists(STATE_FILE):
+            try:
+                raw = open(STATE_FILE).read()
+            except OSError:
+                raw = ""
+        if not raw:
+            return
+        try:
+            d = json.loads(raw)
+            self.state = mr.FState(p=d.get("p"), peak=d.get("peak"), floor=d.get("floor"),
+                                   last_reset_date=d.get("last_reset_date"),
+                                   milestone_hit=bool(d.get("milestone_hit")))
+            logger.info("MAIN MONEY loaded saved state: P=%s floor=%s day=%s",
+                        _fmt(self.state.p), _fmt(self.state.floor), self.state.last_reset_date)
+        except Exception as exc:
+            logger.warning("MAIN MONEY saved state unreadable (%s) - starting fresh", exc)
+
+    def _persist(self, force: bool = False) -> None:
+        """Local file every time; Render env var only on floor/day changes, throttled
+        (an env-var write can trigger a Render deploy)."""
+        payload = self._payload()
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump(payload, f)
+        except OSError:
+            pass
+        key = (payload["floor"], payload["last_reset_date"])
+        now = time.monotonic()
+        if key == self._persisted_key:
+            return
+        if not force and now - self._last_persist < PERSIST_MIN_INTERVAL:
+            return
+        self._persisted_key, self._last_persist = key, now
+        try:
+            import env_persist
+            if not env_persist.configured():
+                os.environ[ENV_KEY] = json.dumps(payload)
+                return
+            if self._persist_task is None or self._persist_task.done():
+                self._persist_task = asyncio.ensure_future(
+                    env_persist.put_env_vars_async({ENV_KEY: json.dumps(payload)}))
+        except Exception as exc:
+            logger.warning("MAIN MONEY persist error: %s", str(exc)[:80])
