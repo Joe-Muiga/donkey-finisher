@@ -25,7 +25,6 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 import db
 import follower_config as fc
-import money_rules as mr
 import token_crypto
 import verdict as vd
 
@@ -213,8 +212,6 @@ def logout():
 
 # ── followers ────────────────────────────────────────────────────────────────
 def _follower_card(f: dict, csrf: str) -> str:
-    st = mr.FState(p=f.get("p_base"), peak=f.get("peak"), floor=f.get("floor_amt"))
-    ms = mr.milestone(st)
     last4 = f.get("token_last4") or ""
     return render_template_string("""
 <div class="card"><form method="post" action="/followers/save">
@@ -225,16 +222,14 @@ def _follower_card(f: dict, csrf: str) -> str:
 <input type="password" name="token" placeholder="leave blank to keep the saved token" autocomplete="off">
 <label>App ID</label><input type="text" name="app_id" value="{{ f.app_id }}" maxlength="32">
 <div class="row"><label style="margin:0"><input type="checkbox" name="enabled" value="1" {{ 'checked' if f.enabled }}> Enabled</label></div>
-<div class="kv"><b>Balance</b><span>{{ bal }}</span><b>P (last reset)</b><span>{{ p }}</span>
-<b>Floor</b><span>{{ floor }}</span><b>Peak</b><span>{{ peak }}</span><b>Tier</b><span>{{ tier }}</span>
-<b>Milestone</b><span>{{ ms }}</span><b>Last window</b><span>{{ last }}</span></div>
+<div class="kv"><b>Balance</b><span>{{ bal }}</span><b>Flat stake</b><span>{{ stake }}</span>
+<b>Last window</b><span>{{ last }}</span></div>
 <div class="row"><button class="p" type="submit">Save</button></div></form>
 <form method="post" action="/followers/delete" onsubmit="return confirm('Delete this follower?')">
 <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ f.id }}">
 <div class="row"><button class="d" type="submit">Delete</button></div></form></div>""",
                                   f=f, csrf=csrf, last4=last4, bal=_n(f.get("last_balance")),
-                                  p=_n(f.get("p_base")), floor=_n(f.get("floor_amt")) if f.get("floor_amt") is not None else "none (growth)",
-                                  peak=_n(f.get("peak")), tier=f.get("tier") or "-", ms=_n(ms),
+                                  stake=_n(fc.STAKE),
                                   last=f.get("last_window_result") or "-")
 
 
