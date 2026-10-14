@@ -1752,24 +1752,23 @@ STATS_PERSIST_TO_RENDER       = os.environ.get(
 # ════════════════════════════════════════════════════════════════════════════════════════════
 #  AUTO REDEPLOY  -  EASY-EDIT SECTION (keep this block at the very bottom of the file)
 # ════════════════════════════════════════════════════════════════════════════════════════════
-#  Render env var  AUTO_REDEPLOY   1 / true / on  = bot redeploys itself every
-#                                                   AUTO_REDEPLOY_SECONDS (below)
-#                                  0 / unset      = OFF (bot runs continuously, no redeploy)
-#  Flip it in Render > Environment; no code change needed. Needs RENDER_API_KEY set on Render.
+#  ALWAYS ON: the bot redeploys itself every AUTO_REDEPLOY_SECONDS (below), forever, in a never-ending
+#  cycle (the AUTO_REDEPLOY env var is no longer consulted). The only off switch is the Render env var
+#  REDEPLOY_INTERVAL_SECONDS=0. Needs RENDER_API_KEY set on Render.
 #
 #  A redeploy wipes the instance's local data - that is expected.
 #  While ON, the hourly trade window (minutes 29-36) is switched OFF, because the window scheduler
 #  runs its own redeploy cycle and the two would fight each other. Each cycle the bot stops opening
 #  trades, drains open contracts (max REDEPLOY_DRAIN_MAX_SECONDS), then fires the Render redeploy.
 #
-#  >>> CHANGE THE INTERVAL HERE (seconds). 780 = 13 minutes. <<<
-AUTO_REDEPLOY_SECONDS = 780
+#  >>> CHANGE THE INTERVAL HERE (seconds). 420 = 7 minutes. <<<
+AUTO_REDEPLOY_SECONDS = 420
 # ────────────────────────────────────────────────────────────────────────────────────────────
-AUTO_REDEPLOY_ENABLED = os.environ.get("AUTO_REDEPLOY", "0").strip().lower() in ("1", "true", "yes", "on")
+AUTO_REDEPLOY_ENABLED = True
 
 # Everything below applies the switch - no need to edit.
 REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
-# (MH mode no longer ignores AUTO_REDEPLOY: AUTO_REDEPLOY=1 turns the 13-minute cycle on, 0/unset leaves it off.)
+# (The 7-minute cycle is always on; REDEPLOY_INTERVAL_SECONDS=0 in the Render env is the only way to stop it.)
 _ri_env = (os.environ.get("REDEPLOY_INTERVAL_SECONDS") or "").strip()
 if _ri_env:                               # an explicit env value always wins (0 = off)
     try:
@@ -1790,8 +1789,8 @@ if AUTO_REDEPLOY_ENABLED and "REDEPLOY_DRAIN" not in os.environ:
 # Deploys are ALWAYS requested with clearCache="do_not_clear" (latest commit); nothing in this path clears the cache.
 REDEPLOY_BUY_BLOCK_SECONDS     = _env_f("REDEPLOY_BUY_BLOCK_SECONDS", 20)      # no new buys in the last N s before a redeploy
 REDEPLOY_HEALTH_TIMEOUT_SECONDS = _env_f("REDEPLOY_HEALTH_TIMEOUT_SECONDS", 180)  # new deploy must be live within this
-REDEPLOY_BACKOFF_BASE_SECONDS  = _env_f("REDEPLOY_BACKOFF_BASE_SECONDS", 300)  # after a failed deploy: base * 2^(fails-1)
-REDEPLOY_BACKOFF_MAX_SECONDS   = _env_f("REDEPLOY_BACKOFF_MAX_SECONDS", 7200)
+REDEPLOY_BACKOFF_BASE_SECONDS  = _env_f("REDEPLOY_BACKOFF_BASE_SECONDS", 60)   # after a failed deploy: base * 2^(fails-1)
+REDEPLOY_BACKOFF_MAX_SECONDS   = _env_f("REDEPLOY_BACKOFF_MAX_SECONDS", 1800)
 REDEPLOY_MIN_UPTIME_SECONDS    = _env_f("REDEPLOY_MIN_UPTIME_SECONDS", 120)    # never redeploy an instance younger than this
 
 # ─── TEST MODE: pre-registered, frozen experiment (exp_mode.py) ──────────────────────────────────
