@@ -5,10 +5,11 @@ mh_engine.py - MH MODE engine (subclass of SetEngine; flat stake, client, watchd
     symbols initialised concurrently, each worker starts as soon as ITS init is done.
   * Signal: every tick, horizons 1..MH_HMAX_TRADE, all 18 Over/Under covers from the calibrated blended
     distribution; admitted when p_lb * payout/stake - 1 > MH_MIN_EDGE (lag-mixed P_eff, deadline gate).
-  * Execution: every symbol is scanned in its OWN task (parallel, one symbol never waits for another);
-    candidates are interleaved fairly across symbols; per symbol at most MH_SYMBOL_MAX_PER_SEC (2) buys in any
-    rolling second; a symbol that has not bought for MH_SYMBOL_FORCE_SECONDS (30) buys its best quoted cover
-    (payout floor still applies) on its next signal. Direct buys run in parallel (API semaphore only).
+  * Execution (MH_MINUTE_RANK=1, default): every symbol is scanned in parallel (own task per symbol) and ranked
+    TWICE inside each UTC minute: (1) the best contract (cover/horizon) of each symbol, (2) those per-symbol
+    bests ranked against each other; only the overall top MH_MINUTE_TOP_N (default 1) is bought in that minute.
+    The ranking lives for that minute only; the next minute starts from scratch. MH_MINUTE_RANK=0 = old
+    behaviour (every admitted candidate is bought). Direct buys run in parallel (API semaphore only).
   * Everything new is in memory and rebuilt at boot; the 10-minute redeploy refits the models.
 """
 import asyncio
@@ -50,7 +51,7 @@ class MHSignal:
 
 
 class Cand:
-    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score", "cl", "arm", "extra", "forced")
+    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score", "cl", "arm", "extra")
 
     def __init__(self, sig, h, ci, p, lb, r, edge):
         self.sig, self.h, self.ci, self.p, self.lb, self.r, self.edge = sig, h, ci, p, lb, r, edge
@@ -58,7 +59,6 @@ class Cand:
         self.cl = None                                   # cluster mode: (cluster, mass, width)
         self.arm = None                                  # test mode: "test" | "ctl"
         self.extra = None                                # extra fields stored with the open contract
-        self.forced = False                              # bought only to keep the symbol active (30 s rule)
 
 
 def p_eff_mix(ph, pn, q: float):
@@ -72,6 +72,20 @@ def p_eff_mix(ph, pn, q: float):
 def top_cluster(p, size: int) -> Tuple[int, ...]:
     """The `size` most probable digits (ties -> lower digit), sorted ascending."""
     return tuple(sorted(sorted(range(10), key=lambda d: (-float(p[d]), d))[:size]))
+
+
+def _num(name: str, default: float) -> float:
+    """Env var first (Render), then config.py, then the default."""
+    try:
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip() != "":
+            return float(raw)
+    except ValueError:
+        pass
+    try:
+        return float(_cfg(name, default))
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def cover_width(cand) -> int:
@@ -124,10 +138,13 @@ class MHEngine(SetEngine):
         self._rtt_ready = False
         self._ratio_cache: Dict[tuple, Tuple[float, float]] = {}
         self._tcount: Dict[tuple, int] = {}
-        self.sym_max_per_sec = int(_cfg("MH_SYMBOL_MAX_PER_SEC", 2))          # 0 = no per-symbol rate cap
-        self.sym_force_every = float(_cfg("MH_SYMBOL_FORCE_SECONDS", 30))     # 0 = never force a buy
-        self._sym_buys: Dict[str, collections.deque] = {}                    # sym -> pick timestamps (rolling 1 s)
-        self._last_buy_ts: Dict[str, float] = {}                             # sym -> last successful buy
+        # minute ranking: per-symbol best contract, then best overall, once per UTC minute
+        self.minute_rank = bool(int(_num("MH_MINUTE_RANK", 1)))
+        self.minute_top_n = max(1, int(_num("MH_MINUTE_TOP_N", 1)))          # contracts bought per minute
+        self.rank_delay = max(0.0, _num("MH_RANK_DELAY_SECONDS", 1.0))       # wait after the minute starts so symbols can report
+        self._rnd_minute = -1
+        self._rnd_best: Dict[str, "Cand"] = {}                               # level 1: best contract per symbol (this minute)
+        self._rnd_n = 0                                                      # contracts picked in this minute
         self._brk: Dict[str, collections.deque] = {}
         self._muted: set = set()
         self._hs_n = collections.Counter()
@@ -615,54 +632,21 @@ class MHEngine(SetEngine):
                         best = Cand(sig, h, ci, p, lb, r, edge)
                 if best is not None:
                     cands.append(best)
-        if self.sym_force_every > 0:                        # a symbol silent for 30 s buys its best quoted cover
-            now = time.time()
-            have = {c.sig.sym for c in cands}
-            for sig in sigs:
-                sym = sig.sym
-                if sym in have or now - self._last_buy_ts.setdefault(sym, now) < self.sym_force_every:
-                    continue
-                for h in sorted(sig.cands):
-                    hit = None
-                    for ci, p, lb, mass in sig.cands[h]:
-                        r = self._ratio_get(sym, ci, h)
-                        if r is not None and r >= self.min_ratio:
-                            hit = (ci, p, lb, mass, r)
-                            break
-                    if hit is None:
-                        continue
-                    ci, p, lb, mass, r = hit
-                    c = Cand(sig, h, ci, p, lb, r, lb * r - 1.0)
-                    c.forced = True
-                    if self.cluster:
-                        c.score = mass
-                        c.cl = (sig.info.get(h, ((), mass))[0], mass, cover_width(mp.COVERS[ci]))
-                    cands.append(c)
-                    break
         for sym in {s.sym for s in sigs}:                   # forget old target counters
             cut = self._idx.get(sym, 0) - 30
             for k in [k for k in self._tcount if k[0] == sym and k[1] < cut]:
                 self._tcount.pop(k, None)
+        if self.minute_rank:
+            self._rank_minute(sigs, cands)
+            return
         if not cands:
             self._last_decision = f"scan {self._scans}: {len(sigs)} signal(s), none admitted"
             return
         cands.sort(key=(lambda c: (-c.score, -c.p)) if self.cluster else (lambda c: -c.score))
-        seen_n: collections.Counter = collections.Counter()  # fair order: every symbol's best first, then 2nd best...
-        ranked = []
-        for c in cands:
-            ranked.append((seen_n[c.sig.sym], not c.forced, len(ranked), c))
-            seen_n[c.sig.sym] += 1
-        cands = [t[3] for t in sorted(ranked, key=lambda t: t[:3])]
         picks: List[Tuple[Cand, float]] = []
         for c in cands:
             if self._late(c.sig) or self._blocked():
                 continue
-            dq = self._sym_buys.setdefault(c.sig.sym, collections.deque())
-            now = time.time()
-            while dq and now - dq[0] >= 1.0:
-                dq.popleft()
-            if self.sym_max_per_sec > 0 and len(dq) >= self.sym_max_per_sec:
-                continue                                    # this symbol already fired its quota in the last second
             if self.max_open and len(self._open) + self._inflight + len(picks) >= self.max_open:
                 break
             if self.max_per_scan and len(picks) >= self.max_per_scan:
@@ -678,8 +662,72 @@ class MHEngine(SetEngine):
                 self._last_decision = "skip: balance cannot pay the stake"
                 break
             self._tcount[tk] = self._tcount.get(tk, 0) + 1
-            dq.append(now)
             picks.append((c, stake))
+        for c, stake in picks:
+            self._inflight += 1
+            t = asyncio.create_task(self._buy_one(c, stake))
+            self._tasks.add(t)
+            t.add_done_callback(self._tasks.discard)
+
+    @staticmethod
+    def _cand_key(c: "Cand"):
+        return (-c.score, -c.p)
+
+    def _rank_minute(self, sigs: List[MHSignal], cands: List[Cand]) -> None:
+        """Two-level ranking, fresh every UTC minute.
+        Level 1: each symbol keeps its single best contract (over/under, any horizon) from its newest signal.
+        Level 2: those per-symbol bests are ranked against each other; the top MH_MINUTE_TOP_N is bought, once per minute."""
+        now = time.time()
+        minute = int(now // 60)
+        if minute != self._rnd_minute:                      # new minute: old ranking is discarded
+            self._rnd_minute, self._rnd_best, self._rnd_n = minute, {}, 0
+        by_sym: Dict[str, Cand] = {}
+        for c in cands:                                     # level 1
+            b = by_sym.get(c.sig.sym)
+            if b is None or self._cand_key(c) < self._cand_key(b):
+                by_sym[c.sig.sym] = c
+        for sym in {sg.sym for sg in sigs}:                 # a newer signal supersedes the symbol's older candidate
+            if sym in by_sym:
+                self._rnd_best[sym] = by_sym[sym]
+            else:
+                self._rnd_best.pop(sym, None)
+        if self._rnd_n >= self.minute_top_n:
+            return
+        if now < minute * 60 + self.rank_delay:
+            self._last_decision = f"minute {minute % 1440 // 60:02d}:{minute % 60:02d}: collecting ({len(self._rnd_best)} symbols ranked)"
+            return
+        pool = [c for c in self._rnd_best.values()          # only live candidates: no newer tick, not late, not muted
+                if self._idx.get(c.sig.sym) == c.sig.idx and c.sig.sym not in self._muted
+                and c.sig.sym not in self._hold and not self._late(c.sig)]
+        if not pool:
+            return
+        pool.sort(key=self._cand_key)                       # level 2
+        picks: List[Tuple[Cand, float]] = []
+        for c in pool:
+            if self._rnd_n + len(picks) >= self.minute_top_n or self._blocked():
+                break
+            if self.max_open and len(self._open) + self._inflight + len(picks) >= self.max_open:
+                break
+            tk = (c.sig.sym, c.sig.idx + c.h)
+            if self._tcount.get(tk, 0) >= self.max_per_target:
+                continue
+            stake = self._next_stake()
+            if stake is None:
+                self._last_decision = "skip: no stake available"
+                break
+            if not self.money.reserve(stake):
+                self._last_decision = "skip: balance cannot pay the stake"
+                break
+            self._tcount[tk] = self._tcount.get(tk, 0) + 1
+            picks.append((c, stake))
+        if not picks:
+            return
+        self._rnd_n += len(picks)
+        runner = [f"{x.sig.sym} {mp.COVERS[x.ci][0]}{mp.COVERS[x.ci][1]}" for x in pool[len(picks):len(picks) + 2]]
+        logger.info("MINUTE RANK %02d:%02d UTC: %d symbols ranked -> BUY %s (runners-up: %s)",
+                    minute % 1440 // 60, minute % 60, len(pool),
+                    ", ".join(f"{c.sig.sym} {mp.COVERS[c.ci][0]}{mp.COVERS[c.ci][1]} h={c.h} score={c.score:.3f} p={c.p:.3f}"
+                              for c, _ in picks), ", ".join(runner) or "-")
         for c, stake in picks:
             self._inflight += 1
             t = asyncio.create_task(self._buy_one(c, stake))
@@ -723,7 +771,6 @@ class MHEngine(SetEngine):
             payout = float(buy.get("payout") or 0.0)
             ratio = payout / price_paid if payout > 0 and price_paid > 0 else c.r
             ok = True
-            self._last_buy_ts[sym] = time.time()
             self._open[cid] = {"sym": sym, "cand": cand, "stake": price_paid, "ratio": ratio,
                                "opened_at": float(buy.get("purchase_time") or time.time()),
                                "decision_epoch": sig.epoch, "t0": time.time(), "h": h, "sig_idx": sig.idx,
@@ -764,6 +811,8 @@ class MHEngine(SetEngine):
                 self._test_pending = max(0.0, self._test_pending - stake)
             if not ok:
                 self._tcount[tk] = max(0, self._tcount.get(tk, 1) - 1)
+                if self.minute_rank and c.arm is None and int(time.time() // 60) == self._rnd_minute:
+                    self._rnd_n = max(0, self._rnd_n - 1)      # the minute's pick failed: another candidate may be tried
 
     # ── TEST MODE: frozen zone rule, shadow scoring, control arm ─────────────
     def _test_step(self, sym: str, mhs: mp.MHSymbol) -> None:
