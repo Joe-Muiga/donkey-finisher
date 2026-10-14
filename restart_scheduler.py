@@ -48,6 +48,8 @@ _last_scheduled_at: float = 0.0
 _process_start_time: float = time.time()
 _last_watchdog_warning_at: float = 0.0
 _hook_missing_warned_at: float = 0.0
+_failed_flag: bool = False              # last deploy REQUEST failed (engine then resumes trading)
+_due_at: float = 0.0                     # when the pending flag will be raised (0 = not scheduled / cycle skipped)
 
 # Task 7 fix — soft/optional dashboard visibility. restart_scheduler.py
 # doesn't otherwise depend on keep_alive.py; imported lazily and guarded
@@ -68,6 +70,31 @@ def is_enabled() -> bool:
         return False
 
 
+def buys_blocked() -> bool:
+    """True while a redeploy is pending OR due within REDEPLOY_BUY_BLOCK_SECONDS: no new buys, so contracts
+    do not straddle the redeploy."""
+    if _pending:
+        return True
+    if not is_enabled() or not _due_at:
+        return False
+    return time.time() >= _due_at - float(getattr(config, "REDEPLOY_BUY_BLOCK_SECONDS", 20))
+
+
+def consume_failure() -> bool:
+    """True once after a deploy request failed, so the engine can lift its post-redeploy halt."""
+    global _failed_flag
+    f, _failed_flag = _failed_flag, False
+    return f
+
+
+def skip_cycle(reason: str) -> None:
+    """Drop a pending redeploy (guard refused): trading resumes, the next interval starts now."""
+    global _pending, _due_at
+    logger.error("REDEPLOY CYCLE SKIPPED: %s", reason)
+    _pending = False
+    _due_at = 0.0
+
+
 def is_redeploy_pending() -> bool:
     """True once the rolling REDEPLOY_INTERVAL_SECONDS timer has fired and a
     redeploy is due but hasn't been confirmed-triggered yet."""
@@ -85,7 +112,7 @@ async def run_scheduler():
     calling trigger_redeploy() once that's done (which starts the next
     interval).
     """
-    global _pending, _last_scheduled_at
+    global _pending, _last_scheduled_at, _due_at
 
     if not is_enabled():
         logger.info("REDEPLOY SCHEDULER: disabled (REDEPLOY_INTERVAL_SECONDS<=0) - bot runs continuously")
@@ -95,15 +122,27 @@ async def run_scheduler():
         try:
             interval_secs = float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 600))
             _last_scheduled_at = time.time()
+            _due_at = _last_scheduled_at + interval_secs
 
-            next_fire = datetime.fromtimestamp(
-                _last_scheduled_at + interval_secs, tz=timezone.utc
-            )
+            next_fire = datetime.fromtimestamp(_due_at, tz=timezone.utc)
             logger.info(
                 f"REDEPLOY SCHEDULER: next redeploy at {next_fire.isoformat()} "
                 f"({interval_secs:.0f}s from now, rolling)"
             )
-            await asyncio.sleep(interval_secs)
+            # Pre-flight BEFORE buys are blocked: a refused cycle must not cost any trading time.
+            block = float(getattr(config, "REDEPLOY_BUY_BLOCK_SECONDS", 20))
+            lead = block + 10.0
+            await asyncio.sleep(max(0.0, interval_secs - lead))
+            import redeploy_guard
+            ok, why = await asyncio.to_thread(redeploy_guard.preflight)
+            if not ok:
+                _due_at = 0.0
+                wait = redeploy_guard.note_skip(why)
+                _push_dashboard_flag(redeploy_skipped_reason=why)
+                await asyncio.sleep(max(wait, 1.0))
+                continue
+            redeploy_guard.note_ok()
+            await asyncio.sleep(max(0.0, _due_at - time.time()))
 
             _pending = True
             logger.warning(
@@ -167,69 +206,40 @@ def trigger_redeploy() -> None:
     successful hook fire. `_last_triggered_at` (this function having run
     at all, success or not) is kept separately for existing behavior/logs.
     """
-    global _pending, _last_triggered_at, _hook_missing_warned_at
+    global _pending, _last_triggered_at, _hook_missing_warned_at, _last_confirmed_redeploy_at, _due_at
 
     import render_api
+    import redeploy_guard
     _target = render_api.deploy_target()
     hook_url, _hdrs = _target if _target else ("", {})
     _last_triggered_at = time.time()
 
-    if not hook_url:
-        _hook_missing_warned_at = time.time()
-        logger.critical(
-            "\n" + "=" * 78 + "\n"
-            "REDEPLOY HOOK NOT CONFIGURED\n"
-            "Neither RENDER_API_KEY nor RENDER_DEPLOY_HOOK_URL is set. trigger_redeploy() is clearing "
-            "the pending flag and starting a brand-new "
-            f"{getattr(config, 'REDEPLOY_INTERVAL_SECONDS', 600)}s window WITHOUT an "
-            "actual redeploy happening. The rolling-restart mechanism is "
-            "effectively disabled until RENDER_DEPLOY_HOOK_URL is configured in "
-            "the deployment environment.\n" + "=" * 78
-        )
-        _push_dashboard_flag(redeploy_hook_missing=True)
-        _pending = False
-        return
-
     async def _fire():
         global _last_confirmed_redeploy_at
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(hook_url, headers=_hdrs, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                    body = await resp.text()
-                    if resp.status in (200, 201, 202):
-                        logger.info(f"REDEPLOY HOOK FIRED: HTTP {resp.status}")
-                        _last_confirmed_redeploy_at = time.time()
-                        _push_dashboard_flag(
-                            redeploy_hook_missing=False,
-                            redeploy_watchdog_overdue=False,
-                        )
-                    else:
-                        logger.error(
-                            f"REDEPLOY HOOK FAILED: HTTP {resp.status} — {body[:500]}"
-                        )
-        except Exception as exc:
-            logger.error(f"REDEPLOY HOOK ERROR: {exc}")
+        import asyncio as _a
+        ok, info = await _a.to_thread(redeploy_guard.deploy_request)
+        if ok:
+            logger.info(f"REDEPLOY REQUESTED (clearCache=do_not_clear, latest commit) {info}")
+            _last_confirmed_redeploy_at = time.time()
+            _push_dashboard_flag(redeploy_hook_missing=False, redeploy_watchdog_overdue=False)
+        else:
+            logger.error(f"REDEPLOY REQUEST FAILED: {info}")
+            global _failed_flag
+            _failed_flag = True
+            redeploy_guard.note_skip(f"deploy request failed: {info}")
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.create_task(_fire())
     except RuntimeError:
-        # No running loop — fall back to a synchronous best-effort call.
-        try:
-            import requests
-            resp = requests.post(hook_url, headers=_hdrs, timeout=20)
-            logger.info(f"REDEPLOY HOOK FIRED (sync): HTTP {resp.status_code}")
-            if resp.status_code in (200, 201, 202):
-                global _last_confirmed_redeploy_at
-                _last_confirmed_redeploy_at = time.time()
-                _push_dashboard_flag(
-                    redeploy_hook_missing=False,
-                    redeploy_watchdog_overdue=False,
-                )
-        except Exception as exc:
-            logger.error(f"REDEPLOY HOOK ERROR (sync fallback): {exc}")
+        ok, info = redeploy_guard.deploy_request()
+        if ok:
+            _last_confirmed_redeploy_at = time.time()
+        else:
+            redeploy_guard.note_skip(f"deploy request failed: {info}")
 
     _pending = False
+    _due_at = 0.0
 
 
 async def _watchdog_loop():
