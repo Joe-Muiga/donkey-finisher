@@ -61,6 +61,16 @@
 
 <div class="note">With 60 minute buckets, the best-looking ones are often just luck, so treat the suggestion as a hypothesis to confirm on other days.</div>
 
+<div class="section card" id="exp" style="display:none">
+  <h2>Pre-registered test <span class="tag" id="exp-hash"></span></h2>
+  <div class="grid" id="exp-cards"></div>
+  <div class="muted" style="font-size:.72rem;margin:8px 0 4px">test-arm balance (flat stake) vs expected "no edge" path with &plusmn;2 SE band &middot; blue = actual, dashed = expected, shaded = band</div>
+  <svg id="exp-chart" viewBox="0 0 600 170" style="width:100%;max-width:640px"></svg>
+  <div id="exp-three" style="font-size:.85rem;margin-top:8px"></div>
+  <div id="exp-diag" class="muted" style="font-size:.78rem;margin-top:8px"></div>
+  <div class="muted" style="font-size:.72rem;margin-top:6px">Per-symbol / per-horizon breakdowns are EXPLORATORY. Frozen config hash is logged at start and in every report.</div>
+</div>
+
 <script>
 let tz = 'utc', data = null;
 const off = -new Date().getTimezoneOffset();            // minutes east of UTC
@@ -131,6 +141,46 @@ function render() {
   document.getElementById('chart').innerHTML = svg;
 }
 load(); setInterval(load, 10000);
+async function loadExp() {
+  const p = localStorage.getItem('ks_pin') || '';
+  try {
+    const r = await fetch('/api/exp_report', {headers: {'X-Pin': p}});
+    if (!r.ok) return;
+    const e = await r.json();
+    if (!e.test_mode) return;
+    document.getElementById('exp').style.display = '';
+    document.getElementById('exp-hash').textContent = 'config ' + e.config_hash;
+    const v = e.verdict || {}, t = e.three_numbers || {}, s = e.shadow || {};
+    const cls = v.state === 'confirmed profitable' ? 'green' : (v.state === 'confirmed unprofitable' ? 'red' : 'yellow');
+    document.getElementById('exp-cards').innerHTML = [
+      ['Verdict', v.state || '—', cls], ['Test trades', (e.n_test || 0) + ' / ' + e.max_trades, ''],
+      ['Win rate', pct(v.win_rate), ''], ['Break-even', pct(v.break_even), ''],
+      ['Profit/stake', v.mean == null ? '—' : v.mean.toFixed(4), ''],
+      ['95% CI', v.ci_low == null ? '—' : '[' + v.ci_low.toFixed(3) + ', ' + v.ci_high.toFixed(3) + ']', ''],
+    ].map(([l, x, c]) => `<div class="card"><div class="label">${l}</div><div class="value ${c}">${x}</div></div>`).join('');
+    const b = e.balance || {n: []};
+    if (b.n.length > 1) {
+      const all = b.actual.concat(b.lo, b.hi), lo = Math.min(...all), hi = Math.max(...all), rng = (hi - lo) || 1;
+      const X = i => 5 + 590 * i / (b.n.length - 1), Y = v => 165 - 155 * (v - lo) / rng;
+      const line = a => a.map((v, i) => (i ? 'L' : 'M') + X(i).toFixed(1) + ' ' + Y(v).toFixed(1)).join(' ');
+      const band = b.hi.map((v, i) => (i ? 'L' : 'M') + X(i).toFixed(1) + ' ' + Y(v).toFixed(1)).join(' ') + ' ' +
+        b.lo.map((v, i) => 'L' + X(b.lo.length - 1 - i).toFixed(1) + ' ' + Y(b.lo[b.lo.length - 1 - i]).toFixed(1)).join(' ') + ' Z';
+      document.getElementById('exp-chart').innerHTML = `<path d="${band}" fill="#8b949e" opacity=".25"/>
+        <path d="${line(b.expected)}" stroke="#8b949e" fill="none" stroke-dasharray="4 3"/>
+        <path d="${line(b.actual)}" stroke="#58a6ff" fill="none" stroke-width="1.8"/>`;
+    }
+    document.getElementById('exp-three').innerHTML =
+      `<b>Shadow hit rate</b> ${pct(t.shadow_hit_rate)} (${t.shadow_fired_n || 0} fired) &middot; <b>ALIGNED</b> ${pct(t.aligned && t.aligned.win_rate)} (${t.aligned ? t.aligned.n : 0}) &middot;
+       <b>LATE</b> ${pct(t.late && t.late.win_rate)} (${t.late ? t.late.n : 0}) &middot; <b>execution loss</b> ${pct(t.execution_loss)}<br>
+       Shadow top-1 ${pct(s.top1_hit)} (chance 10%) &middot; zone ${pct(s.zone_hit_all)} (chance 40%) &middot; control arm ${e.control ? e.control.n : 0} trades, win ${pct(e.control && e.control.win_rate)}`;
+    const d = (e.diag && e.diag.pooled) || {}, c = e.cycle || {};
+    document.getElementById('exp-diag').innerHTML =
+      `chi&sup2; blocks p&lt;.05: ${pct(d.frac_p05)} (expect 5%) &middot; CUSUM alarms ${d.cusum_alarms ?? '—'} &middot;
+       last cycle: down ${c.downtime_seconds ?? '—'}s / boot ${c.boot_seconds ?? '—'}s / ticks lost ~${c.ticks_lost_est ?? '—'} &middot;
+       skipped_late ${Object.values(e.skipped_late || {}).reduce((a, x) => a + x, 0)}${e.final ? ' &middot; <b>FINAL: ' + e.final.reason + '</b>' : ''}`;
+  } catch (err) {}
+}
+loadExp(); setInterval(loadExp, 15000);
 </script>
 </body>
 </html>
