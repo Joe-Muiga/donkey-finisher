@@ -265,7 +265,10 @@ class MHEngine(SetEngine):
         self._rtt_ready = True
         logger.info("MH BOOT done in %.1fs, rtt estimate %.3fs", time.time() - self._boot_t0, self._rtt or 0.0)
         if self._ledger_on:
-            await self._exp_ready()
+            await self._exp_ready()                         # also marks the engine ready for the redeploy guard
+        else:
+            import redeploy_guard
+            redeploy_guard.mark_engine_ready()              # without this the 7-minute redeploy preflight refuses forever
         return [s for s in res if s]
 
     async def _init_symbol(self, sym: str, sem: Optional[asyncio.Semaphore] = None):
