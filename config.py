@@ -1720,6 +1720,22 @@ MH_MAX_PER_TARGET      = _env_i("MH_MAX_PER_TARGET", 4 if MH_CLUSTER else 2)    
 MH_DEADLINE_FRAC       = _env_f("MH_DEADLINE_FRAC", 0.85)         # buy must land within this fraction of a tick
 MH_API_CONCURRENCY     = _env_i("MH_API_CONCURRENCY", 6)          # simultaneous proposal/buy requests
 MH_PRICE_TOL           = _env_f("MH_PRICE_TOL", 0.02)             # max buy price = stake * (1 + tol)
+MH_BUY_TIMEOUT_SECONDS = _env_f("MH_BUY_TIMEOUT_SECONDS", 3.0)    # MH buy reply timeout; keep well below the tick gap / deadline
+MH_RECONCILE_WAIT_SECONDS  = _env_f("MH_RECONCILE_WAIT_SECONDS", 2.0)    # in-doubt buy: wait for the late reply this long
+MH_RECONCILE_RETRY_SECONDS = _env_f("MH_RECONCILE_RETRY_SECONDS", 3.0)   # in-doubt buy: retry the portfolio query after this
+MH_RECONCILE_SAFETY_SECONDS = _env_f("MH_RECONCILE_SAFETY_SECONDS", 30.0)  # unresolved buy: hold the reservation this much longer
+MH_RANK_KEY            = os.environ.get("MH_RANK_KEY", "mass").strip().lower()   # mass (raw top-cluster mass, old) | edge (calibrated lb*r-1)
+MH_RANK_MIN_EDGE       = _env_f("MH_RANK_MIN_EDGE", _env_f("MH_MIN_EDGE", 0.0))  # edge floor when MH_RANK_KEY=edge (replaces SET_MIN_SET_PROB)
+MH_RANK_WINDOW_SECONDS = _env_i("MH_RANK_WINDOW_SECONDS", 30)     # ranking window: 30 (:00/:30 UTC) or 60 (old per-minute behaviour)
+MH_WINDOW_TOP_N        = _env_i("MH_WINDOW_TOP_N", _env_i("MH_MINUTE_TOP_N", 1))   # contracts bought per window
+MH_RANK_MODE           = os.environ.get("MH_RANK_MODE", "snapshot").strip().lower()   # snapshot (old) | bar (rank closed window, buy at current state)
+MH_INPROC_REFIT_SECONDS = _env_f("MH_INPROC_REFIT_SECONDS", 0.0)   # 0 = off; else rebuild each symbol's models in the background this often
+MH_WILSON_Z            = _env_f("MH_WILSON_Z", 1.64)              # Wilson z of the calibrated lower bound (use this OR MH_MIN_EDGE, not both)
+MH_OOS_CHECK           = _env_b("MH_OOS_CHECK", 0)                # 0 = held-out check is logged only; 1 = enforce (bins must beat break-even out of sample)
+MH_OOS_MIN_N           = _env_i("MH_OOS_MIN_N", 30)               # min held-out samples in a bin for it to be admissible (enforce)
+MH_OOS_MARGIN          = _env_f("MH_OOS_MARGIN", 0.0)             # held-out Wilson lb must exceed break-even + margin (enforce)
+MH_MAX_QUOTE_AGE_SECONDS = _env_f("MH_MAX_QUOTE_AGE_SECONDS", 0.0)   # 0 = off; else refuse/refetch admission quotes older than this
+MH_ADOPT_ORPHANS_ON_BOOT = _env_b("MH_ADOPT_ORPHANS_ON_BOOT", 1)   # adopt open digit contracts found on Deriv at boot
 REDEPLOY_DRAIN         = _env_i("REDEPLOY_DRAIN", 0 if MH_MODE else 1)   # 0 = redeploy without waiting for open contracts
 PREDICTOR_STATS_FLUSH_SECONDS = _env_f("PREDICTOR_STATS_FLUSH_SECONDS", 30)
 MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
