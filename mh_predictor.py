@@ -11,6 +11,7 @@ The batch walk-forward (numpy, no per-tick loop) and the online update are the s
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
 from collections import deque
@@ -30,7 +31,8 @@ A0, B0 = 50.0, 30.0  # legacy prior / back-off strengths (as set_predictor defau
 RHO = 1.0 - 1.0 / 300.0   # model-loss decay (~300 scored predictions)
 ETA = 1.0
 ROLL = 300
-WILSON_Z = 1.64
+WILSON_Z = float(getattr(config, "MH_WILSON_Z", 1.64))   # Wilson z of the per-bin lower bound (env MH_WILSON_Z)
+logger = logging.getLogger(__name__)
 
 COVERS: List[P.Candidate] = [("OVER", b) for b in range(0, 9)] + [("UNDER", b) for b in range(1, 10)]
 W = np.array([[1.0 if P.wins_digit(c, d) else 0.0 for c in COVERS] for d in range(10)])   # (10, 18)
@@ -95,6 +97,34 @@ class Calibrator:
     def __call__(self, p: float) -> Tuple[float, float]:
         k = min(int(np.searchsorted(self.hi, p, side="left")), len(self.hi) - 1)
         return float(self.p[k]), float(self.lb[k])
+
+    # ── held-out check: same bins, NEWER slice that the bins were not fitted on ──
+    def set_oos(self, p: np.ndarray, y: np.ndarray, z: float = WILSON_Z) -> None:
+        k = np.minimum(np.searchsorted(self.hi, p, side="left"), len(self.hi) - 1)
+        self.n_oos = np.bincount(k, minlength=len(self.hi)).astype(np.float64)
+        self.hits_oos = np.bincount(k, weights=y, minlength=len(self.hi))
+        self.wr_oos = np.where(self.n_oos > 0, self.hits_oos / np.maximum(self.n_oos, 1.0), np.nan)
+        self.wr_oos_lb = np.array([P.wilson_lower(h_, n_, z) if n_ > 0 else 0.0 for h_, n_ in zip(self.hits_oos, self.n_oos)])
+
+    def oos_at(self, p: float) -> Optional[Tuple[int, int, float, float]]:
+        """(n_oos, hits_oos, wr_oos, wr_oos_lb) of the bin that `p` falls in; None when no held-out slice was stored."""
+        if getattr(self, "n_oos", None) is None:
+            return None
+        k = min(int(np.searchsorted(self.hi, p, side="left")), len(self.hi) - 1)
+        return int(self.n_oos[k]), int(self.hits_oos[k]), float(self.wr_oos[k]), float(self.wr_oos_lb[k])
+
+
+def oos_admissible(cal, p: float, break_even: float, min_n: int, margin: float = 0.0) -> bool:
+    """Held-out gate: the bin needs >= min_n held-out samples and a Wilson lower bound above break-even (+margin).
+    A calibrator without a held-out slice (tests / fakes) passes."""
+    fn = getattr(cal, "oos_at", None)
+    if fn is None:
+        return True
+    r = fn(p)
+    if r is None:
+        return True
+    n, _hits, _wr, lbo = r
+    return n >= min_n and lbo > break_even + margin
 
 
 # ── batch walk-forward for one horizon ───────────────────────────────────────
@@ -247,7 +277,7 @@ class MHSymbol:
         self.n = 0                                     # digits seen; latest index = n-1
         self.last_epoch: Optional[float] = None
 
-    async def fit(self, digits: Sequence[int], last_epoch: Optional[float], deadline: float = 0.0) -> dict:
+    async def fit(self, digits: Sequence[int], last_epoch: Optional[float], deadline: float = 0.0, offload: bool = False) -> dict:
         """Walk-forward over `digits`. Horizon 1 always; others only while time.time() < deadline."""
         D = np.asarray(list(digits), dtype=np.int64)
         n = len(D)
@@ -261,14 +291,21 @@ class MHSymbol:
         for h in range(1, self.hmax_paper + 1):
             if h > 1 and deadline and time.time() > deadline:
                 break
-            res = walk_batch(D, h, self.decay)
             hs = HState(h, self.decay)
-            hs.load(res, D, n)
-            self._calibrate(hs, res, D)
+            if offload:                                # background refit: numpy off the event loop (objects are not shared yet)
+                res = await asyncio.to_thread(walk_batch, D, h, self.decay)
+                await asyncio.to_thread(self._load_cal, hs, res, D, n)
+            else:
+                res = walk_batch(D, h, self.decay)
+                self._load_cal(hs, res, D, n)
             self.hs[h] = hs
             rep["h"][h] = (round(hs.val_ll, 4) if hs.val_ll is not None else None, hs.tradable)
             await asyncio.sleep(0)                     # keep websockets alive between horizons
         return rep
+
+    def _load_cal(self, hs: HState, res: dict, D: np.ndarray, n: int) -> None:
+        hs.load(res, D, n)
+        self._calibrate(hs, res, D)
 
     def _calibrate(self, hs: HState, res: dict, D: np.ndarray) -> None:
         """Validation slice = last min(3000, 30%) predictions, split in time: the OLDER 60% fits the per-cover
@@ -285,6 +322,11 @@ class MHSymbol:
         k = int(0.6 * V)
         pc, oc = PB[:k] @ W, W[tgt[:k]]
         hs.cal = [Calibrator(pc[:, c], oc[:, c]) for c in range(len(COVERS))]
+        pco, oco = PB[k:] @ W, W[tgt[k:]]               # held-out slice (never used to fit the bins)
+        for c in range(len(COVERS)):
+            hs.cal[c].set_oos(pco[:, c], oco[:, c])
+        if h <= self.hmax_trade:
+            self._log_oos(hs)
         gain = LN10 - loss[k:]                         # >0 = better than uniform, out-of-sample
         m = float(gain.mean())
         se = float(gain.std(ddof=1) / math.sqrt(len(gain))) if len(gain) > 1 else float("inf")
@@ -292,6 +334,27 @@ class MHSymbol:
         hs.val_ll = LN10 - m
         hs.gate_gain, hs.gate_lb = m, m - z * se
         hs.tradable = h <= self.hmax_trade and (hs.gate_lb > 0 or not GATE)
+
+    def _log_oos(self, hs: HState) -> None:
+        """Boot table: in-sample lb of the best admissible bin vs its held-out win rate / lower bound (optimism gap)."""
+        r = float(getattr(config, "MH_MIN_PAYOUT_RATIO", 1.9))
+        be, me_ = 1.0 / r, float(getattr(config, "MH_MIN_EDGE", 0.0))
+        mn, mg = int(getattr(config, "MH_OOS_MIN_N", 30)), float(getattr(config, "MH_OOS_MARGIN", 0.0))
+        parts, adm, rem = [], 0, 0
+        for c, cand in enumerate(COVERS):
+            cal = hs.cal[c]
+            ok = [i for i in range(len(cal.hi)) if cal.lb[i] * r - 1.0 > me_]       # admissible in-sample
+            if not ok:
+                continue
+            bad = [i for i in ok if not (cal.n_oos[i] >= mn and cal.wr_oos_lb[i] > be + mg)]
+            adm += len(ok)
+            rem += len(bad)
+            i = ok[-1]                                                               # top admissible bin
+            wr = cal.wr_oos[i]
+            parts.append(f"{cand[0]}{cand[1]}:lb={cal.lb[i]:.3f} oos={'n/a' if wr != wr else f'{wr:.3f}'}/{cal.wr_oos_lb[i]:.3f} "
+                         f"n={int(cal.n_oos[i])} rm={len(bad)}/{len(ok)}")
+        logger.info("MH OOS %s h=%d (break-even %.3f): admissible bins %d, removed by OOS check %d | %s",
+                    self.symbol, hs.h, be, adm, rem, "; ".join(parts) or "no admissible bin in-sample")
 
     def on_tick(self, digit: int, epoch: Optional[float] = None) -> bool:
         if epoch is not None:
