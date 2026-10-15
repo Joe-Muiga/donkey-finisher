@@ -134,6 +134,7 @@ v9 → v10 audit changes (full compliance pass):
 """
 
 import asyncio
+import collections
 import json
 import logging
 import math
@@ -178,9 +179,30 @@ def _is_volatility_index(symbol: str) -> bool:
     return any(s.startswith(p) for p in _VOLATILITY_PREFIXES)
 
 
+class RequestTimeout(TimeoutError):
+    """The request frame was written but no reply arrived in time: the server MAY have acted on it.
+    Still a TimeoutError, so existing `except TimeoutError` handlers keep working."""
+    sent = True
+    req_id = None
+
+
+def _mark_sent(exc: BaseException, req_id: int) -> None:
+    """Tag an exception raised after the frame went out (or may have): callers can tell "in doubt" from "refused"."""
+    try:
+        exc.sent = True
+        exc.req_id = req_id
+    except Exception:
+        pass
+
+
+LATE_BUY_MAX = 300          # late buy replies kept (bounded)
+LATE_BUY_TTL = 120.0        # seconds a late buy reply is kept
+
+
 class DerivClient:
 
     def __init__(self):
+        self._late_buys: "collections.OrderedDict[int, tuple]" = collections.OrderedDict()   # req_id -> (ts, msg)
         self._ws: Optional[Any]    = None
         self._ready: asyncio.Event = asyncio.Event()
         self._connected: bool      = False
@@ -513,6 +535,22 @@ class DerivClient:
             except Exception as exc:
                 logger.debug(f"Dispatch error: {exc}")
 
+    def _note_late_buy(self, req_id: int, msg: dict) -> None:
+        now = time.time()
+        self._late_buys[req_id] = (now, msg)
+        while self._late_buys and (len(self._late_buys) > LATE_BUY_MAX
+                                   or now - next(iter(self._late_buys.values()))[0] > LATE_BUY_TTL):
+            self._late_buys.popitem(last=False)
+        b = msg.get("buy") or {}
+        logger.warning("LATE BUY REPLY req_id=%s contract_id=%s (arrived after the local timeout)", req_id, b.get("contract_id"))
+
+    def pop_late_buy(self, req_id) -> Optional[dict]:
+        """The buy reply that arrived after its request timed out (None if none yet / expired)."""
+        item = self._late_buys.pop(req_id, None)
+        if item is None or time.time() - item[0] > LATE_BUY_TTL:
+            return None
+        return item[1]
+
     async def _handle(self, msg: dict):
         logger.debug(f"RAW MSG: {msg}")
         msg_type = msg.get("msg_type", "")
@@ -538,6 +576,8 @@ class DerivClient:
                 except Exception:
                     pass
 
+        if req_id and msg_type == "buy" and not error and req_id not in self._pending:
+            self._note_late_buy(req_id, msg)                # reply after the local timeout: keep it, never drop a contract id
         if req_id and req_id in self._pending:
             fut = self._pending.pop(req_id)
             if not fut.done():
@@ -853,7 +893,19 @@ class DerivClient:
             logger.error(f"FORCE CHECK ERROR {contract_id}: {e}")
             return {}
 
-    async def get_portfolio(self) -> list:
+    async def get_profit_table(self, limit: int = 30, strict: bool = True, timeout: float = 10.0) -> list:
+        """Most recent CLOSED contracts (newest first): used to find an in-doubt buy that already settled.
+        strict=True raises on failure (an empty list must mean "nothing there", not "could not ask")."""
+        try:
+            resp = await self._send({"profit_table": 1, "description": 1, "limit": int(limit), "sort": "DESC"}, timeout=timeout)
+            return list((resp or {}).get("profit_table", {}).get("transactions", []) or [])
+        except Exception as e:
+            logger.error(f"GET PROFIT TABLE ERROR: {e}")
+            if strict:
+                raise
+            return []
+
+    async def get_portfolio(self, strict: bool = False, timeout: float = 30.0) -> list:
         """
         Query Deriv's own server-side state for every currently-open
         contract on this account ({"portfolio": 1}) — no dependency on any
@@ -876,9 +928,11 @@ class DerivClient:
         entries), or [] on any failure. Never raises.
         """
         try:
-            resp = await self._send({"portfolio": 1})
+            resp = await self._send({"portfolio": 1}, timeout=timeout)
             if not resp:
                 logger.warning("GET PORTFOLIO: no response")
+                if strict:
+                    raise RuntimeError("portfolio: no response")
                 return []
             if resp.get("error"):
                 err = resp["error"]
@@ -889,6 +943,8 @@ class DerivClient:
             return contracts
         except Exception as e:
             logger.error(f"GET PORTFOLIO ERROR: {e}")
+            if strict:
+                raise                   # strict: "could not ask" must not look like "nothing open"
             return []
 
     # ─── Request helper ───────────────────────────────────────────────────────
@@ -913,14 +969,20 @@ class DerivClient:
 
         try:
             await self._ws.send(json.dumps(payload))
-        except Exception:
+        except Exception as exc:
             self._pending.pop(req_id, None)
+            _mark_sent(exc, req_id)                         # the frame may have gone out before the failure
             raise
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             self._pending.pop(req_id, None)
-            raise TimeoutError(f"Request timed out: {payload.get('msg_type', payload)}")
+            err = RequestTimeout(f"Request timed out: {payload.get('msg_type', payload)}")
+            err.req_id = req_id
+            raise err
+        except ConnectionError as exc:                      # socket dropped while the request was pending
+            _mark_sent(exc, req_id)
+            raise
 
     # ─── Auth & balance ───────────────────────────────────────────────────────
 
