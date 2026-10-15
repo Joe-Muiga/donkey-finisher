@@ -340,11 +340,11 @@ class BotEngine:
         return p
 
     async def _buy_direct(self, sym: str, cand: pred.Candidate, price: float, stake: Optional[float] = None,
-                          duration: Optional[int] = None) -> dict:
+                          duration: Optional[int] = None, timeout: float = 10) -> dict:
         """Buy without a proposal id: {"buy": "1", "price": max_price, "parameters": {...}}."""
         return await self.client._send(
             {"buy": "1", "price": price, "parameters": self._contract_params(sym, cand, self.stake if stake is None else stake, duration)},
-            timeout=10)
+            timeout=timeout)
 
     async def _propose(self, sym: str, cand: pred.Candidate, stake: float, duration: Optional[int] = None) -> Optional[dict]:
         req = {"proposal": 1, **self._contract_params(sym, cand, stake, duration)}
