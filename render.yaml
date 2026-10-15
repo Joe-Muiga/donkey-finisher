@@ -33,6 +33,12 @@
 #   (the main account trades on its own; TARGET_BALANCE, if set, still stops it.)
 #   Demo/real is ONE global switch on the /followers page (typed confirmation), not an env var.
 
+# ── MH recommended env values (Phase 2; code defaults are unchanged, set these on Render to use them) ──
+#   MH_DEADLINE_RTT=p95   # deadline gate uses the 95th-percentile RTT: conservative against tail latency (EWMA until 20 samples)
+#   MH_HMAX_TRADE=2       # trade only horizons 1-2, the ones the log-loss gate proves best
+#   MH_BUY_TIMEOUT_SECONDS=3   # buy reply timeout; a timed-out buy is reconciled (late reply / portfolio / profit_table)
+#   MH_RANK_WINDOW_SECONDS=60  # use 60 to compare Phases 1-4 on the old per-minute basis (code default is 30)
+
 services:
   - type: web
     name: sifm-deriv-bot
