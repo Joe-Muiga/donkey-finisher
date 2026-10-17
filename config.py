@@ -1232,8 +1232,7 @@ MAX_BUY_PER_SECOND     = 3
 # ── RENDER ──────────────────────────────────────────────────
 RENDER_DEPLOY_HOOK_URL = os.environ.get(
     "RENDER_DEPLOY_HOOK_URL","")
-# (The old rolling / periodic redeploy settings are gone. The ONLY redeploy is the single one per hour
-#  before Session A - see "TRADING SCHEDULE" and "PRE-SESSION-A REDEPLOY" further down.)
+SETTLE_WAIT_SECS = 15
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
@@ -1610,57 +1609,32 @@ RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # PREDICTOR_SYMBOLS is defined next to DIGIT_SYMBOLS above.
-
-# ════════════════════════════════════════════════════════════════════════════════════════════
-#  TRADING SCHEDULE  -  EASY-EDIT SECTION  (window_scheduler.py)
-# ════════════════════════════════════════════════════════════════════════════════════════════
-#  Two sessions EVERY hour, EVERY day of the week, in UTC, judged on DERIV'S SERVER clock.
-#  All numbers are SECONDS OF THE HOUR (minute*60 + second).
-#
-#      Session A : opens HH:06:00.000   closes HH:16:01.000
-#      Session B : opens HH:21:00.000   closes HH:29:01.000
-#
-#  Open instant is INCLUSIVE, close instant is EXCLUSIVE:  buying is allowed when  open <= t < close.
-#  The close is  <nominal end> + SESSION_CLOSE_EXTRA_SECONDS.  The "+1 second" lives ONLY in
-#  SESSION_CLOSE_EXTRA_SECONDS: set it to 0 and the sessions end exactly at HH:16:00.000 / HH:29:00.000.
-#
-#  Outside the two sessions the bot is NOT connected to Deriv at all (no websocket, no OTP, no polling).
-#  Each session is its own connect/disconnect cycle - there is NO "keep open through short gaps".
-#  Sessions can only be changed here (no environment variable can move, widen or switch them off).
-SESSION_A_OPEN_SECOND      = 6 * 60           # HH:06:00
-SESSION_A_END_SECOND       = 16 * 60          # nominal end HH:16:00
-SESSION_B_OPEN_SECOND      = 21 * 60          # HH:21:00
-SESSION_B_END_SECOND       = 29 * 60          # nominal end HH:29:00
-SESSION_CLOSE_EXTRA_SECONDS = 1               # the "+1 s": close = nominal end + this  (-> HH:16:01 / HH:29:01)
-SESSION_SLOTS = (("A", SESSION_A_OPEN_SECOND, SESSION_A_END_SECOND),
-                 ("B", SESSION_B_OPEN_SECOND, SESSION_B_END_SECOND))
-
-#  Connect lead: the bot connects, authorises, subscribes all symbols, downloads history/candles, measures
-#  the clock offset and starts the money rules this long BEFORE the open instant, so that nothing is left
-#  to warm up at the open.  The engine logs "DONKEY BOOT done in X s" every session: set this to roughly
-#  (P95 of those numbers) + 30-40 s.  90 s was chosen without live data (typical boot is a fraction of it).
-WINDOW_PRECONNECT_SECONDS = 90
-#  After the close: no new buys; wait at most this long for open (tick-duration) contracts to settle,
-#  flush stats, then CLOSE THE WEBSOCKET.  This is the only connected time allowed after a close.
-SESSION_DRAIN_SECONDS     = 10
-#  A process that BOOTS (redeploy finishing late, Render restart, crash restart, engine rebuilt) while a
-#  session is already open: False = do not trade the rest of that session, start at the next open instant.
-RESUME_TRADING_MID_SESSION_AFTER_BOOT = False
-
-#  Clock precision (clock_sync.py).  Deriv's `time` is whole seconds; the estimator intersects the interval
-#  every sample proves (assumes Deriv's `time` = FLOOR of its clock) and bisects the second-flip with a
-#  handful of timed probes.  Rate-limit friendly: at most CLOCK_BURST_MAX_PROBES requests per burst,
-#  one every >= CLOCK_PROBE_MIN_GAP_SECONDS.
-DERIV_TIME_IS_FLOORED         = True      # False = assume Deriv ROUNDS to the nearest second (offset model +-0.5 s)
-CLOCK_BURST_MAX_PROBES        = 10
-CLOCK_BURST_BUDGET_SECONDS    = 12.0
-CLOCK_PROBE_MIN_GAP_SECONDS   = 0.3
-CLOCK_MAX_ABS_OFFSET_SECONDS  = 120.0     # sanity limit: a larger local-vs-Deriv difference is rejected
-CLOCK_WARN_OFFSET_SECONDS     = 1.5       # log a WARNING when the local clock differs from Deriv by more
-CLOCK_REFRESH_SECONDS         = 30.0      # in-session single-probe refresh period
-CLOCK_PRE_OPEN_BURST_SECONDS  = 20.0      # a second, quiet-network burst this long before the open
-CLOCK_MAX_ERROR_FOR_OK        = 0.25      # estimated error above this is logged as a WARNING
-PREDICTOR_STAKE         = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
+# Trade sessions: two per hour, every hour, every day, in SECONDS OF THE HOUR (UTC, judged on Deriv's
+# server clock). A session is open for  open <= t < close  (open instant inclusive, close instant exclusive).
+# Strict - not env vars, so a stale value on Render can never change them. Outside a session the bot is not
+# connected to Deriv (only the pre-connect lead before an open and the short drain after a close).
+#   Session A: HH:06:00.000 -> HH:16:01.000        Session B: HH:21:00.000 -> HH:29:01.000
+TRADE_SESSION_CLOSE_PLUS_SECONDS = 1                                    # the "+1 second" on every close; change here
+TRADE_SESSION_A_OPEN_SECONDS     = 6 * 60                               # 360  = HH:06:00
+TRADE_SESSION_A_CLOSE_SECONDS    = 16 * 60 + TRADE_SESSION_CLOSE_PLUS_SECONDS   # 961 = HH:16:01
+TRADE_SESSION_B_OPEN_SECONDS     = 21 * 60                              # 1260 = HH:21:00
+TRADE_SESSION_B_CLOSE_SECONDS    = 29 * 60 + TRADE_SESSION_CLOSE_PLUS_SECONDS   # 1741 = HH:29:01
+TRADE_SESSIONS = (("A", TRADE_SESSION_A_OPEN_SECONDS, TRADE_SESSION_A_CLOSE_SECONDS),
+                  ("B", TRADE_SESSION_B_OPEN_SECONDS, TRADE_SESSION_B_CLOSE_SECONDS))
+# SESSION_WINDOW_ENABLED (Render env var, default ON): 1 = trade only in the two sessions, disconnected the rest
+# of the hour, one redeploy per hour before Session A. 0 = sessions OFF: connected and trading all hours, no redeploy.
+TRADE_WINDOW_ENABLED      = os.environ.get("SESSION_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+# The one redeploy per hour is fired in the idle gap after Session B at
+#   next Session A open - pre-connect lead (window_scheduler._preconnect) - REDEPLOY_LEAD_SECONDS.
+# Expected Render deploy time (cache cleared) plus margin, tune from Render's deploy history.
+REDEPLOY_LEAD_SECONDS = 300
+# May a freshly booted or crash-restarted process start trading in the middle of an already-open session?
+# False = it waits for the next session's exact open.
+TRADE_ALLOW_MID_SESSION_START = False
+# Cap (seconds) on how long after a session closes the engine waits for already-bought contracts to settle
+# before it disconnects (the wait ends earlier as soon as nothing is open).
+SESSION_DRAIN_SECONDS = 15
+PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
 # Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
 # OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
@@ -1691,7 +1665,7 @@ PREDICTOR_STATS_FLUSH_SECONDS = _env_f("PREDICTOR_STATS_FLUSH_SECONDS", 30)
 MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
 WINDOW_MINUTES           = _env_i("WINDOW_MINUTES", 10)
 
-# ─── In-process self-healing (reconnect / stale-tick watchdog / resync after a reconnect) ────────
+# ─── Continuous-running / self-healing (replaces the rolling redeploy) ────────
 # Reconnect forever (0 = unlimited) with exponential backoff capped at 60 s.
 WEBSOCKET_MAX_RECONNECTS      = _env_i("WEBSOCKET_MAX_RECONNECTS", 0)
 WEBSOCKET_RECONNECT_INTERVAL  = _env_f("WEBSOCKET_RECONNECT_INTERVAL", 3)
@@ -1712,47 +1686,6 @@ STATS_PERSIST_TO_RENDER       = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
     "0").strip().lower() in ("1", "true", "yes", "on")
 
-
-# ════════════════════════════════════════════════════════════════════════════════════════════
-#  PRE-SESSION-A REDEPLOY  -  EASY-EDIT SECTION  (redeploy_planner.py / redeploy_guard.py)
-# ════════════════════════════════════════════════════════════════════════════════════════════
-#  There is NO periodic / rolling redeploy any more.  The ONLY redeploy is ONE per hour, fired by the
-#  running instance while it is DISCONNECTED (in the long idle gap after Session B), timed so that the new
-#  deploy goes live JUST BEFORE the Session A connect lead:
-#
-#        fire_time = (Session A connect-lead start) - (expected deploy duration + safety margin)
-#
-#  Session B never gets a redeploy; nothing is ever fired between Session A and Session B or inside a
-#  session.  Needs RENDER_API_KEY (RENDER_SERVICE_ID is injected by Render).  The build cache is NEVER
-#  cleared (clearCache="do_not_clear").
-PRE_A_REDEPLOY_ENABLED            = _env_b("PRE_A_REDEPLOY_ENABLED", 1)   # 0 = never redeploy (in-process reconnects only)
-REDEPLOY_DEFAULT_DURATION_SECONDS = 180      # assumed deploy duration until Render's own history gives a P95
-REDEPLOY_DURATION_PERCENTILE      = 0.95     # of Render's createdAt -> finishedAt over the latest deploys
-REDEPLOY_HISTORY_LIMIT            = 30       # deploys read from Render's history
-REDEPLOY_MIN_DURATION_SECONDS     = 30       # sanity clamp for the measured duration
-REDEPLOY_MAX_DURATION_SECONDS     = 1500
-REDEPLOY_SAFETY_MARGIN_SECONDS    = 120      # margin = max(this, REDEPLOY_SAFETY_MARGIN_FRACTION x expected duration)
-REDEPLOY_SAFETY_MARGIN_FRACTION   = 0.5
-REDEPLOY_LATE_FIRE_FLOOR_SECONDS  = 45       # at fire time the lead must still be >= expected duration + this away
-REDEPLOY_RETRY_SECONDS            = 20       # preflight refused for a transient reason: look again after this
-REDEPLOY_STATUS_POLL_SECONDS      = 15       # how often a fired deploy's status is read
-# Deploy safety (redeploy_guard.py). Deploys are ALWAYS requested with clearCache="do_not_clear" (latest commit).
-REDEPLOY_HEALTH_TIMEOUT_SECONDS = _env_f("REDEPLOY_HEALTH_TIMEOUT_SECONDS", 180)  # local /health probe cap
-REDEPLOY_BACKOFF_BASE_SECONDS   = _env_f("REDEPLOY_BACKOFF_BASE_SECONDS", 300)    # after a FAILED deploy: base * 2^(fails-1)
-REDEPLOY_BACKOFF_MAX_SECONDS    = _env_f("REDEPLOY_BACKOFF_MAX_SECONDS", 7200)
-
-# ─── Retired settings: an old value left on Render must never change behaviour ──────────────────────
-# These environment variables no longer exist.  If one is still set on Render it is IGNORED (main.py logs one
-# warning).  In particular REDEPLOY_INTERVAL_SECONDS / SESSION_WINDOW_ENABLED can no longer switch the
-# sessions off, and the session times / connect lead / drain cannot be changed from the environment.
-_RETIRED_ENV = (
-    "REDEPLOY_INTERVAL_SECONDS", "REDEPLOY_INTERVAL_HOURS", "AUTO_REDEPLOY", "AUTO_REDEPLOY_SECONDS",
-    "REDEPLOY_EVERY_N_CYCLES", "REDEPLOY_TIMEZONE", "REDEPLOY_BUY_BLOCK_SECONDS", "REDEPLOY_DRAIN",
-    "REDEPLOY_DRAIN_MAX_SECONDS", "REDEPLOY_HALT_MAX_SECONDS", "REDEPLOY_MIN_UPTIME_SECONDS",
-    "REDEPLOY_MIN_GAP_SECONDS", "KEEP_OPEN_GAP_SECONDS", "SESSION_WINDOW_ENABLED", "SCHEDULE_FILE",
-    "SCHEDULE_TIERS", "WINDOW_PRECONNECT_SECONDS", "SESSION_DRAIN_SECONDS", "WINDOW_REDEPLOY_CLEAR_CACHE",
-)
-IGNORED_LEGACY_ENV = sorted(k for k in _RETIRED_ENV if (os.environ.get(k) or "").strip())
 
 # ─── DONKEY STRATEGY: Four-Pair Focus (donkey_pairs.py / donkey_triggers.py / donkey_engine.py) ─────
 # We buy the COMPLEMENT of each crowd setup: crowd Over 2 -> Under 3, Over 3 -> Under 4, Under 6 -> Over 5,
@@ -1809,10 +1742,6 @@ DONKEY_API_CONCURRENCY     = _env_i("DONKEY_API_CONCURRENCY", 6)
 DONKEY_LIMIT_COOLDOWN_SECONDS = _env_f("DONKEY_LIMIT_COOLDOWN_SECONDS", 5)
 DONKEY_MAX_OPEN            = _env_i("DONKEY_MAX_OPEN", 0)              # 0 = unlimited
 DONKEY_DRY_RUN             = _env_b("DONKEY_DRY_RUN", 0)
-# 1 = INVERT at execution: after a setup fires, buy the COMPLEMENT of the contract we would have bought (= the crowd's own
-# contract: P1 OVER2, P2 OVER3, P3 UNDER6, P4 UNDER7) instead of ours. Same trigger, symbol, tick and duration; only the side flips
-# in the last step before the buy. Payouts differ (the crowd side pays far less per win), so compare in dry run first.
-DONKEY_INVERT              = _env_b("DONKEY_INVERT", 0)
 DONKEY_GUARD_ENABLED       = _env_b("DONKEY_GUARD_ENABLED", 0)         # OWNER DECISION: no guards, no suspensions
 DONKEY_BUY_TIMEOUT_SECONDS = _env_f("DONKEY_BUY_TIMEOUT_SECONDS", 3.0)
 DONKEY_RECONCILE_WAIT_SECONDS   = _env_f("DONKEY_RECONCILE_WAIT_SECONDS", 2.0)
