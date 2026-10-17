@@ -1,11 +1,7 @@
 """
-bot_engine.py - base engine: Deriv connection, stake rules, settlement, redeploy handling, dashboard.
+bot_engine.py - base engine: Deriv connection, stake rules, settlement, exact session gate, dashboard.
 
 Strategy-free. The Donkey strategy lives in donkey_engine.py (DonkeyEngine subclasses this class).
-
-Session lifecycle (window_scheduler.py, judged on Deriv's server clock): ONE engine instance serves ONE session:
-connect at the connect lead -> authorise, subscribe, warm up, measure the clock (clock_sync.py) -> buy from the open
-instant to the close instant -> bounded drain -> hard disconnect.  main.py builds a fresh engine for the next session.
 
 Self-healing: the Deriv client reconnects forever with backoff, a watchdog re-subscribes / reconnects
 when a tick stream goes quiet, per-symbol state is re-synced after every reconnect (`_refit_loop` ->
@@ -13,7 +9,10 @@ when a tick stream goes quiet, per-symbol state is re-synced after every reconne
 
 There are no trading gates in this layer: no loss/drawdown/streak limits, no cooldowns, no suspensions.
 Only technical necessities remain: reconnect (deriv_client), auth, rate-limit backoff, error logging,
-the session gate (send-time, in deriv_client), TARGET_BALANCE and the dashboard kill switch.
+the two exact trade sessions per hour (window_scheduler, Deriv server clock), draining open contracts after a
+session close, TARGET_BALANCE and the dashboard kill switch.
+One engine instance serves ONE session: main.py builds a fresh engine for every session and the engine
+disconnects from Deriv when its session closes.
 """
 import asyncio
 import collections
@@ -22,13 +21,12 @@ import statistics
 import time
 from typing import Dict, List, Optional
 
-import clock_sync
 import config
 import digit_utils as du
 import main_money
 import predictor_stats
 import target_guard
-import window_scheduler as ws
+import window_scheduler
 from deriv_client import DerivClient
 
 try:                                    # follower system is optional; the main account never depends on it
@@ -43,13 +41,12 @@ except Exception:                       # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
-def _fmt_ms(ts: float) -> str:
-    """Epoch -> 'HH:MM:SS.mmm' (UTC)."""
-    return time.strftime("%H:%M:%S", time.gmtime(ts)) + f".{int((ts % 1) * 1000):03d}"
-
-
 def _cfg(name, default):
     return getattr(config, name, default)
+
+
+def _utc(ts: float) -> str:
+    return time.strftime("%H:%M:%S", time.gmtime(ts)) + ("%.3f" % (ts % 1.0))[1:]
 
 
 class BotEngine:
@@ -65,17 +62,15 @@ class BotEngine:
         self._open: Dict[str, dict] = {}
         self._recent_epochs: Dict[str, List[float]] = {}
         self._last_epoch: Dict[str, float] = {}
-        self._sess: Optional[ws.Session] = None   # the session this engine serves (connection window)
-        self._phase = "connecting"
-        self._symbols_ready = False
-        self._ready = False                       # symbols warmed up AND Deriv clock measured
-        self._ready_at = 0.0                      # server time at which that became true
-        self._clock = clock_sync.ClockEstimator(floored=bool(_cfg("DERIV_TIME_IS_FLOORED", True)))
         self._lag_obs: List[int] = []
         self._last_decision = "—"
         self.balance = 0.0
         self._target_done = asyncio.Event()   # set once the TARGET_BALANCE / window-end shutdown has finished
-        self._session_over = False            # session closed: no buys, socket dropped, engine returns
+        self._session_over = False            # trade session closed: no buys, socket dropped, engine returns
+        self._window_seen = False             # the session this engine serves has actually opened (and been traded)
+        self._money_ready = False             # money.start finished
+        self._boot_done = False               # symbols warmed up and all loops started
+        self._stop_at_close: list = []        # tasks that talk to Deriv: cancelled the instant the session closes
         self._feed_followers = True           # DonkeyEngine turns this off (no follower stats / mirroring)
         # ── self-healing state ──
         self._last_tick_wall: Dict[str, float] = {}
@@ -97,22 +92,22 @@ class BotEngine:
         logger.info("=" * 64)
         logger.info("  Digit bot  –  min stake %.2f (PREDICTOR_STAKE), symbols %s", self.stake, self.symbols)
         logger.info("=" * 64)
-        ws.reset_clock()                                  # this connection measures the Deriv clock from scratch
-        self._sess = ws.connection_session()
-        if self._sess is None:
-            logger.error("ENGINE START REFUSED: no session connection window is open right now (fail closed)")
-            return
-        self._set_phase("connecting")
+        sessions_on = bool(_cfg("TRADE_WINDOW_ENABLED", False))
         ws_task = asyncio.create_task(self.client.connect())
-        while not self.client.is_connected and not ws_task.done():     # connect() retries until the window ends
-            await asyncio.sleep(0.1)
+        waited = 0.0
+        while not self.client.is_connected:
+            if sessions_on:                      # keep retrying (DerivClient backs off) until the session is over
+                if not window_scheduler.should_be_connected(window_scheduler.now()):
+                    break
+            elif waited >= 60:
+                break
+            await asyncio.sleep(0.5)
+            waited += 0.5
         if not self.client.is_connected:
-            logger.error("Could not connect/authorise before the connection window ended")
+            logger.error("Could not connect/authorise to Deriv (%s)",
+                         "the session is over" if sessions_on else "within 60 s")
             ws_task.cancel()
             return
-        self._set_phase("warming")
-        clock_task = asyncio.create_task(self._clock_sync_loop())     # starts measuring at once, parallel to the warm-up
-        session_task = asyncio.create_task(self._session_loop())      # open/close markers, the 2-s readiness check, the close
         self.balance = self.client.balance
         # Target check BEFORE anything is warmed up: if the balance is already at/above
         # TARGET_BALANCE (e.g. service resumed without raising the target) never trade.
@@ -126,13 +121,16 @@ class BotEngine:
                 if target_guard.mark_reached(self.balance):
                     await self._shutdown_for_target(self.balance)
                 ws_task.cancel()
-                clock_task.cancel()
-                session_task.cancel()
                 return
         else:
             logger.info("TARGET GUARD: TARGET_BALANCE not set - no balance target")
+        session_tasks = []                       # clock sync + readiness alarm (sessions only)
+        if sessions_on:                          # Deriv server-clock offset: measured while the symbols warm up
+            session_tasks = [asyncio.create_task(self._cancellable(self._clock_sync())),
+                             asyncio.create_task(self._cancellable(self._readiness_watch()))]
         try:
             await self.money.start(self.client)          # saved floor/P, live balance, midnight reset
+            self._money_ready = True
         except Exception as exc:
             logger.error("MAIN MONEY could not start (%s) - the bot will not trade until it can", exc)
         self.client.on_balance(self._on_balance)
@@ -140,24 +138,29 @@ class BotEngine:
 
         ready = await self._init_symbols()
         self.symbols = ready
-        self._symbols_ready = bool(ready)
         if not self.symbols:
             raise RuntimeError("no tradable symbol could be started")
         logger.info("SYMBOLS ACTIVE (%d): %s", len(self.symbols), ",".join(self.symbols))
 
+        t_watchdog = asyncio.create_task(self._cancellable(self._watchdog_loop()))
+        t_refit = asyncio.create_task(self._cancellable(self._refit_loop()))
+        t_monitor = asyncio.create_task(self._cancellable(self._target_monitor_loop()))
+        extra = [asyncio.create_task(self._cancellable(c)) for c in self._extra_tasks()]
         tasks = [asyncio.create_task(self._worker(s)) for s in self.symbols if s not in self._worker_started]
         tasks += self._early_tasks
         tasks += [asyncio.create_task(self._settle_loop()),
                   asyncio.create_task(self._flush_loop()),
                   asyncio.create_task(self._dashboard_loop()),
-                  asyncio.create_task(self._watchdog_loop()),
-                  asyncio.create_task(self._refit_loop()),
-                  asyncio.create_task(self._target_monitor_loop()),
-                  session_task,
-                  clock_task,
+                  t_watchdog, t_refit, t_monitor,
+                  asyncio.create_task(self._window_watch_loop()),
                   asyncio.create_task(self._supervise_ws(ws_task))]
-        tasks += [asyncio.create_task(c) for c in self._extra_tasks()]
-        self._check_ready()
+        tasks += extra + session_tasks
+        # Everything below talks to Deriv: it dies the instant the session closes (only settlement polling and
+        # the in-doubt reconciles keep going through the bounded drain).
+        self._stop_at_close = [t_watchdog, t_refit, t_monitor] + extra + session_tasks
+        if _follower_mgr is not None:        # Deriv server-time offset for the follower scheduler (main account time)
+            tasks.append(asyncio.create_task(_follower_mgr.collector_time_sync(self.client)))
+        self._boot_done = True
         stopper = asyncio.create_task(self._target_done.wait())
         main_t = asyncio.gather(*tasks)
         try:
@@ -171,6 +174,16 @@ class BotEngine:
                 t.cancel()
             stopper.cancel()
             ws_task.cancel()
+
+    async def _cancellable(self, coro):
+        """Run `coro`; if _end_session cancels it at the session close that is a normal end, not a cancelled task
+        (a cancelled child would make the gather in run() finish early and cut the drain short)."""
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            if self._session_over:
+                return None
+            raise
 
     async def _init_symbols(self) -> list:
         """Initialise all symbols one after another (DonkeyEngine overrides this with a concurrent boot)."""
@@ -227,20 +240,37 @@ class BotEngine:
         been missed, so the digit windows would be wrong."""
         return self._conn_count() != self._seen_conn
 
-    def _gate_reason(self) -> Optional[str]:
-        """Why a buy may not be decided/sent right now according to the schedule (None = the gate is open).
-        Judged on Deriv's server clock; deriv_client._send repeats the check at the moment of sending."""
-        ok, why = ws.buy_gate()
-        return None if ok else why
+    @staticmethod
+    def _in_trade_window(ts: Optional[float] = None) -> bool:
+        """True when `ts` (epoch seconds on DERIV'S SERVER CLOCK, default window_scheduler.now()) is inside one of the
+        two sessions: open <= ts < close, exact to the float second (window_scheduler.in_window)."""
+        if not _cfg("TRADE_WINDOW_ENABLED", False):
+            return True
+        return window_scheduler.in_window(window_scheduler.now() if ts is None else ts)
+
+    @staticmethod
+    def _server_now() -> float:
+        return window_scheduler.now()
+
+    def _send_block_reason(self) -> Optional[str]:
+        """Checked AGAIN at the instant a buy is handed to the socket: a decision taken before the close must not be
+        transmitted after it. None = clear."""
+        if self._session_over:
+            return "session_over"
+        if target_guard.is_reached():
+            return "target_reached"
+        if not self._in_trade_window(window_scheduler.now()):
+            return "outside_trade_window"
+        return None
 
     def _next_stake(self) -> Optional[float]:
         """Stake from the money rules for the next buy; None = stopped (floor reached) or not ready."""
         return self.money.next_stake()
 
     def _blocked(self) -> bool:
-        # Only technical blocks remain: the session gate, no socket, or state not yet re-synced after a
+        # Only technical blocks remain: outside the session, no socket, or state not yet re-synced after a
         # reconnect (a few seconds).
-        return (self._gate_reason() is not None or target_guard.is_reached() or self._session_over
+        return (not self._in_trade_window(window_scheduler.now()) or target_guard.is_reached() or self._session_over
                 or not self.client.is_connected or self._needs_resync())
 
     # ── trading ──────────────────────────────────────────────────────────────
@@ -254,7 +284,11 @@ class BotEngine:
 
     async def _buy_direct(self, sym: str, cand: du.Candidate, price: float, stake: Optional[float] = None,
                           duration: Optional[int] = None, timeout: float = 10) -> dict:
-        """Buy without a proposal id: {"buy": "1", "price": max_price, "parameters": {...}}."""
+        """Buy without a proposal id: {"buy": "1", "price": max_price, "parameters": {...}}.
+        The session gate is re-checked here, immediately before the frame is written: nothing is sent after the close."""
+        why = self._send_block_reason()
+        if why:
+            raise RuntimeError(f"BUY_GATE_CLOSED ({why}): buy not sent")
         return await self.client._send(
             {"buy": "1", "price": price, "parameters": self._contract_params(sym, cand, self.stake if stake is None else stake, duration)},
             timeout=timeout)
@@ -284,158 +318,220 @@ class BotEngine:
             return
         raise RuntimeError("Deriv WebSocket task ended unexpectedly")
 
-    # ── session lifecycle: connect lead -> warm-up -> open -> close -> drain -> hard disconnect ────────────
-    def _set_phase(self, phase: str) -> None:
-        """connecting / warming / ready (the dashboard turns it into CONNECTING / WARMING UP / SESSION x LIVE)."""
-        self._phase = phase
-        try:
-            import keep_alive
-            keep_alive.update_status(engine_phase=phase)
-        except Exception:
-            pass
-
-    def _check_ready(self) -> None:
-        """Ready = symbols warmed up AND the Deriv clock measured (the buy gate also needs the clock)."""
-        if self._ready or not self.symbols or self._phase == "connecting":
-            return
-        if not ws.clock_measured() or not getattr(self, "_symbols_ready", False):
-            return
-        self._ready = True
-        self._ready_at = ws.now()
-        self._set_phase("ready")
-        sess = self._sess
-        if sess is not None:
-            d = sess.open - self._ready_at
-            if d >= 0:
-                logger.info("ENGINE READY %.1fs before Session %s opens (%s)", d, sess.slot, ws.clock_status())
-            else:
-                logger.critical("ENGINE READY %.1fs AFTER Session %s opened - those seconds of the session were not tradable "
-                                "(raise WINDOW_PRECONNECT_SECONDS in config.py if this repeats)", -d, sess.slot)
-
-    async def _sleep_until(self, server_ts: float) -> None:
-        """Sleep until Deriv-server time `server_ts` (re-evaluated against the live clock offset, ms-precise)."""
+    # ── trade session: connected only for the session, exact open / exact close, then drain + disconnect ──
+    async def _sleep_until_server(self, target: float):
+        """Sleep until the SERVER clock reaches `target`, re-reading the clock each step (an offset refresh mid-wait is
+        honoured). Halving steps converge to the instant within a few milliseconds."""
         while True:
-            rem = server_ts - ws.now()
+            rem = target - window_scheduler.now()
             if rem <= 0:
                 return
-            await asyncio.sleep(rem if rem < 0.004 else (0.002 if rem < 0.05 else min(rem - 0.04, 1.0)))
+            await asyncio.sleep(rem / 2.0 if rem > 0.004 else rem)
 
-    async def _session_loop(self):
-        """The marker task of the session this engine serves: readiness check 2 s before the open, the OPEN line with the
-        clock offset/error, the CLOSE line, then the drain and the hard disconnect."""
-        sess = self._sess
-        assert sess is not None
+    def _log_session_open(self, name: str, open_ts: float) -> None:
+        info = window_scheduler.clock_info()
+        if info["measured"]:
+            logger.warning("SESSION %s OPEN at server %s UTC | clock offset %+.3fs, %d sample(s), est. error +-%.3fs",
+                           name, _utc(window_scheduler.now()), info["offset"], info["samples"], info["err"] or 0.0)
+        else:
+            logger.critical("SESSION %s OPEN at LOCAL %s UTC but NO Deriv server-clock sample was obtained: falling back "
+                            "to the local clock (offset 0). The gate was not opened early and the session is not skipped.",
+                            name, _utc(window_scheduler.now()))
+        self._window_seen = True
+
+    async def _window_watch_loop(self):
+        """Exact timing for this engine's ONE session: wait for the exact open instant (if it is still ahead), then sleep to
+        the exact close instant and end the session within a few milliseconds of it. (The gate itself is evaluated on
+        every decision and every send, so it flips at the exact instant whatever this loop's wake-up latency is.)"""
+        if not _cfg("TRADE_WINDOW_ENABLED", False):
+            return                                          # sessions off: trade all hours, never ends by itself
+        ws = window_scheduler
+        t = ws.now()
+        if ws.session_at(t) is None and ws.seconds_until_open(t) > ws._preconnect() + 5.0:
+            # this engine was started for a session that is already over (it connected too late): never sit
+            # connected through a gap
+            logger.warning("SESSION already over before this engine was ready: disconnecting")
+            await self._end_session()
+            return
+        while True:
+            t = ws.now()
+            sess = ws.session_at(t)
+            if sess is None:
+                name, open_ts, _ = ws.next_session(t)
+                await self._sleep_until_server(open_ts)
+                self._log_session_open(name, open_ts)
+                continue
+            if not self._window_seen:
+                self._log_session_open(sess[0], sess[1])
+            await self._sleep_until_server(sess[2])
+            if not ws.in_window(ws.now()):
+                break
+        await self._end_session()
+
+    async def _readiness_watch(self):
+        """Warm-up must be complete BEFORE the open instant: 2 s before it, say loudly what is still pending."""
+        ws = window_scheduler
+        t = ws.now()
+        if ws.session_at(t) is not None:
+            return                                          # already inside a session: nothing to pre-warn about
+        name, open_ts, _ = ws.next_session(t)
+        await self._sleep_until_server(open_ts - 2.0)
+        pending = self._pending_readiness()
+        if pending:
+            logger.critical("NOT READY 2 s BEFORE SESSION %s OPENS (%s UTC): pending = %s. The gate will NOT open early; "
+                            "trading starts when these clear.", name, _utc(open_ts), ", ".join(pending))
+        else:
+            logger.info("READY 2 s before session %s opens (%s UTC): connected, warmed up, resynced, clock measured",
+                        name, _utc(open_ts))
+
+    def _pending_readiness(self) -> List[str]:
+        p = []
+        if not self.client.is_connected:
+            p.append("connection")
+        if not self._money_ready:
+            p.append("money.start")
+        if not self._boot_done:
+            p.append("symbols warm-up")
+        elif self._needs_resync():
+            p.append("resync after reconnect")
+        if _cfg("TRADE_WINDOW_ENABLED", False) and not window_scheduler.clock_measured():
+            p.append("server-clock offset")
+        return p
+
+    def _drain_busy(self) -> bool:
+        """True while something bought before the close is still unsettled (subclasses add in-flight buys)."""
+        return bool(self._open)
+
+    def _on_session_end(self) -> None:
+        """Hook: called after the drain, before the stats flush and the disconnect (DonkeyEngine logs its report)."""
+        return
+
+    async def _end_session(self):
+        self._session_over = True                       # _blocked() is now True: no new proposals/buys
+        for t in list(self._stop_at_close):             # monitor / refit / watchdog / extras / clock: nothing but
+            t.cancel()                                  # settlement and the in-doubt reconciles talks to Deriv now
+        drain = float(_cfg("SESSION_DRAIN_SECONDS", 15))
+        logger.warning("TRADE SESSION CLOSED at server %s UTC: no new trades; draining %d open contract(s) (max %.0fs)",
+                       _utc(window_scheduler.now()), len(self._open), drain)
+        t0 = time.monotonic()
+        while self._drain_busy() and time.monotonic() - t0 < drain:
+            await asyncio.sleep(0.1)                    # ends as soon as nothing is open
+        if self._drain_busy():
+            logger.warning("drain cap reached after %.0fs: %d contract(s) left to settle on Deriv's side",
+                           time.monotonic() - t0, len(self._open))
         try:
-            if ws.now() < sess.open - 2.0:
-                await self._sleep_until(sess.open - 2.0)
-                self._check_ready()
-                if not self._ready:
-                    logger.critical("SESSION %s NOT READY 2 s BEFORE OPEN (phase=%s, clock measured=%s, symbols ready=%s): the gate will "
-                                    "NOT open early - buying starts only when the engine is ready", sess.slot, self._phase,
-                                    ws.clock_measured(), getattr(self, "_symbols_ready", False))
-            if ws.now() < sess.open:
-                await self._sleep_until(sess.open)
-            logger.warning("SESSION %s OPEN: offset %+.2fs, error \u00b1%.2fs | server time %s | ready=%s | gate=%s",
-                           sess.slot, ws.clock_offset(), ws.clock_error() if ws.clock_error() is not None else float("nan"),
-                           _fmt_ms(ws.now()), self._ready, self._gate_reason() or "OPEN")
-            await self._sleep_until(sess.close)
-            self._session_over = True                   # _blocked() is now True: no new proposals/buys
-            logger.warning("SESSION %s CLOSED: offset %+.2fs, error \u00b1%.2fs | server time %s | open contracts %d",
-                           sess.slot, ws.clock_offset(), ws.clock_error() if ws.clock_error() is not None else float("nan"),
-                           _fmt_ms(ws.now()), len(self._open))
-            await self._end_session(sess)
-        except asyncio.CancelledError:
-            raise
+            self._on_session_end()
         except Exception as exc:
-            logger.error("session loop error: %s", exc, exc_info=True)
-            raise
+            logger.warning("session end hook error: %s", exc)
+        try:
+            await asyncio.wait_for(self.stats.flush(force=True), timeout=5)
+        except Exception as exc:
+            logger.warning("session end: stats flush skipped: %s", exc)
+        try:
+            import keep_alive
+            keep_alive.update_status(session="IDLE - disconnected until next session",
+                                     open_contracts_count=len(self._open))
+        except Exception:
+            pass
+        await self.client.shutdown("trade session closed")      # also stops DerivClient's reconnect loop
+        for _ in range(50):                                     # the socket must really be down before we return
+            if not self.client.is_connected:
+                break
+            await asyncio.sleep(0.1)
+        logger.warning("SESSION ENDED: disconnected from Deriv (connected=%s, %d contract(s) left to settle on Deriv's side)",
+                       self.client.is_connected, len(self._open))
+        self._target_done.set()
 
-    async def _clock_sync_loop(self):
-        """Measure Deriv-server-minus-local clock to sub-second precision (clock_sync.py): a bisecting burst right after
-        connect, a second quiet-network burst shortly before the open, and one probe every CLOCK_REFRESH_SECONDS."""
-        est = self._clock
-        probe = lambda: clock_sync.probe_client(self.client)          # noqa: E731
-        max_probes = int(_cfg("CLOCK_BURST_MAX_PROBES", 10))
-        budget = float(_cfg("CLOCK_BURST_BUDGET_SECONDS", 12.0))
-        min_gap = float(_cfg("CLOCK_PROBE_MIN_GAP_SECONDS", 0.3))
-        refresh = float(_cfg("CLOCK_REFRESH_SECONDS", 30.0))
-        pre_open = float(_cfg("CLOCK_PRE_OPEN_BURST_SECONDS", 20.0))
-        pre_done = False
-        last_probe = 0.0
+    # ── server clock: burst of {"time":1} samples, lowest-RTT / interval intersection ──
+    # Deriv answers {"time":1} in WHOLE seconds, so one sample is only good to +-0.5 s. Samples spread over several
+    # seconds straddle several second-flips; intersecting their intervals (window_scheduler.estimate_offset) recovers
+    # the sub-second phase. Then a few probes are timed to land ON the predicted flip to bisect it further.
+    # The request counts are named so they can be tuned against Deriv's rate limits (not verified here).
+    CLOCK_BURST_SAMPLES = 10          # first burst, spaced CLOCK_BURST_SPACING apart
+    CLOCK_BURST_SPACING = 0.3
+    CLOCK_REFINE_PROBES = 6           # probes timed onto the predicted second-flip
+    CLOCK_REFRESH_SECONDS = 45.0      # a smaller burst every 30-60 s
+    CLOCK_REFRESH_SAMPLES = 5
+    CLOCK_REFRESH_PROBES = 3
+    CLOCK_MAX_ERROR = 1.0             # a result with a worse estimated error is not used
 
-        def publish(e, why: str) -> None:
-            if e is None:
-                return
-            if abs(e.offset) > float(_cfg("CLOCK_MAX_ABS_OFFSET_SECONDS", 120.0)):
-                logger.critical("CLOCK: offset %+.1fs between this machine and Deriv is absurd - ignored, buying stays blocked", e.offset)
-                return
-            prev = ws.clock_offset() if ws.clock_measured() else None
-            ws.set_clock_offset(e.offset, e.n_used, e.error, e.method)
-            if prev is None or abs(e.offset - prev) > 0.05 or why != "refresh":
-                logger.info("CLOCK %s: %s", why, e.describe())
-            if abs(e.offset) > float(_cfg("CLOCK_WARN_OFFSET_SECONDS", 1.5)):
-                logger.warning("CLOCK: this machine's clock differs from Deriv by %+.2fs - sessions are judged on Deriv's clock", -e.offset)
-            if e.error > float(_cfg("CLOCK_MAX_ERROR_FOR_OK", 0.25)):
-                logger.warning("CLOCK: estimate error \u00b1%.2fs is larger than %.2fs (%s)", e.error,
-                               float(_cfg("CLOCK_MAX_ERROR_FOR_OK", 0.25)), e.method)
-            self._check_ready()
+    async def _time_sample(self):
+        t0 = time.time()
+        resp = await self.client._send({"time": 1}, timeout=3)
+        t1 = time.time()
+        return (t0, t1, float(resp["time"]))
 
-        while not self._session_over:
+    async def _measure_clock(self, burst: int, probes: int) -> bool:
+        ws = window_scheduler
+        samples: list = []
+        for _ in range(burst):
             try:
-                if self.client.is_connected:
-                    sess = self._sess
-                    till_open = (sess.open - ws.now()) if sess is not None else -1.0
-                    if last_probe == 0.0:
-                        e = await clock_sync.sync_burst(est, probe, max_probes=max_probes, budget=budget, min_gap=min_gap,
-                                                        is_open=lambda: self.client.is_connected and not self._session_over)
-                        publish(e, "initial burst")
-                        last_probe = time.time()
-                    elif not pre_done and 3.0 < till_open <= pre_open:
-                        pre_done = True
-                        e = await clock_sync.sync_burst(est, probe, max_probes=max_probes,
-                                                        budget=max(1.0, min(budget, till_open - 2.0)), min_gap=min_gap,
-                                                        is_open=lambda: self.client.is_connected and not self._session_over)
-                        publish(e, "pre-open burst")
-                        last_probe = time.time()
-                    elif time.time() - last_probe >= refresh and not (0.0 < till_open < 3.0):
-                        e = await clock_sync.single_probe(est, probe)
-                        publish(e, "refresh")
-                        last_probe = time.time()
+                samples.append(await self._time_sample())
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("clock sync failed: %s", exc)
-                last_probe = last_probe or time.time()
-            await asyncio.sleep(0.5)
+                logger.warning("CLOCK SYNC sample failed: %s", exc)
+            await asyncio.sleep(self.CLOCK_BURST_SPACING)
+        est = ws.estimate_offset(samples)
+        if est is None:
+            return False
+        if est[1] <= self.CLOCK_MAX_ERROR:
+            ws.set_clock_offset(est[0], est[1], len(samples))        # usable at once; refined below
+        for _ in range(probes):
+            off, err, _used = est
+            if err <= 0.02 or not samples:
+                break
+            rtt = min(b - a for a, b, _ in samples)
+            flip_k = int(time.time() + rtt / 2.0 + 0.02 + off - ws.SERVER_TIME_SHIFT) + 1   # next whole server second
+            land = flip_k + ws.SERVER_TIME_SHIFT - off                                        # local instant it flips
+            await asyncio.sleep(max(0.0, land - rtt / 2.0 - time.time()))
+            try:
+                samples.append(await self._time_sample())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("CLOCK SYNC probe failed: %s", exc)
+                break
+            new = ws.estimate_offset(samples)
+            if new is not None:
+                est = new
+        if est[1] > self.CLOCK_MAX_ERROR:
+            logger.warning("CLOCK SYNC: estimated error +-%.3fs is too large, not used", est[1])
+            return False
+        prev = ws.clock_offset() if ws.clock_measured() else None
+        if not ws.set_clock_offset(est[0], est[1], len(samples)):
+            return False
+        if prev is None or abs(est[0] - prev) > max(0.05, est[1]):
+            logger.info("CLOCK SYNC: Deriv server - local = %+.3fs (%d sample(s), est. error +-%.3fs)%s", est[0], len(samples),
+                        est[1], "" if prev is None else f" [was {prev:+.3f}s]")
+        return True
 
-    def _pending_work(self) -> int:
-        """Things that still need the connection after the close (open contracts; DonkeyEngine adds in-doubt buys)."""
-        return len(self._open)
-
-    async def _end_session(self, sess: Optional[ws.Session] = None):
-        """Close reached: no new buys; wait for open contracts to settle, but never past the drain deadline
-        (close + SESSION_DRAIN_SECONDS), flush stats, then CLOSE THE WEBSOCKET."""
-        sess = sess or self._sess
-        self._session_over = True
-        deadline = sess.drain_end if sess is not None else ws.now() + float(_cfg("SESSION_DRAIN_SECONDS", 10))
-        logger.warning("SESSION DRAIN: no new trades; waiting up to %.1fs for %d open contract(s) to settle",
-                       max(0.0, deadline - ws.now()), self._pending_work())
+    async def _clock_sync(self):
+        """Measure right after the connection is authorised (while the symbols warm up), then refresh every ~45 s
+        (never within 4 s of an open/close edge)."""
+        ws = window_scheduler
+        first = True
         try:
-            import keep_alive
-            keep_alive.update_status(open_contracts_count=len(self._open))
-        except Exception:
-            pass
-        while self._pending_work() and ws.now() < deadline - 0.25:
-            await asyncio.sleep(0.2)
-        try:
-            await asyncio.wait_for(self.stats.flush(force=True), timeout=2)
-        except Exception as exc:
-            logger.warning("session end: stats flush skipped: %s", exc)
-        left = self._pending_work()
-        await self.client.shutdown("session closed")
-        logger.warning("SESSION ENDED: disconnected from Deriv at server time %s (%d contract(s)/buy(s) left to settle on Deriv's side)",
-                       _fmt_ms(ws.now()), left)
-        self._target_done.set()
+            while True:
+                if not self.client.is_connected:
+                    await asyncio.sleep(1.0)
+                    continue
+                if not first:
+                    t = ws.now()
+                    cur = ws.session_at(t)
+                    edge = (cur[2] if cur else ws.next_session(t)[1]) - t
+                    if edge < 4.0:
+                        await asyncio.sleep(0.5)
+                        continue
+                ok = await self._measure_clock(self.CLOCK_BURST_SAMPLES if first else self.CLOCK_REFRESH_SAMPLES,
+                                               self.CLOCK_REFINE_PROBES if first else self.CLOCK_REFRESH_PROBES)
+                if ok:
+                    first = False
+                await asyncio.sleep(self.CLOCK_REFRESH_SECONDS if ok else 2.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                            # never let the clock task crash the engine
+            logger.error("clock sync stopped: %s", exc, exc_info=True)
 
     # ── balance target ───────────────────────────────────────────────────────
     def _on_balance(self, bal: float):
@@ -617,6 +713,7 @@ class BotEngine:
             pass
 
     async def _settle_loop(self):
+        """Straggler polling: contracts whose settlement message never arrived are asked for directly."""
         while True:
             await asyncio.sleep(2)
             now = time.time()
@@ -640,7 +737,7 @@ class BotEngine:
             try:
                 import keep_alive
                 keep_alive.update_status(
-                    balance=round(self.client.balance, 2),
+                    balance=round(self.client.balance, 2), session="DONKEY",
                     current_symbol=",".join(self.symbols), last_signal=self._last_decision,
                     armed_pairs=self._armed_count(),
                     open_contracts_count=len(self._open),
