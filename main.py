@@ -1,26 +1,28 @@
 """
 main.py – entry point (Render web service).
 
-  • Main thread   : Flask (dashboard + /health) – always running.
-  • bot-engine    : one trading engine PER SESSION.  Two sessions every hour, every day, in UTC and on Deriv's server
-                    clock (window_scheduler.py / config.py):  Session A HH:06:00.000-HH:16:01.000, Session B
-                    HH:21:00.000-HH:29:01.000.  The thread connects at the connect lead before each open, trades,
-                    drains and hard-disconnects after the close; between sessions the bot is NOT connected to Deriv.
-  • redeploy      : redeploy_planner.py - ONE redeploy per hour, fired from the idle gap after Session B so that the
-                    new deploy is live just before the Session A connect lead.  No timer cycle, no other redeploys.
-  • keep-alive    : self-ping of /health (keeps the Render instance awake; talks only to this service).
-  • followers     : follower_manager.py, on the same two sessions.
+  • Main thread  : Flask (dashboard + /health) – always running.
+  • bot-engine   : thread that runs the Donkey strategy in TWO SESSIONS EVERY HOUR (config.TRADE_SESSIONS, UTC,
+                   judged on Deriv's server clock):  A HH:06:00.000-HH:16:01.000   B HH:21:00.000-HH:29:01.000.
+                   Outside a session (and outside the short pre-connect lead before an open) the bot is NOT
+                   connected to Deriv at all; every session gets a fresh engine in the same process.
+  • keep-alive   : self-ping of /health.
+  • redeploy     : exactly ONE per hour, fired in the idle gap after Session B so a fresh instance is up just before
+                   Session A (window_scheduler.redeploy_fire_ts: A open - pre-connect lead - REDEPLOY_LEAD_SECONDS).
+                   Never between A and B, never on a timer, never while a session is open, and never by an instance
+                   that has not run a session. The old rolling auto-redeploy cycle is gone.
+  • SESSION_WINDOW_ENABLED=0 : sessions off - trade all hours, no redeploy.
 
-Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (the hourly redeploy, TARGET_BALANCE suspend), optional
-DERIV_APP_ID, DERIV_ACCOUNT_MODE ("demo" default / "real" picks which account the token's OTP is minted for),
-DASHBOARD_PIN, PREDICTOR_SYMBOLS, ...
+Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (the hourly redeploy + stats persistence),
+optional DERIV_APP_ID, DERIV_ACCOUNT_MODE ("demo" default / "real" picks which
+account the token's OTP is minted for), DASHBOARD_PIN, PREDICTOR_SYMBOLS, ...
+(see CHANGES.md).
 
 Follower accounts (optional): DATABASE_URL, ADMIN_PASSWORD, ENCRYPTION_KEY - see render.yaml.
 """
 import asyncio
 import logging
 import os
-import signal
 import sys
 import threading
 import time
@@ -45,81 +47,117 @@ def _engine_class():
     return DonkeyEngine
 
 
-def decide_engine_start(phase: str, resume_mid_session: bool, held: bool) -> str:
-    """Pure decision used by the loop (and the tests): what to do inside a connection window that has no engine yet.
-       'start' | 'skip_mid_session' | 'skip_drain'."""
-    if phase == "DRAIN":
-        return "skip_drain"                      # the session is already closed: never open a connection for it
-    if phase == "LIVE" and (held or not resume_mid_session):
-        return "skip_mid_session"                # booted inside the session: wait for the next open
-    return "start"
+def _utc(ts: float) -> str:
+    return time.strftime("%H:%M:%S", time.gmtime(ts))
+
+
+def _countdown(sec: float) -> str:
+    m, s = divmod(int(max(0.0, sec)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+
+
+def _idle_until(ws, keep_alive, target_ts: float, label) -> None:
+    """Sleep (disconnected) until the SERVER clock reaches target_ts. Computed sleeps: it wakes ON the target second
+    (the last sleep is exactly the remainder), never up to 15 s late. label(rem) -> dashboard status text."""
+    while True:
+        rem = target_ts - ws.now()
+        if rem <= 0:
+            return
+        try:
+            keep_alive.update_status(session=label(rem))
+        except Exception:
+            pass
+        time.sleep(rem if rem <= 1.0 else min(rem - 0.5, 5.0))
 
 
 def _run_bot():
-    """One engine per session: connect at the connect lead, trade, drain, disconnect; idle (disconnected) otherwise."""
+    """Session loop. Idle (disconnected) -> connect lead -> one engine per session -> idle ... Once per hour, after
+    Session B, one redeploy is fired in the idle gap. If an engine ever exits or crashes inside its connect lead it is
+    started again; inside an already-open session it is NOT (config.TRADE_ALLOW_MID_SESSION_START=False)."""
     import target_guard
-    import keep_alive
-    import redeploy_guard
-    import window_scheduler as ws
     Engine = _engine_class()
-    handled = None                                   # `open` of the connection window this process is done with
-    logged_hold = None
+    import window_scheduler as ws
+    import keep_alive
+
+    if not config.TRADE_WINDOW_ENABLED:                  # SESSION_WINDOW_ENABLED=0: trade all hours, never redeploy
+        while True:
+            eng = Engine()
+            try:
+                asyncio.run(eng.run())
+            except Exception as exc:
+                logger.error(f"Bot crashed: {exc}", exc_info=True)
+            if target_guard.is_reached():
+                logger.warning("Balance target reached - bot stays stopped (no restart)")
+                return
+            logger.warning("Bot engine returned (sessions off); restarting in 5 s")
+            time.sleep(5)
+
+    redeploy_due = False        # a Session B has just ended in THIS process (it really ran a session)
+    fired_for = set()           # Session A open instants a redeploy was already requested for: never fires twice
+    retry = 0
     while True:
-        if target_guard.is_reached():
-            logger.warning("Balance target reached - bot stays stopped (no restart)")
-            return
-        err = ws.load_error()
-        if err:                                      # fail closed: no valid schedule, no connection, no trading
-            time.sleep(30)
+        now = ws.now()
+        if ws.in_window(now) and not config.TRADE_ALLOW_MID_SESSION_START:
+            # started / restarted while a session is already open: sit it out, trade from the next exact open
+            cur = ws.session_at(now)
+            logger.warning("Session %s is already open (boot or restart inside a session): NOT trading it "
+                           "(TRADE_ALLOW_MID_SESSION_START=False); waiting for the next session's open", cur[0])
+            nxt = ws.next_session(cur[2])
+            _idle_until(ws, keep_alive, ws.connect_at(now, skip_current=True),
+                        lambda rem, n=nxt: f"IDLE - disconnected, sitting out the open session; next session {n[0]} "
+                                           f"opens {_utc(n[1])} UTC, connecting in {_countdown(rem)}")
             continue
-        sess = ws.connection_session()
-        if sess is None or sess.open == handled:     # between sessions (or this window is finished): NOT connected
-            time.sleep(min(1.0, max(0.05, ws.next_connect_in() if sess is None else 0.5)))
+        if not ws.should_be_connected(now):              # outside the sessions: NOT connected to Deriv
+            nxt = ws.next_session(now)
+            connect_ts = nxt[1] - ws._preconnect()
+            if redeploy_due and nxt[0] == "A" and nxt[1] not in fired_for:
+                fire_ts = ws.redeploy_fire_ts(now)
+                fired_for.add(nxt[1])                    # one shot per Session A, whatever happens
+                redeploy_due = False
+                if fire_ts is not None:
+                    _idle_until(ws, keep_alive, fire_ts,
+                                lambda rem, n=nxt, f=fire_ts: f"IDLE - disconnected; hourly redeploy at {_utc(f)} UTC "
+                                                              f"(in {_countdown(rem)}), session {n[0]} opens {_utc(n[1])} UTC")
+                    keep_alive.update_status(session="IDLE - hourly redeploy requested (build cache cleared)")
+                    if ws.redeploy_clear_cache():
+                        logger.warning("Hourly redeploy requested for Session A at %s UTC: staying idle (not connecting) "
+                                       "until the connect lead; Render replaces this instance", _utc(nxt[1]))
+                    else:
+                        logger.error("Hourly redeploy refused / not possible: keeping this instance, it reconnects "
+                                     "at the next connect lead")
+                    continue
+                logger.warning("Hourly redeploy moment already passed for Session A at %s UTC: not redeploying", _utc(nxt[1]))
+            _idle_until(ws, keep_alive, connect_ts,
+                        lambda rem, n=nxt: f"IDLE - disconnected, session {n[0]} opens {_utc(n[1])} UTC, "
+                                           f"connecting in {_countdown(rem)}")
             continue
-        if redeploy_guard.hold_connect():            # a fresh deploy is replacing this instance: only ONE may trade
-            if logged_hold != sess.open:
-                logged_hold = sess.open
-                logger.warning("SESSION %s: NOT connecting - %s", sess.slot, redeploy_guard.snapshot().get("hold_reason"))
-            time.sleep(1.0)
-            continue
-        phase = ws.phase()["phase"]
-        held = ws.note_engine_start()                # a start inside an open session is held when RESUME_... is False
-        action = decide_engine_start(phase, bool(config.RESUME_TRADING_MID_SESSION_AFTER_BOOT), held is not None)
-        if action != "start":
-            logger.warning("SESSION %s: engine not started (%s) - next connect at the next session's lead", sess.slot, action)
-            handled = sess.open
-            continue
+        sess = ws.session_at(now) or ws.next_session(now)
+        keep_alive.update_status(session=f"CONNECTING - session {sess[0]} opens {_utc(sess[1])} UTC")
+        redeploy_due = False
         eng = Engine()
-        started = time.time()
-        keep_alive.update_status(engine_alive=True, running=True, engine_phase="connecting")
         try:
             asyncio.run(eng.run())
         except Exception as exc:
             logger.error(f"Bot crashed: {exc}", exc_info=True)
-        finally:
-            keep_alive.update_status(engine_alive=False, running=False, engine_phase="")
         if target_guard.is_reached():
             logger.warning("Balance target reached - bot stays stopped (no restart)")
             return
+        try:                                             # the engine's own shutdown must have finished: nothing stays open
+            if eng.client.is_connected:
+                logger.error("Deriv connection still open after the engine returned")
+        except Exception:
+            pass
         if getattr(eng, "_session_over", False):
-            logger.warning("SESSION %s finished after %.0fs - disconnected, idle until the next connect lead", sess.slot,
-                           time.time() - started)
-            handled = sess.open
+            retry = 0
+            if getattr(eng, "_window_seen", False):
+                logger.warning("Session %s finished: disconnected, idling until the next connect lead", sess[0])
+                redeploy_due = (sess[0] == "B")          # only an instance that really ran Session B redeploys
+            time.sleep(0.5)
             continue
-        logger.warning("Bot engine returned before its session ended (after %.0fs); a crash restart inside an open session "
-                       "waits for the next open (RESUME_TRADING_MID_SESSION_AFTER_BOOT=False)", time.time() - started)
-        time.sleep(5)
-
-
-def _on_sigterm(signum, frame):
-    """Render stops the old instance after a deploy: flush what must be flushed and exit at once."""
-    logger.warning("SIGTERM - clean exit")
-    try:
-        import follower_manager
-        follower_manager.shutdown_blocking(8.0)
-    except Exception:
-        pass
-    raise SystemExit(0)
+        retry = min(retry + 1, 3)
+        logger.warning("Bot engine returned before session %s ended; checking the schedule again in %d s", sess[0], 5 * retry)
+        time.sleep(5 * retry)
 
 
 if __name__ == "__main__":
@@ -136,38 +174,27 @@ if __name__ == "__main__":
     logger.info(f"  Account mode : {config.DERIV_ACCOUNT_MODE}")
     logger.info("  Dry run      : %s" % ("ON (DONKEY_DRY_RUN=1) - buys are only logged as 'DONKEY WOULD BUY'" if config.DONKEY_DRY_RUN else "off"))
     import window_scheduler as _ws
-    _sched = _ws.schedule()
-    if _sched is None:
-        logger.critical("  Sessions     : SCHEDULE NOT LOADED (%s) - NO CONNECTION AND NO TRADING", _ws.load_error())
+
+    def _hms(sec):
+        return "%02d:%02d" % (int(sec) // 60, int(sec) % 60)
+    if config.TRADE_WINDOW_ENABLED:
+        logger.info("  Trade sessions: " + " | ".join(f"{n} HH:{_hms(o)}-HH:{_hms(c)}" for n, o, c in config.TRADE_SESSIONS)
+                    + " every hour (UTC, Deriv server clock; open <= t < close); disconnected from Deriv in between "
+                      f"(connect lead {_ws._preconnect():.0f}s before each open)")
+        logger.info("  Redeploy     : ONE per hour, fired in the idle gap after Session B, %.0f s before Session A's connect "
+                    "lead (%.0f s before its open); never between A and B. Needs RENDER_API_KEY."
+                    % (config.REDEPLOY_LEAD_SECONDS, config.REDEPLOY_LEAD_SECONDS + _ws._preconnect()))
+        logger.info("  Mid-session boot: %s" % ("trades the open session" if config.TRADE_ALLOW_MID_SESSION_START
+                                                 else "sits it out, trades from the next exact open"))
     else:
-        for _line in _ws.describe_sessions():
-            logger.info("  %s", _line)
-        logger.info("  Sessions     : every hour, every day, UTC, judged on Deriv's server clock; disconnected between sessions; "
-                    "boot inside a session %s", "TRADES the rest of it" if config.RESUME_TRADING_MID_SESSION_AFTER_BOOT
-                    else "waits for the next open")
-    if config.IGNORED_LEGACY_ENV:
-        logger.warning("IGNORED legacy environment variable(s) still set on Render: %s - they no longer do anything "
-                       "(the schedule is fixed in config.py; the periodic redeploy is gone). Delete them in the Render dashboard.",
-                       ", ".join(config.IGNORED_LEGACY_ENV))
+        logger.info("  Trade sessions: OFF (SESSION_WINDOW_ENABLED=0) - trading all hours, connected all hours")
+        logger.info("  Redeploy     : OFF (sessions are off)")
     if not (os.environ.get("PREDICTOR_STAKE") or "").strip():
         logger.warning("PREDICTOR_STAKE is not set on Render - using the default minimum stake %s", config.PREDICTOR_STAKE)
-    if config.PRE_A_REDEPLOY_ENABLED:
-        logger.info("  Redeploy     : ONE per hour from the idle gap after Session B, fired (expected deploy duration + margin) "
-                    "before the Session A connect lead; default expected duration %ss; no cycle timer",
-                    config.REDEPLOY_DEFAULT_DURATION_SECONDS)
-    else:
-        logger.info("  Redeploy     : OFF (PRE_A_REDEPLOY_ENABLED=0 in config.py)")
     import target_guard as _tg
     logger.info(f"  Balance target: {_tg.target() if _tg.target() else 'OFF (TARGET_BALANCE not set)'}")
     logger.info(f"  Port         : {config.PORT}")
 
-    try:
-        import kill_switch
-        kill_switch.load_persisted()
-    except Exception as exc:
-        logger.error("kill switch state not loaded: %s", exc)
-
-    signal.signal(signal.SIGTERM, _on_sigterm)
     start_keep_alive()
 
     # Follower accounts: own thread + own event loop + Flask Blueprint. Fully optional:
@@ -177,13 +204,15 @@ if __name__ == "__main__":
         import follower_web
         follower_web.register(app)
         follower_manager.start()
+
+        def _on_sigterm(signum, frame):
+            logger.warning("SIGTERM - flushing follower DB buffers")
+            follower_manager.shutdown_blocking(8.0)
+            raise SystemExit(0)
+        import signal
+        signal.signal(signal.SIGTERM, _on_sigterm)
     except Exception as exc:
         logger.error(f"Follower system not started: {exc}", exc_info=True)
     threading.Thread(target=_run_bot, name="bot-engine", daemon=True).start()
     logger.info("Bot engine thread started ✓")
-    try:
-        import redeploy_planner
-        redeploy_planner.start()                         # Render API only; never touches Deriv
-    except Exception as exc:
-        logger.error("redeploy planner not started: %s", exc, exc_info=True)
     app.run(host="0.0.0.0", port=config.PORT, use_reloader=False, threaded=True)
