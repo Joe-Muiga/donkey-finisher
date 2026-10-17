@@ -5,20 +5,14 @@
 # Optional (all have defaults, see CHANGES.md):
 #   DERIV_ACCOUNT_MODE (demo|real), DASHBOARD_PIN, PREDICTOR_SYMBOLS (default: the 13 Donkey symbols R_10..R_100 + 1HZ10V..1HZ250V),
 #   PREDICTOR_STAKE (1000), MIN_PAYOUT_RATIO (1.8) ...
-#   STALE_TICK_SECONDS (30), STATS_PERSIST_TO_RENDER (0)
-#
-# ── Trading schedule (fixed in config.py - NO environment variable can change it) ─────────────────────
-#   Two sessions EVERY hour, EVERY day, UTC, judged on Deriv's SERVER clock (open inclusive, close exclusive):
-#       Session A  HH:06:00.000 - HH:16:01.000        Session B  HH:21:00.000 - HH:29:01.000
-#   The bot connects WINDOW_PRECONNECT_SECONDS (config.py, 90) before each open, trades, drains for at most
-#   SESSION_DRAIN_SECONDS (10) after the close and then DISCONNECTS. Between sessions nothing talks to Deriv.
-#   ONE self-redeploy per hour (needs RENDER_API_KEY): fired from the idle gap after Session B, timed to go live
-#   just before the Session A connect lead (config.py "PRE-SESSION-A REDEPLOY"; PRE_A_REDEPLOY_ENABLED=0 turns it off).
-#   RETIRED env vars (ignored; delete them on Render): REDEPLOY_INTERVAL_SECONDS, AUTO_REDEPLOY, AUTO_REDEPLOY_SECONDS,
-#   SESSION_WINDOW_ENABLED, SCHEDULE_FILE, SCHEDULE_TIERS, KEEP_OPEN_GAP_SECONDS, REDEPLOY_MIN_GAP_SECONDS,
-#   WINDOW_PRECONNECT_SECONDS, SESSION_DRAIN_SECONDS, WINDOW_REDEPLOY_CLEAR_CACHE, REDEPLOY_DRAIN*.
-#   CAUTION: changing ANY env var on Render (including KILL_SWITCH written by the dashboard when no DATABASE_URL is set)
-#   makes Render restart/redeploy the service at that moment. With DATABASE_URL set the kill switch is stored in the database.
+#   SESSION_WINDOW_ENABLED (1 = on, default; 0 = off: trade all hours, stay connected, no hourly redeploy).
+#   TRADE WINDOW: connected to Deriv only minutes 29-36 of each hour (UTC). When the window closes the bot
+#     disconnects and redeploys itself with the build cache CLEARED (needs RENDER_API_KEY, required now),
+#     then idles until ~40 s before minute 29 (WINDOW_PRECONNECT_SECONDS, default 40). REDEPLOY_INTERVAL_SECONDS is ignored.
+#   SELF-REDEPLOY is ALWAYS ON: every AUTO_REDEPLOY_SECONDS (bottom of config.py; 1080 = 18 min), forever, and it
+#     turns the hourly trade window off. REDEPLOY_INTERVAL_SECONDS=0 (env) is the only off switch.
+#     Needs RENDER_API_KEY so the bot can trigger the redeploy.
+#   STALE_TICK_SECONDS (30), STATS_PERSIST_TO_RENDER (0), REDEPLOY_DRAIN (1)
 
 #   TARGET_BALANCE (unset/0 = OFF) - account balance you want. The moment Deriv's LIVE balance
 #     is >= this, the bot stops trading (open trades or not), closes the Deriv connection and
@@ -32,8 +26,8 @@
 #     ENCRYPTION_KEY  - Fernet key that encrypts follower tokens. Generate once with:
 #         python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 #   Optional (defaults in brackets):
-#     DEFAULT_ZONE_START (53), DEFAULT_ZONE_END (59)  - follower zone hypothesis (follower files are NOT changed in this
-#       release: the follower connections are also subject to the session gates in deriv_client.py, see the notes above)
+#     DEFAULT_ZONE_START (53), DEFAULT_ZONE_END (59)  - pre-registered HYPOTHESIS window, minutes of the
+#       hour, inclusive: starts 53:00.0, last opening 59:59.9. A test, not a claimed edge.
 #     ZONE_MIN_TRADES (150), ZONE_MAX_PER_HOUR (3), VERDICT_MIN_TRADES (300),
 #     FOLLOWER_LOCK_THRESHOLD (5.0)
 #   (the main account trades on its own; TARGET_BALANCE, if set, still stops it.)
@@ -59,6 +53,8 @@ services:
     envVars:
       - key: DERIV_API_TOKEN
         sync: false
+      - key: AUTO_REDEPLOY      # ignored: the 18-minute redeploy cycle (config.AUTO_REDEPLOY_SECONDS = 1080) is always on; REDEPLOY_INTERVAL_SECONDS=0 stops it
+        value: "1"
       - key: RENDER_API_KEY
         sync: false
       - key: PREDICTOR_STAKE      # MINIMUM stake for the main account AND the followers (money rules size up from it)
