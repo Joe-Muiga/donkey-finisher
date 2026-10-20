@@ -3,16 +3,16 @@
 # Required per service:
 #   DERIV_API_TOKEN  – Deriv API token (trade + read scope)
 # Optional (all have defaults, see CHANGES.md):
-#   DERIV_ACCOUNT_MODE (demo|real), DASHBOARD_PIN, PREDICTOR_SYMBOLS (default: the 13 Donkey symbols R_10..R_100 + 1HZ10V..1HZ250V),
+#   DERIV_ACCOUNT_MODE (demo|real), DASHBOARD_PIN, PREDICTOR_SYMBOLS (default R_100),
 #   PREDICTOR_STAKE (1000), MIN_PAYOUT_RATIO (1.8) ...
 #   SESSION_WINDOW_ENABLED (1 = on, default; 0 = off: trade all hours, stay connected, no hourly redeploy).
 #   TRADE WINDOW: connected to Deriv only minutes 29-36 of each hour (UTC). When the window closes the bot
 #     disconnects and redeploys itself with the build cache CLEARED (needs RENDER_API_KEY, required now),
 #     then idles until ~40 s before minute 29 (WINDOW_PRECONNECT_SECONDS, default 40). REDEPLOY_INTERVAL_SECONDS is ignored.
-#   SELF-REDEPLOY is ALWAYS ON: every AUTO_REDEPLOY_SECONDS (bottom of config.py; 1080 = 18 min), forever, and it
+#   SELF-REDEPLOY is ALWAYS ON: every AUTO_REDEPLOY_SECONDS (bottom of config.py; 420 = 7 min), forever, and it
 #     turns the hourly trade window off. REDEPLOY_INTERVAL_SECONDS=0 (env) is the only off switch.
 #     Needs RENDER_API_KEY so the bot can trigger the redeploy.
-#   STALE_TICK_SECONDS (30), STATS_PERSIST_TO_RENDER (0), REDEPLOY_DRAIN (1)
+#   STALE_TICK_SECONDS (30), REFIT_INTERVAL_SECONDS (300), STATS_PERSIST_TO_RENDER (0)
 
 #   TARGET_BALANCE (unset/0 = OFF) - account balance you want. The moment Deriv's LIVE balance
 #     is >= this, the bot stops trading (open trades or not), closes the Deriv connection and
@@ -33,12 +33,11 @@
 #   (the main account trades on its own; TARGET_BALANCE, if set, still stops it.)
 #   Demo/real is ONE global switch on the /followers page (typed confirmation), not an env var.
 
-# ── Donkey strategy env (all optional; defaults in config.py, 'DONKEY STRATEGY' block) ──────────────────
-#   DONKEY_DRY_RUN=1          # log 'DONKEY WOULD BUY' instead of buying (dry run on the live feed)
-#   DONKEY_THRESH_P1..P4      # window thresholds (0.71 / 0.61 / 0.61 / 0.71)
-#   DONKEY_TRIG_WINDOW|POINTER|FREQ|ARC|TREND|CANDLE|MOMENTUM = 0/1   # trigger family switches
-#   DONKEY_MAX_OPEN=0         # optional soft cap on open contracts (0 = unlimited)
-#   DONKEY_DEADLINE_RTT=p50|p95|ewma, DONKEY_BUY_TIMEOUT_SECONDS=3, DONKEY_API_CONCURRENCY=6
+# ── MH recommended env values (Phase 2; code defaults are unchanged, set these on Render to use them) ──
+#   MH_DEADLINE_RTT=p95   # deadline gate uses the 95th-percentile RTT: conservative against tail latency (EWMA until 20 samples)
+#   MH_HMAX_TRADE=2       # trade only horizons 1-2, the ones the log-loss gate proves best
+#   MH_BUY_TIMEOUT_SECONDS=3   # buy reply timeout; a timed-out buy is reconciled (late reply / portfolio / profit_table)
+#   MH_RANK_WINDOW_SECONDS=60  # use 60 to compare Phases 1-4 on the old per-minute basis (code default is 30)
 
 services:
   - type: web
@@ -53,7 +52,7 @@ services:
     envVars:
       - key: DERIV_API_TOKEN
         sync: false
-      - key: AUTO_REDEPLOY      # ignored: the 18-minute redeploy cycle (config.AUTO_REDEPLOY_SECONDS = 1080) is always on; REDEPLOY_INTERVAL_SECONDS=0 stops it
+      - key: AUTO_REDEPLOY      # ignored: the 7-minute redeploy cycle (config.AUTO_REDEPLOY_SECONDS = 420) is always on; REDEPLOY_INTERVAL_SECONDS=0 stops it
         value: "1"
       - key: RENDER_API_KEY
         sync: false
