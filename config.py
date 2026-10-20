@@ -183,8 +183,8 @@ def _parse_symbols(raw: str):
     return out or ["R_100"]
 
 
-_DONKEY_DEFAULT_SYMBOLS = "R_10,R_25,R_50,R_75,R_100,1HZ10V,1HZ25V,1HZ50V,1HZ75V,1HZ100V,1HZ150V,1HZ200V,1HZ250V"
-PREDICTOR_SYMBOLS = _parse_symbols(os.environ.get("PREDICTOR_SYMBOLS", _DONKEY_DEFAULT_SYMBOLS))
+PREDICTOR_SYMBOLS = _parse_symbols(os.environ.get("PREDICTOR_SYMBOLS", "ALL_SYMBOLS"))
+# signal_engine routes these symbols to predictor.py
 DIGIT_SYMBOLS = list(PREDICTOR_SYMBOLS)
 
 # ── STRATEGY ROUTING (signal_engine.py) ──────────────────────
@@ -1232,7 +1232,40 @@ MAX_BUY_PER_SECOND     = 3
 # ── RENDER ──────────────────────────────────────────────────
 RENDER_DEPLOY_HOOK_URL = os.environ.get(
     "RENDER_DEPLOY_HOOK_URL","")
+# REDEPLOY_EVERY_N_CYCLES previously = 8. With SETTLE_WAIT_SECS defaulting to
+# 15s (bot_engine._settle_loop), that was an 8*15=120s cycle-based redeploy —
+# fighting restart_scheduler.py's timer. Set high enough that it never fires
+# on its own; restart_scheduler.py's daily Kenya-midnight timer (see
+# REDEPLOY_TIMEZONE below) is the only authoritative redeploy trigger. Lower
+# this back down only if you deliberately want a SECOND, settle-count-based
+# redeploy path in addition to the daily timer.
+REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
+
+# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS, anchored to
+# 00:00 in this zone (Africa/Nairobi = EAT = UTC+3 year-round, no DST) —
+# so with the default of 6 that's 00:00 / 06:00 / 12:00 / 18:00 EAT (4
+# redeploys/day). Was a once-daily fixed 00:00 timer per Implementation
+# Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
+# _next_scheduled_fire().
+REDEPLOY_TIMEZONE = "Africa/Nairobi"
+# 0 (default) = scheduled self-redeploy DISABLED: the bot runs continuously and heals
+# itself in-process (reconnect, stale-tick watchdog, periodic refit). Set a positive
+# number of seconds only if you really want the old rolling redeploy back.
+REDEPLOY_INTERVAL_SECONDS = float(os.environ.get("REDEPLOY_INTERVAL_SECONDS", "0"))
+REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0   # legacy derived value; hours since
+                                      # that's the unit restart_scheduler.py
+                                      # expects (interval_secs = hours*3600).
+                                      # Was 13.7 min, before that 1h, 3h.
+
+# How long bot_engine.py's _settle_loop will wait, actively trying to
+# confirm-close every remaining open contract, once a redeploy has been
+# scheduled, before delaying the redeploy rather than wiping contract
+# bookkeeping (Fix G). Kept generous even at 4x/day — 30min of drain
+# headroom out of every 6h window is still cheap, and a redeploy that's
+# delayed a few minutes because a contract is still confirming its close
+# is far better than one that guesses.
+DRAIN_MAX_SECS = 1800
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
@@ -1609,31 +1642,14 @@ RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # PREDICTOR_SYMBOLS is defined next to DIGIT_SYMBOLS above.
-# Trade sessions: two per hour, every hour, every day, in SECONDS OF THE HOUR (UTC, judged on Deriv's
-# server clock). A session is open for  open <= t < close  (open instant inclusive, close instant exclusive).
-# Strict - not env vars, so a stale value on Render can never change them. Outside a session the bot is not
-# connected to Deriv (only the pre-connect lead before an open and the short drain after a close).
-#   Session A: HH:06:00.000 -> HH:16:01.000        Session B: HH:21:00.000 -> HH:29:01.000
-TRADE_SESSION_CLOSE_PLUS_SECONDS = 1                                    # the "+1 second" on every close; change here
-TRADE_SESSION_A_OPEN_SECONDS     = 6 * 60                               # 360  = HH:06:00
-TRADE_SESSION_A_CLOSE_SECONDS    = 16 * 60 + TRADE_SESSION_CLOSE_PLUS_SECONDS   # 961 = HH:16:01
-TRADE_SESSION_B_OPEN_SECONDS     = 21 * 60                              # 1260 = HH:21:00
-TRADE_SESSION_B_CLOSE_SECONDS    = 29 * 60 + TRADE_SESSION_CLOSE_PLUS_SECONDS   # 1741 = HH:29:01
-TRADE_SESSIONS = (("A", TRADE_SESSION_A_OPEN_SECONDS, TRADE_SESSION_A_CLOSE_SECONDS),
-                  ("B", TRADE_SESSION_B_OPEN_SECONDS, TRADE_SESSION_B_CLOSE_SECONDS))
-# SESSION_WINDOW_ENABLED (Render env var, default ON): 1 = trade only in the two sessions, disconnected the rest
-# of the hour, one redeploy per hour before Session A. 0 = sessions OFF: connected and trading all hours, no redeploy.
+# Trade window: the bot opens contracts ONLY while the clock (UTC) is between minute 29 and minute 36
+# of the hour, inclusive: 29:00.0 up to and including 36:59.9. Strict - not an env var, so a stale value
+# on Render can never widen it. Outside it nothing is bought (ticks keep feeding the predictor).
+# SESSION_WINDOW_ENABLED (Render env var, default ON): 1 = trade only minutes 29-36, disconnected + redeployed
+# (cache cleared) the rest of the hour. 0 = window OFF: connected and trading every minute, no hourly redeploy.
 TRADE_WINDOW_ENABLED      = os.environ.get("SESSION_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-# The one redeploy per hour is fired in the idle gap after Session B at
-#   next Session A open - pre-connect lead (window_scheduler._preconnect) - REDEPLOY_LEAD_SECONDS.
-# Expected Render deploy time (cache cleared) plus margin, tune from Render's deploy history.
-REDEPLOY_LEAD_SECONDS = 300
-# May a freshly booted or crash-restarted process start trading in the middle of an already-open session?
-# False = it waits for the next session's exact open.
-TRADE_ALLOW_MID_SESSION_START = False
-# Cap (seconds) on how long after a session closes the engine waits for already-bought contracts to settle
-# before it disconnects (the wait ends earlier as soon as nothing is open).
-SESSION_DRAIN_SECONDS = 15
+TRADE_WINDOW_START_MINUTE = 29
+TRADE_WINDOW_END_MINUTE   = 36
 PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
 # Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
@@ -1657,13 +1673,75 @@ PREDICTOR_ALPHA          = _env_f("PREDICTOR_ALPHA", 0.05)       # family-wise, 
 PREDICTOR_PAYOUT_FACTOR  = _env_f("PREDICTOR_PAYOUT_FACTOR", 0.975)  # fallback payout estimate only
 PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates priced per tick
 
+# ─── SET MODE: predict a set of next digits, buy the Over/Under that covers it ─────────────────────
+# (set_predictor.py + set_engine.py). ON by default; SET_MODE=0 runs the original single-contract engine.
+# It honours TRADE_WINDOW_* (29-36), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, sizes stakes with the money rules (PREDICTOR_STAKE = minimum; SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
+# and is DEMO-ONLY unless SET_ALLOW_REAL=1.
+SET_MODE               = os.environ.get("SET_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+SET_ALLOW_REAL         = os.environ.get("SET_ALLOW_REAL", "0").strip().lower() in ("1", "true", "yes", "on")
+SET_SIZE               = _env_i("SET_SIZE", 4)                    # digits predicted per tick
+SET_MAX_COVER_WIDTH    = _env_i("SET_MAX_COVER_WIDTH", 5)         # "clustered": cover wins on <= this many digits
+SET_CONTEXT_SIZES      = _env_tuple("SET_CONTEXT_SIZES", (1, 2, 3))
+SET_PRIOR_STRENGTH     = _env_f("SET_PRIOR_STRENGTH", 50.0)       # shrinkage toward uniform
+SET_BACKOFF_STRENGTH   = _env_f("SET_BACKOFF_STRENGTH", 30.0)     # shrinkage of a context toward its shorter one
+SET_MIN_SET_PROB       = _env_f("SET_MIN_SET_PROB", 0.0)          # optional: min P(next digit in set); 0 = off
+SET_MIN_SCORE          = _env_f("SET_MIN_SCORE", 0.0)             # optional: min (P(win) x payout/stake); 0 = off
+SET_STAKE              = _env_f("SET_STAKE", 1.0)                 # flat stake per contract (demo)
+SET_PRICE_TOP          = _env_i("SET_PRICE_TOP", 4)               # best symbols priced (in parallel) per scan
+SET_MAX_BUYS_PER_SCAN  = _env_i("SET_MAX_BUYS_PER_SCAN", 2)       # contracts bought (in parallel) per scan
+SET_MAX_OPEN           = _env_i("SET_MAX_OPEN", 6)                # max contracts open at once
+SET_COALESCE_SECONDS   = _env_f("SET_COALESCE_SECONDS", 0.05)     # wait so simultaneous ticks are ranked together
+SET_MIN_SCAN_GAP       = _env_f("SET_MIN_SCAN_GAP", 0.25)         # min seconds between scans (API rate limits)
+SET_SIGNAL_MAX_AGE_FRAC = _env_f("SET_SIGNAL_MAX_AGE_FRAC", 0.6)  # a signal dies after this fraction of a tick interval
+SET_REPORT_SECONDS     = _env_f("SET_REPORT_SECONDS", 300)        # accuracy/performance report period
+
+# ─── MH MODE: multi-horizon digit model (mh_predictor.py + mh_engine.py), ON by default ─────────────
+# MH_MODE=0 -> old behaviour (SET_MODE / original engine). Everything MH keeps lives in memory only.
 def _env_b(k, d):
     return os.environ.get(k, str(d)).strip().lower() in ("1", "true", "yes", "on")
 
 
+MH_MODE                = _env_b("MH_MODE", 1)
+MH_CLUSTER             = _env_b("MH_CLUSTER", 1)                  # 1 = SET-cluster contract choice inside MH; 0 = old MH edge logic
+MH_CLUSTER_WIDTHS      = _env_tuple("MH_CLUSTER_WIDTHS", (3, 4, 5))   # allowed cover widths (digits the cover wins on)
+MH_CLUSTER_PICK        = os.environ.get("MH_CLUSTER_PICK", "widest").strip().lower()   # widest = best win prob; tightest = best payout
+MH_MAX_OPEN            = _env_i("MH_MAX_OPEN", 0)                 # optional cap on open contracts; 0 = unlimited
+MH_MAX_PER_SCAN        = _env_i("MH_MAX_PER_SCAN", 0)             # optional cap on buys per scan; 0 = unlimited
+MH_MIN_PAYOUT_RATIO    = _env_f("MH_MIN_PAYOUT_RATIO", 1.9 if MH_CLUSTER else 2.0)   # real quote payout/stake floor
+MH_HISTORY_TICKS       = _env_i("MH_HISTORY_TICKS", 15000)        # ticks fetched per symbol at boot
+MH_BOOT_BUDGET_SECONDS = _env_f("MH_BOOT_BUDGET_SECONDS", 75)     # extra horizons are skipped past this
+MH_BOOT_CONCURRENCY    = _env_i("MH_BOOT_CONCURRENCY", 5)         # symbols initialised in parallel
+MH_HMAX_TRADE          = _env_i("MH_HMAX_TRADE", 4 if MH_CLUSTER else 5)               # trade horizons 1..N (paper-scored to 10)
+MH_DECAY               = _env_f("MH_DECAY", 0.998)                # per-observation decay of the models
+MH_GATE                = _env_i("MH_GATE", 1)                   # 0 = no log-loss gate: horizons trade even if not better than uniform
+MH_GATE_Z              = _env_f("MH_GATE_Z", 1.96)              # gate: lower CI bound of (ln10 - log-loss) must be > 0 at this z
+MH_MIN_EDGE            = _env_f("MH_MIN_EDGE", 0.0)               # admit if p_lb * payout/stake - 1 > this
+MH_MAX_PER_TARGET      = _env_i("MH_MAX_PER_TARGET", 4 if MH_CLUSTER else 2)           # contracts per (symbol, target tick)
+MH_DEADLINE_FRAC       = _env_f("MH_DEADLINE_FRAC", 0.85)         # buy must land within this fraction of a tick
+MH_API_CONCURRENCY     = _env_i("MH_API_CONCURRENCY", 6)          # simultaneous proposal/buy requests
+MH_PRICE_TOL           = _env_f("MH_PRICE_TOL", 0.02)             # max buy price = stake * (1 + tol)
+MH_BUY_TIMEOUT_SECONDS = _env_f("MH_BUY_TIMEOUT_SECONDS", 3.0)    # MH buy reply timeout; keep well below the tick gap / deadline
+MH_RECONCILE_WAIT_SECONDS  = _env_f("MH_RECONCILE_WAIT_SECONDS", 2.0)    # in-doubt buy: wait for the late reply this long
+MH_RECONCILE_RETRY_SECONDS = _env_f("MH_RECONCILE_RETRY_SECONDS", 3.0)   # in-doubt buy: retry the portfolio query after this
+MH_RECONCILE_SAFETY_SECONDS = _env_f("MH_RECONCILE_SAFETY_SECONDS", 30.0)  # unresolved buy: hold the reservation this much longer
+MH_RANK_KEY            = os.environ.get("MH_RANK_KEY", "mass").strip().lower()   # mass (raw top-cluster mass, old) | edge (calibrated lb*r-1)
+MH_RANK_MIN_EDGE       = _env_f("MH_RANK_MIN_EDGE", _env_f("MH_MIN_EDGE", 0.0))  # edge floor when MH_RANK_KEY=edge (replaces SET_MIN_SET_PROB)
+MH_RANK_WINDOW_SECONDS = _env_i("MH_RANK_WINDOW_SECONDS", 30)     # ranking window: 30 (:00/:30 UTC) or 60 (old per-minute behaviour)
+MH_WINDOW_TOP_N        = _env_i("MH_WINDOW_TOP_N", _env_i("MH_MINUTE_TOP_N", 1))   # contracts bought per window
+MH_RANK_MODE           = os.environ.get("MH_RANK_MODE", "snapshot").strip().lower()   # snapshot (old) | bar (rank closed window, buy at current state)
+MH_INPROC_REFIT_SECONDS = _env_f("MH_INPROC_REFIT_SECONDS", 0.0)   # 0 = off; else rebuild each symbol's models in the background this often
+MH_WILSON_Z            = _env_f("MH_WILSON_Z", 1.64)              # Wilson z of the calibrated lower bound (use this OR MH_MIN_EDGE, not both)
+MH_OOS_CHECK           = _env_b("MH_OOS_CHECK", 0)                # 0 = held-out check is logged only; 1 = enforce (bins must beat break-even out of sample)
+MH_OOS_MIN_N           = _env_i("MH_OOS_MIN_N", 30)               # min held-out samples in a bin for it to be admissible (enforce)
+MH_OOS_MARGIN          = _env_f("MH_OOS_MARGIN", 0.0)             # held-out Wilson lb must exceed break-even + margin (enforce)
+MH_MAX_QUOTE_AGE_SECONDS = _env_f("MH_MAX_QUOTE_AGE_SECONDS", 0.0)   # 0 = off; else refuse/refetch admission quotes older than this
+MH_ADOPT_ORPHANS_ON_BOOT = _env_b("MH_ADOPT_ORPHANS_ON_BOOT", 1)   # adopt open digit contracts found on Deriv at boot
+REDEPLOY_DRAIN         = _env_i("REDEPLOY_DRAIN", 0 if MH_MODE else 1)   # 0 = redeploy without waiting for open contracts
 PREDICTOR_STATS_FLUSH_SECONDS = _env_f("PREDICTOR_STATS_FLUSH_SECONDS", 30)
 MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
 WINDOW_MINUTES           = _env_i("WINDOW_MINUTES", 10)
+REDEPLOY_DRAIN_MAX_SECONDS = _env_f("REDEPLOY_DRAIN_MAX_SECONDS", 60)
+REDEPLOY_HALT_MAX_SECONDS  = _env_f("REDEPLOY_HALT_MAX_SECONDS", 600)
 
 # ─── Continuous-running / self-healing (replaces the rolling redeploy) ────────
 # Reconnect forever (0 = unlimited) with exponential backoff capped at 60 s.
@@ -1684,70 +1762,79 @@ TICK_HISTORY_PAGE_SIZE        = _env_i("TICK_HISTORY_PAGE_SIZE", 1000)
 # (it can restart the service). Only needed when self-redeploying; off otherwise.
 STATS_PERSIST_TO_RENDER       = os.environ.get(
     "STATS_PERSIST_TO_RENDER",
-    "0").strip().lower() in ("1", "true", "yes", "on")
+    "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
-# ─── DONKEY STRATEGY: Four-Pair Focus (donkey_pairs.py / donkey_triggers.py / donkey_engine.py) ─────
-# We buy the COMPLEMENT of each crowd setup: crowd Over 2 -> Under 3, Over 3 -> Under 4, Under 6 -> Over 5,
-# Under 7 -> Over 6. Every completed setup is traded (no guards, no suspensions); the only limiters are
-# Deriv's own limits (3.7), the money floor, TARGET_BALANCE and the dashboard kill switch.
-DONKEY_WIN_FAST            = _env_i("DONKEY_WIN_FAST", 20)
-DONKEY_WIN_MEDIUM          = _env_i("DONKEY_WIN_MEDIUM", 50)
-DONKEY_WIN_SLOW            = _env_i("DONKEY_WIN_SLOW", 200)
-DONKEY_SLOW_MARGIN         = _env_f("DONKEY_SLOW_MARGIN", 0.0)
-DONKEY_THRESH_P1           = _env_f("DONKEY_THRESH_P1", 0.71)
-DONKEY_THRESH_P2           = _env_f("DONKEY_THRESH_P2", 0.61)
-DONKEY_THRESH_P3           = _env_f("DONKEY_THRESH_P3", 0.61)
-DONKEY_THRESH_P4           = _env_f("DONKEY_THRESH_P4", 0.71)
-DONKEY_ANALYSIS_TICKS      = _env_i("DONKEY_ANALYSIS_TICKS", 120)
-DONKEY_FREQ_TRIGGER        = _env_f("DONKEY_FREQ_TRIGGER", 0.12)
-DONKEY_PARITY_MODE         = os.environ.get("DONKEY_PARITY_MODE", "green").strip().lower()   # green | any
-DONKEY_REARM_TICKS         = _env_i("DONKEY_REARM_TICKS", 20)
-DONKEY_P4_POINTER_DURATIONS = _env_tuple("DONKEY_P4_POINTER_DURATIONS", (1,))
-DONKEY_DURATION_TICKS      = _env_i("DONKEY_DURATION_TICKS", 1)
-DONKEY_BOOT_HOLD           = _env_b("DONKEY_BOOT_HOLD", 1)
-DONKEY_HISTORY_TICKS       = _env_i("DONKEY_HISTORY_TICKS", 1000)
-DONKEY_CANDLE_SECONDS      = _env_i("DONKEY_CANDLE_SECONDS", 60)
-DONKEY_CANDLE_SEED         = _env_i("DONKEY_CANDLE_SEED", 200)
-# price-trigger parameters (3.5)
-DONKEY_EMA_FAST            = _env_i("DONKEY_EMA_FAST", 20)
-DONKEY_EMA_SLOW            = _env_i("DONKEY_EMA_SLOW", 50)
-DONKEY_RULES_ZONE_MIN      = _env_f("DONKEY_RULES_ZONE_MIN", 0.61)     # P2 rules-based: zone 4-9 share in the analysis window
-DONKEY_DONCHIAN_PERIOD     = _env_i("DONKEY_DONCHIAN_PERIOD", 20)
-DONKEY_DONCHIAN_TOL        = _env_f("DONKEY_DONCHIAN_TOL", 0.0005)     # fraction of price
-DONKEY_DOJI_BODY_FRAC      = _env_f("DONKEY_DOJI_BODY_FRAC", 0.10)
-DONKEY_MA_MEET_FAST        = _env_i("DONKEY_MA_MEET_FAST", 9)
-DONKEY_MA_MEET_SLOW        = _env_i("DONKEY_MA_MEET_SLOW", 21)
-DONKEY_MA_MEET_LOOKBACK    = _env_i("DONKEY_MA_MEET_LOOKBACK", 2)
-DONKEY_SMI_K               = _env_i("DONKEY_SMI_K", 10)
-DONKEY_SMI_D               = _env_i("DONKEY_SMI_D", 3)
-DONKEY_SMI_SMOOTH          = _env_i("DONKEY_SMI_SMOOTH", 3)
-DONKEY_SMI_ZONE            = _env_f("DONKEY_SMI_ZONE", -40.0)
-DONKEY_MACD_FAST           = _env_i("DONKEY_MACD_FAST", 12)
-DONKEY_MACD_SLOW           = _env_i("DONKEY_MACD_SLOW", 26)
-DONKEY_MACD_SIGNAL         = _env_i("DONKEY_MACD_SIGNAL", 9)
-# trigger family switches
-DONKEY_TRIG_WINDOW         = _env_b("DONKEY_TRIG_WINDOW", 1)
-DONKEY_TRIG_POINTER        = _env_b("DONKEY_TRIG_POINTER", 1)
-DONKEY_TRIG_FREQ           = _env_b("DONKEY_TRIG_FREQ", 1)
-DONKEY_TRIG_ARC            = _env_b("DONKEY_TRIG_ARC", 1)
-DONKEY_TRIG_TREND          = _env_b("DONKEY_TRIG_TREND", 1)
-DONKEY_TRIG_CANDLE         = _env_b("DONKEY_TRIG_CANDLE", 1)
-DONKEY_TRIG_MOMENTUM       = _env_b("DONKEY_TRIG_MOMENTUM", 1)
-# execution
-DONKEY_DEADLINE_FRAC       = _env_f("DONKEY_DEADLINE_FRAC", 0.85)
-DONKEY_DEADLINE_RTT        = os.environ.get("DONKEY_DEADLINE_RTT", "p50").strip().lower()   # p50 | p95 | ewma
-DONKEY_PRICE_TOL           = _env_f("DONKEY_PRICE_TOL", 0.02)
-DONKEY_API_CONCURRENCY     = _env_i("DONKEY_API_CONCURRENCY", 6)
-DONKEY_LIMIT_COOLDOWN_SECONDS = _env_f("DONKEY_LIMIT_COOLDOWN_SECONDS", 5)
-DONKEY_MAX_OPEN            = _env_i("DONKEY_MAX_OPEN", 0)              # 0 = unlimited
-DONKEY_DRY_RUN             = _env_b("DONKEY_DRY_RUN", 0)
-DONKEY_GUARD_ENABLED       = _env_b("DONKEY_GUARD_ENABLED", 0)         # OWNER DECISION: no guards, no suspensions
-DONKEY_BUY_TIMEOUT_SECONDS = _env_f("DONKEY_BUY_TIMEOUT_SECONDS", 3.0)
-DONKEY_RECONCILE_WAIT_SECONDS   = _env_f("DONKEY_RECONCILE_WAIT_SECONDS", 2.0)
-DONKEY_RECONCILE_RETRY_SECONDS  = _env_f("DONKEY_RECONCILE_RETRY_SECONDS", 3.0)
-DONKEY_RECONCILE_SAFETY_SECONDS = _env_f("DONKEY_RECONCILE_SAFETY_SECONDS", 30.0)
-DONKEY_ADOPT_ORPHANS_ON_BOOT    = _env_b("DONKEY_ADOPT_ORPHANS_ON_BOOT", 1)
-DONKEY_BOOT_CONCURRENCY    = _env_i("DONKEY_BOOT_CONCURRENCY", 5)
-DONKEY_REPORT_SECONDS      = _env_f("DONKEY_REPORT_SECONDS", 300)
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  AUTO REDEPLOY  -  EASY-EDIT SECTION (keep this block at the very bottom of the file)
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  ALWAYS ON: the bot redeploys itself every AUTO_REDEPLOY_SECONDS (below), forever, in a never-ending
+#  cycle (the AUTO_REDEPLOY env var is no longer consulted). The only off switch is the Render env var
+#  REDEPLOY_INTERVAL_SECONDS=0. Needs RENDER_API_KEY set on Render.
+#
+#  A redeploy wipes the instance's local data - that is expected.
+#  While ON, the hourly trade window (minutes 29-36) is switched OFF, because the window scheduler
+#  runs its own redeploy cycle and the two would fight each other. Each cycle the bot stops opening
+#  trades, drains open contracts (max REDEPLOY_DRAIN_MAX_SECONDS), then fires the Render redeploy.
+#
+#  >>> CHANGE THE INTERVAL HERE (seconds). 420 = 7 minutes. <<<
+AUTO_REDEPLOY_SECONDS = 420
+# ────────────────────────────────────────────────────────────────────────────────────────────
+AUTO_REDEPLOY_ENABLED = True
 
+# Everything below applies the switch - no need to edit.
+REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
+# (The 7-minute cycle is always on; REDEPLOY_INTERVAL_SECONDS=0 in the Render env is the only way to stop it.)
+_ri_env = (os.environ.get("REDEPLOY_INTERVAL_SECONDS") or "").strip()
+if _ri_env:                               # an explicit env value always wins (0 = off)
+    try:
+        REDEPLOY_INTERVAL_SECONDS = float(_ri_env)
+    except ValueError:
+        pass
+REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0
+if REDEPLOY_INTERVAL_SECONDS > 0:
+    TRADE_WINDOW_ENABLED = False          # a timed redeploy replaces the hourly window
+STATS_PERSIST_TO_RENDER = os.environ.get(
+    "STATS_PERSIST_TO_RENDER",
+    "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
+
+if AUTO_REDEPLOY_ENABLED and "REDEPLOY_DRAIN" not in os.environ:
+    REDEPLOY_DRAIN = 1                    # the cycle must drain open contracts before redeploying (explicit env still wins)
+
+# ─── Redeploy cycle safety (restart_scheduler.py / redeploy_guard.py) ─────────────────────────────
+# Deploys are ALWAYS requested with clearCache="do_not_clear" (latest commit); nothing in this path clears the cache.
+REDEPLOY_BUY_BLOCK_SECONDS     = _env_f("REDEPLOY_BUY_BLOCK_SECONDS", 20)      # no new buys in the last N s before a redeploy
+REDEPLOY_HEALTH_TIMEOUT_SECONDS = _env_f("REDEPLOY_HEALTH_TIMEOUT_SECONDS", 180)  # new deploy must be live within this
+REDEPLOY_BACKOFF_BASE_SECONDS  = _env_f("REDEPLOY_BACKOFF_BASE_SECONDS", 60)   # after a failed deploy: base * 2^(fails-1)
+REDEPLOY_BACKOFF_MAX_SECONDS   = _env_f("REDEPLOY_BACKOFF_MAX_SECONDS", 1800)
+REDEPLOY_MIN_UPTIME_SECONDS    = _env_f("REDEPLOY_MIN_UPTIME_SECONDS", 120)    # never redeploy an instance younger than this
+
+# ─── TEST MODE: pre-registered, frozen experiment (exp_mode.py) ──────────────────────────────────
+# Primary test: all non-blocklisted symbols, h=1, OVER5 / UNDER4, fixed zone threshold, flat stake, demo only.
+# Everything below is part of the FROZEN CONFIG whose hash is logged at start and in every report.
+TEST_MODE             = _env_b("TEST_MODE", 0)                  # default OFF
+TEST_STAKE            = _env_f("TEST_STAKE", 1.0)               # one fixed flat stake
+TEST_ZONE_THRESHOLD   = _env_f("TEST_ZONE_THRESHOLD", 0.45)     # fire only if a zone's CALIBRATED total >= this (fixed in advance)
+TEST_MAX_OPEN         = _env_i("TEST_MAX_OPEN", 20)             # cap on open contracts (both arms)
+TEST_MAX_TRADES       = _env_i("TEST_MAX_TRADES", 4000)         # pre-set stopping rule (settled + open test-arm trades)
+TEST_APPLY_GATE       = _env_b("TEST_APPLY_GATE", 0)            # 1 = also require the per-symbol significance gate to fire
+TEST_GATE_Z           = _env_f("TEST_GATE_Z", 2.58)             # gate z in test mode (only used if TEST_APPLY_GATE=1)
+TEST_HONOUR_MUTE      = _env_b("TEST_HONOUR_MUTE", 1)           # breaker-muted symbols do not fire
+TEST_CONTROL          = _env_b("TEST_CONTROL", 1)               # control arm on
+TEST_CONTROL_MODE     = os.environ.get("TEST_CONTROL_MODE", "random").strip().lower()   # random | over | under
+TEST_CONTROL_SEED     = _env_i("TEST_CONTROL_SEED", 12345)
+TEST_VERDICT_MIN      = _env_i("TEST_VERDICT_MIN", 500)         # fewer signals -> "not enough data"
+TEST_SPRT             = _env_b("TEST_SPRT", 0)                  # sequential early stopping, OFF unless enabled
+TEST_SPRT_P1          = _env_f("TEST_SPRT_P1", 0.45)            # alternative hit rate (null = true base rate 0.40)
+TEST_SPRT_ALPHA       = _env_f("TEST_SPRT_ALPHA", 0.05)
+TEST_SPRT_BETA        = _env_f("TEST_SPRT_BETA", 0.20)
+TEST_RESCORE_HMAX     = _env_i("TEST_RESCORE_HMAX", 5)          # horizons stored per signal for re-scoring late trades
+TEST_EPOCH_DUP_MAX    = _env_f("TEST_EPOCH_DUP_MAX", 0.005)     # epoch-resolution flag: duplicate-epoch tick share
+TEST_DIAG_BLOCK       = _env_i("TEST_DIAG_BLOCK", 1000)         # digits per diagnostics block
+LEDGER_LOG_ALL_TICKS  = _env_b("LEDGER_LOG_ALL_TICKS", 1)       # 1 = every tick's prediction + outcome (large!); 0 = fired only
+LEDGER_PATH           = os.environ.get("LEDGER_PATH", "")       # SQLite file when DATABASE_URL is not set
+MH_MUTE_TTL_SECONDS   = _env_f("MH_MUTE_TTL_SECONDS", 0)        # 0 = a breaker mute never expires (restored from the ledger)
+MH_DEADLINE_RTT       = os.environ.get("MH_DEADLINE_RTT", "p50").strip().lower()   # rtt used by the deadline gate: p50 | p95 | ewma
+
+if TEST_MODE:
+    MH_MODE = True                        # test mode lives in the MH engine
