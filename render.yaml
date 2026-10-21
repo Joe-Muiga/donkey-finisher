@@ -2,17 +2,57 @@
 #
 # Required per service:
 #   DERIV_API_TOKEN  – Deriv API token (trade + read scope)
+#   RENDER_API_KEY   – Render API key. STILL REQUIRED: the single pre-Session-A redeploy (below) and the TARGET_BALANCE
+#                      suspend both call the Render API with it. Without it the redeploy is skipped (logged) and the
+#                      bot keeps running on the instance it has.
 # Optional (all have defaults, see CHANGES.md):
 #   DERIV_ACCOUNT_MODE (demo|real), DASHBOARD_PIN, PREDICTOR_SYMBOLS (default R_100),
 #   PREDICTOR_STAKE (1000), MIN_PAYOUT_RATIO (1.8) ...
-#   SESSION_WINDOW_ENABLED (1 = on, default; 0 = off: trade all hours, stay connected, no hourly redeploy).
-#   TRADE WINDOW: connected to Deriv only minutes 29-36 of each hour (UTC). When the window closes the bot
-#     disconnects and redeploys itself with the build cache CLEARED (needs RENDER_API_KEY, required now),
-#     then idles until ~40 s before minute 29 (WINDOW_PRECONNECT_SECONDS, default 40). REDEPLOY_INTERVAL_SECONDS is ignored.
-#   SELF-REDEPLOY is ALWAYS ON: every AUTO_REDEPLOY_SECONDS (bottom of config.py; 420 = 7 min), forever, and it
-#     turns the hourly trade window off. REDEPLOY_INTERVAL_SECONDS=0 (env) is the only off switch.
-#     Needs RENDER_API_KEY so the bot can trigger the redeploy.
 #   STALE_TICK_SECONDS (30), REFIT_INTERVAL_SECONDS (300), STATS_PERSIST_TO_RENDER (0)
+
+# ── TRADING SESSIONS: two per hour, every hour, every day (UTC, judged on DERIV'S SERVER clock) ──────────────
+#   One long-lived process. It trades in two sessions each hour and is connected to Deriv ONLY around them:
+#
+#     Session | buying open (inclusive) | buying closed (exclusive) | connected from (lead) | disconnected after (drain)
+#     A       | HH:06:00.000            | HH:16:01.000              | HH:04:00              | about HH:16:11
+#     B       | HH:21:00.000            | HH:29:01.000              | HH:19:00              | about HH:29:11
+#
+#   The session times are plain constants in config.py (SESSION_A_*/SESSION_B_*/SESSION_CLOSE_EXTRA_SECONDS), NOT env vars,
+#   so a stale value here can never widen a session. Between sessions (including the ~2 min 50 s between A and B) the bot has
+#   no websocket, no authorise/OTP, no polling and no background Deriv requests. Session B is reached by an in-process
+#   disconnect/reconnect, never a redeploy. Models refit in-process inside every lead except the first one after a fresh
+#   process start (that one runs the normal boot fit). A process that BOOTS inside a session waits for the next open
+#   (RESUME_TRADING_MID_SESSION_AFTER_BOOT=0 default).
+#   The old rolling auto-redeploy, the 29-36 minute window and every REDEPLOY_* / AUTO_REDEPLOY* / SESSION_WINDOW_ENABLED
+#   env var are GONE: if any is still set on this service it is ignored and one WARNING at boot lists it. Delete them.
+#
+#   Tunables (env vars, defaults in brackets; all live in config.py):
+#     WINDOW_PRECONNECT_SECONDS (120)  – the connect lead: how long before a session opens the bot connects. It must cover
+#         the boot/refit budget (MH_BOOT_BUDGET_SECONDS, 75), connect, history and the clock burst. Measure, then tune.
+#     SESSION_DRAIN_SECONDS (10)       – the only connected time after a close (settle stragglers, then disconnect).
+#     SESSION_BUY_CUTOFF_SECONDS (0)   – stop buying this long before the close.
+#     SESSION_CLOCK_SYNC_SAMPLES (10), SESSION_CLOCK_MIN_INTERVAL (0.25), SESSION_CLOCK_FLIP_SECONDS (4),
+#     SESSION_CLOCK_RESYNC_SECONDS (300) – Deriv server-clock sync (burst in every lead, light resync while connected).
+#     SESSION_SCHEDULE_ENABLED (1)     – dev override only. 0 disables the schedule (always connected, always buying) and is
+#         logged CRITICAL at boot. Leave it unset on Render.
+#
+# ── THE SINGLE PRE-SESSION-A REDEPLOY ────────────────────────────────────────────────────────────────────────
+#   Exactly ONE redeploy per hour. The running instance fires it while it is idle in the long gap after Session B
+#   (about HH:29:11 to HH:04:00, ~35 min), timed so the new instance is up just BEFORE the Session A connect lead:
+#       fire time = (next HH:04:00) - (expected deploy duration + safety margin)
+#   With the defaults that is about HH:57:00 (180 s + 240 s = 7 min before HH:04:00); the expected duration becomes the
+#   rolling P95 of recent Render deploy durations once at least 3 are known. NEVER between A and B, never inside a session or
+#   a drain, never anywhere else. If it does not fit in the gap, preflight refuses (a failed / still-building deploy, /health
+#   not ok, backoff active), the kill switch is on or the target balance is reached, that hour is skipped with a WARNING and
+#   shown on the dashboard; nothing is retried after the connect lead. The request is always {"clearCache": "do_not_clear"}.
+#   While a fired deploy is replacing the old instance, the old instance holds its connect lead.
+#     PRE_A_REDEPLOY_ENABLED (1)                      – 0 = never redeploy (the bot just keeps running)
+#     PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS (180)   – expected deploy time until Render deploy history exists
+#     PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS (240)      – extra time added before the connect lead
+#     PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS (15)  – earliest fire = Session B drain end + this
+#     PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS (180)     – a deploy still not live this long after expected = stalled
+#     PRE_A_REDEPLOY_BACKOFF_BASE_SECONDS (60), PRE_A_REDEPLOY_BACKOFF_MAX_SECONDS (1800) – backoff after a failed deploy
+#   Deploy durations are read from Render (GET /v1/services/{id}/deploys), not stored in an env var.
 
 #   TARGET_BALANCE (unset/0 = OFF) - account balance you want. The moment Deriv's LIVE balance
 #     is >= this, the bot stops trading (open trades or not), closes the Deriv connection and
@@ -37,7 +77,7 @@
 #   MH_DEADLINE_RTT=p95   # deadline gate uses the 95th-percentile RTT: conservative against tail latency (EWMA until 20 samples)
 #   MH_HMAX_TRADE=2       # trade only horizons 1-2, the ones the log-loss gate proves best
 #   MH_BUY_TIMEOUT_SECONDS=3   # buy reply timeout; a timed-out buy is reconciled (late reply / portfolio / profit_table)
-#   MH_RANK_WINDOW_SECONDS=60  # use 60 to compare Phases 1-4 on the old per-minute basis (code default is 30)
+#   MH_RANK_WINDOW_SECONDS=60  # use 60 to compare Phases 1-4 on the old per-minute basis (code default is 15; allowed 15, 30, 60)
 
 services:
   - type: web
@@ -52,9 +92,7 @@ services:
     envVars:
       - key: DERIV_API_TOKEN
         sync: false
-      - key: AUTO_REDEPLOY      # ignored: the 7-minute redeploy cycle (config.AUTO_REDEPLOY_SECONDS = 420) is always on; REDEPLOY_INTERVAL_SECONDS=0 stops it
-        value: "1"
-      - key: RENDER_API_KEY
+      - key: RENDER_API_KEY       # still required: the single pre-Session-A redeploy and the TARGET_BALANCE suspend use it
         sync: false
       - key: PREDICTOR_STAKE      # MINIMUM stake for the main account AND the followers (money rules size up from it)
         sync: false
