@@ -1,82 +1,330 @@
 """
-window_scheduler.py - the hourly session clock.
+window_scheduler.py - the two-sessions-per-hour clock (pure functions: no network, no Render calls, no sleeping).
 
-  * The bot is connected to Deriv ONLY from WINDOW_PRECONNECT_SECONDS before minute START of every
-    hour until the end of minute END (config.TRADE_WINDOW_*, UTC).  Buying is gated to the exact
-    window by BotEngine; the pre-connect only gives the warm-up time to finish by START:00.
-  * When the window closes the engine drains open contracts, disconnects, and this module asks
-    Render for a redeploy WITH the build cache cleared (POST /v1/services/{id}/deploys
-    {"clearCache": "clear"}).  The fresh instance idles until the next window, connects, trades.
-  * A freshly booted instance never redeploys by itself: only an instance that actually ran a
-    session does, so there is no redeploy loop.
+  * Two sessions every hour, every day, UTC, judged on Deriv's SERVER clock (now() = local time + measured offset):
+        A  opens HH:06:00.000  closes HH:16:01.000        B  opens HH:21:00.000  closes HH:29:01.000
+    Open is inclusive, close is exclusive: a buy is allowed when  open <= t < close.  The "+1 s" is
+    config.SESSION_CLOSE_EXTRA_SECONDS.  Every session is its own session: no weekday logic, no JSON, no tiers,
+    no cluster / keep-open-through-the-gap logic.
+  * The bot is connected only from config.WINDOW_PRECONNECT_SECONDS (the connect lead) before a session opens until
+    config.SESSION_DRAIN_SECONDS after it closes, and is fully disconnected otherwise.
+  * Exactly one redeploy per hour may fire: in the long idle gap after Session B, timed to FINISH just before the
+    Session A connect lead.  This module only holds the (pure) math; the decision to fire lives in redeploy_guard.
+  * Fail closed: if the constants are inconsistent, schedule_ok() is False, should_be_connected() and
+    buy_allowed_at() are False and no redeploy is allowed.  (Callers must check schedule_ok() before calling
+    upcoming_session(), which raises RuntimeError on an inconsistent schedule.)
+  * With config.SESSION_SCHEDULE_ENABLED off (dev override): phase() is always "OPEN", buy_allowed_at() is True,
+    should_be_connected() is True, redeploy_allowed() is False.
 
-Needs RENDER_API_KEY (RENDER_SERVICE_ID is injected by Render).  A deploy hook URL cannot clear the
-cache, so it is not used here.
+All schedule constants are read from `config` on every call (nothing is cached), so tests can patch them.
 """
 import logging
-import os
+import math
 import time
-from typing import Optional
-
-import requests
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import config
-import render_api
 
 logger = logging.getLogger("window")
 
+_HOUR = 3600.0
+# Stand-in for "no end" when SESSION_SCHEDULE_ENABLED is off (2100-01-01 UTC; finite so it survives JSON).
+_FAR_FUTURE = 4102444800.0
 
-def _preconnect() -> float:
+
+class SessionClosed(RuntimeError):
+    """Raised by deriv_client when a buy would be sent at/after the session close. Means 'definitely not sent'."""
+
+
+@dataclass(frozen=True)
+class Session:
+    name: str
+    open_ts: float
+    close_ts: float
+    connect_ts: float          # open_ts - WINDOW_PRECONNECT_SECONDS
+
+    @property
+    def drain_end_ts(self) -> float:
+        return self.close_ts + float(config.SESSION_DRAIN_SECONDS)
+
+
+@dataclass(frozen=True)
+class RedeployPlan:
+    connect_ts: float          # next Session A connect lead
+    earliest_ts: float         # previous B drain_end_ts + PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS
+    fire_ts: float             # connect_ts - (expected_s + margin_s)
+    fits: bool                 # fire_ts >= earliest_ts
+    available_s: float         # connect_ts - earliest_ts
+
+
+# ── clock (server-time offset, NTP-style) ────────────────────────────────────────────────────────────
+# One tuple, replaced atomically, so a reader on another thread never sees a half-updated state.
+_clock = (0.0, 0.0, False)     # (offset, error, measured_this_session)
+
+
+def set_clock_offset(offset: float, error: float = 0.0) -> None:
+    """Record the measured Deriv-minus-local offset (seconds) and its +/- error. Marks 'measured this session'.
+    A non-finite offset is refused (logged), the previous offset is kept and the clock stays 'not measured'."""
+    global _clock
     try:
-        return max(0.0, float((os.environ.get("WINDOW_PRECONNECT_SECONDS") or "40").strip()))
-    except ValueError:
-        return 40.0
+        off, err = float(offset), abs(float(error))
+    except (TypeError, ValueError):
+        logger.error("CLOCK: offset %r / error %r are not numbers - ignored", offset, error)
+        return
+    if not (math.isfinite(off) and math.isfinite(err)):
+        logger.error("CLOCK: non-finite offset %r / error %r - ignored", offset, error)
+        return
+    _clock = (off, err, True)
 
 
-def _minute(ts: float) -> float:
-    return (ts % 3600) / 60.0
+def get_clock_offset() -> float:
+    return _clock[0]
 
 
-def in_window(ts: float) -> bool:
-    if not config.TRADE_WINDOW_ENABLED:              # SESSION_WINDOW_ENABLED=0: always "inside"
+def get_clock_error() -> float:
+    """Estimated +/- seconds of the current offset."""
+    return _clock[1]
+
+
+def reset_clock_measured() -> None:
+    """Called at the start of each lead: the offset is kept, but clock_measured() is False until the next sample."""
+    global _clock
+    off, err, _ = _clock
+    _clock = (off, err, False)
+
+
+def clock_measured() -> bool:
+    return _clock[2]
+
+
+def now() -> float:
+    """time.time() + offset. ALL schedule decisions use this."""
+    return time.time() + _clock[0]
+
+
+# ── constants and consistency ────────────────────────────────────────────────────────────────────────
+def _enabled() -> bool:
+    return bool(config.SESSION_SCHEDULE_ENABLED)
+
+
+def _ts(ts: Optional[float]) -> float:
+    return now() if ts is None else float(ts)
+
+
+def _read() -> Tuple[float, float, float, float, float, float, float]:
+    """(a_open, a_close, b_open, b_close, lead, drain, cutoff) in seconds-of-hour / seconds."""
+    extra = float(config.SESSION_CLOSE_EXTRA_SECONDS)
+    return (float(config.SESSION_A_OPEN_SECOND), float(config.SESSION_A_END_SECOND) + extra,
+            float(config.SESSION_B_OPEN_SECOND), float(config.SESSION_B_END_SECOND) + extra,
+            float(config.WINDOW_PRECONNECT_SECONDS), float(config.SESSION_DRAIN_SECONDS),
+            float(config.SESSION_BUY_CUTOFF_SECONDS))
+
+
+def _problem() -> str:
+    """'' if the constants are consistent, else why not."""
+    try:
+        a_open, a_close, b_open, b_close, lead, drain, cutoff = _read()
+    except (AttributeError, TypeError, ValueError) as exc:
+        return "constants unreadable: %s" % exc
+    if not all(math.isfinite(v) for v in (a_open, a_close, b_open, b_close, lead, drain, cutoff)):
+        return "a constant is not a finite number"
+    if lead < 0 or drain < 0 or cutoff < 0:
+        return "lead, drain and buy cutoff must be >= 0"
+    if not (0 <= a_open < a_close):
+        return "session A: need 0 <= open < close (open=%g close=%g)" % (a_open, a_close)
+    if not (b_open < b_close <= _HOUR):
+        return "session B: need open < close <= 3600 (open=%g close=%g)" % (b_open, b_close)
+    if cutoff >= min(a_close - a_open, b_close - b_open):
+        return "buy cutoff %g leaves no buyable time in a session" % cutoff
+    # consecutive sessions, cyclic: previous drain must end strictly before the next connect lead starts
+    if not (a_close + drain < b_open - lead):
+        return "A drain end %g is not before B connect %g (sessions overlap / lead too long)" % (
+            a_close + drain, b_open - lead)
+    if not (b_close + drain < _HOUR + a_open - lead):
+        return "B drain end %g is not before next A connect %g (sessions overlap / lead too long)" % (
+            b_close + drain, _HOUR + a_open - lead)
+    return ""
+
+
+_last_problem = ""
+
+
+def schedule_ok() -> bool:
+    """False (fail closed) if the schedule constants are inconsistent. Logs CRITICAL once per distinct problem."""
+    global _last_problem
+    problem = _problem()
+    if problem != _last_problem:
+        _last_problem = problem
+        if problem:
+            logger.critical("SESSION SCHEDULE INCONSISTENT - failing closed (no connect, no buys, no redeploy): %s", problem)
+        else:
+            logger.warning("SESSION SCHEDULE consistent again")
+    return not problem
+
+
+def _sessions_around(ts: float) -> List[Session]:
+    """Sessions of the previous, current and next hour, in time order. Only valid when schedule_ok()."""
+    if not math.isfinite(ts):
+        return []
+    a_open, a_close, b_open, b_close, lead, _drain, _cut = _read()
+    h = math.floor(ts / _HOUR)
+    out: List[Session] = []
+    for k in (h - 1, h, h + 1):
+        base = k * _HOUR
+        out.append(Session("A", base + a_open, base + a_close, base + a_open - lead))
+        out.append(Session("B", base + b_open, base + b_close, base + b_open - lead))
+    return out
+
+
+def _all_session() -> Session:
+    return Session("ALL", 0.0, _FAR_FUTURE, 0.0)
+
+
+# ── schedule ─────────────────────────────────────────────────────────────────────────────────────────
+def phase(ts: float = None) -> str:
+    """"IDLE" | "LEAD" | "OPEN" | "DRAIN". Always "OPEN" with the schedule disabled; "IDLE" if not schedule_ok()."""
+    if not _enabled():
+        return "OPEN"
+    ts = _ts(ts)
+    if not schedule_ok():
+        return "IDLE"
+    for s in _sessions_around(ts):
+        if s.open_ts <= ts < s.close_ts:
+            return "OPEN"
+        if s.close_ts <= ts < s.drain_end_ts:
+            return "DRAIN"
+        if s.connect_ts <= ts < s.open_ts:
+            return "LEAD"
+    return "IDLE"
+
+
+def current_session(ts: float = None) -> Optional[Session]:
+    """The session with open_ts <= ts < close_ts, else None (also None if not schedule_ok())."""
+    if not _enabled():
+        return _all_session()
+    ts = _ts(ts)
+    if not schedule_ok():
+        return None
+    for s in _sessions_around(ts):
+        if s.open_ts <= ts < s.close_ts:
+            return s
+    return None
+
+
+def upcoming_session(ts: float = None) -> Session:
+    """The earliest session with drain_end_ts > ts (so during a drain it is the draining session).
+    Raises RuntimeError if the schedule is inconsistent - check schedule_ok() first."""
+    if not _enabled():
+        return _all_session()
+    ts = _ts(ts)
+    if not schedule_ok():
+        raise RuntimeError("session schedule is inconsistent (see the CRITICAL log); no upcoming session")
+    for s in _sessions_around(ts):
+        if s.drain_end_ts > ts:
+            return s
+    raise RuntimeError("no upcoming session for ts=%r" % ts)       # non-finite ts
+
+
+def should_be_connected(ts: float = None) -> bool:
+    """True in LEAD / OPEN / DRAIN. False if not schedule_ok()."""
+    return phase(ts) != "IDLE"
+
+
+def buy_allowed_at(send_ts: float = None) -> bool:
+    """In a session AND open <= send_ts < close - SESSION_BUY_CUTOFF_SECONDS. False if not schedule_ok()."""
+    if not _enabled():
         return True
-    m = int(ts // 60) % 60
-    return config.TRADE_WINDOW_START_MINUTE <= m <= config.TRADE_WINDOW_END_MINUTE
-
-
-def should_be_connected(ts: float) -> bool:
-    """True from PRECONNECT seconds before the window opens until the window closes."""
-    if in_window(ts):
-        return True
-    return seconds_until_open(ts) <= _preconnect()
-
-
-def seconds_until_open(ts: float) -> float:
-    """Seconds until the next window opening (0 while inside the window)."""
-    if in_window(ts):
-        return 0.0
-    start = config.TRADE_WINDOW_START_MINUTE * 60
-    into_hour = ts % 3600
-    return (start - into_hour) % 3600
-
-
-def redeploy_clear_cache() -> bool:
-    """Blocking. Ask Render for a redeploy with the build cache cleared. True if accepted."""
-    if not render_api.api_configured():
-        logger.critical("REDEPLOY SKIPPED: RENDER_API_KEY / service id missing - cannot redeploy with a "
-                        "cleared build cache. The bot will simply reconnect at the next window.")
+    t = _ts(send_ts)
+    if not schedule_ok():
         return False
-    url = f"{render_api.API_BASE}/services/{render_api.service_id()}/deploys"
-    headers = {"Authorization": f"Bearer {render_api.api_key()}", "Accept": "application/json",
-               "Content-Type": "application/json"}
-    try:
-        # With the timed AUTO_REDEPLOY cycle on, nothing may clear the build cache (slow boots, lost uptime).
-        mode = "do_not_clear" if float(getattr(config, "REDEPLOY_INTERVAL_SECONDS", 0)) > 0 else "clear"
-        r = requests.post(url, headers=headers, json={"clearCache": mode}, timeout=20)
-        if r.status_code in (200, 201, 202):
-            logger.warning("REDEPLOY accepted by Render (clearCache=%s): HTTP %s", mode, r.status_code)
+    cutoff = float(config.SESSION_BUY_CUTOFF_SECONDS)
+    for s in _sessions_around(t):
+        if s.open_ts <= t < s.close_ts - cutoff:
             return True
-        logger.error("REDEPLOY refused by Render: HTTP %s %s", r.status_code, r.text[:200])
-    except Exception as exc:
-        logger.error("REDEPLOY request failed: %s", exc)
     return False
+
+
+def in_window(ts: float = None) -> bool:
+    return current_session(ts) is not None
+
+
+def seconds_until_connect(ts: float = None) -> float:
+    """0 while should_be_connected, else seconds until the next connect lead starts. inf if not schedule_ok()."""
+    if not _enabled():
+        return 0.0
+    ts = _ts(ts)
+    if not schedule_ok():
+        return math.inf
+    if should_be_connected(ts):
+        return 0.0
+    return max(0.0, upcoming_session(ts).connect_ts - ts)
+
+
+def seconds_until_open(ts: float = None) -> float:
+    """0 while inside a session, else seconds until the next session opens. inf if not schedule_ok()."""
+    if not _enabled():
+        return 0.0
+    ts = _ts(ts)
+    if not schedule_ok():
+        return math.inf
+    if current_session(ts) is not None:
+        return 0.0
+    nxt = [s.open_ts for s in _sessions_around(ts) if s.open_ts > ts]
+    return (min(nxt) - ts) if nxt else math.inf
+
+
+def seconds_until_close(ts: float = None) -> float:
+    """Seconds until the current session's close; 0 when not inside a session (or not schedule_ok())."""
+    ts = _ts(ts)
+    s = current_session(ts)
+    return max(0.0, s.close_ts - ts) if s is not None else 0.0
+
+
+def session_end(ts: float = None) -> Optional[float]:
+    """close_ts of the current session, or None when not inside one."""
+    s = current_session(ts)
+    return s.close_ts if s is not None else None
+
+
+def next_connect_in(ts: float = None) -> float:
+    """Same as seconds_until_connect (API name kept from the old module)."""
+    return seconds_until_connect(ts)
+
+
+# ── the single pre-A redeploy window (pure math; the decision to fire lives in redeploy_guard) ──────
+def _post_b_pair(ts: float) -> Optional[Tuple[Session, Session]]:
+    """(B, next A) when B.drain_end_ts <= ts < A.connect_ts, else None. None if disabled / not schedule_ok()."""
+    if not _enabled() or not schedule_ok():
+        return None
+    ss = _sessions_around(ts)
+    for prev, nxt in zip(ss, ss[1:]):
+        if prev.name == "B" and nxt.name == "A" and prev.drain_end_ts <= ts < nxt.connect_ts:
+            return prev, nxt
+    return None
+
+
+def in_post_b_gap(ts: float = None) -> bool:
+    """B.drain_end_ts <= ts < next A connect_ts (the only gap where the redeploy may fire)."""
+    return _post_b_pair(_ts(ts)) is not None
+
+
+def redeploy_plan(ts: float, expected_s: float, margin_s: float) -> Optional[RedeployPlan]:
+    """None unless in_post_b_gap(ts). fire_ts = connect_ts - (expected_s + margin_s); fits = fire_ts >= earliest_ts."""
+    ts = _ts(ts)
+    pair = _post_b_pair(ts)
+    if pair is None:
+        return None
+    b, a = pair
+    earliest = b.drain_end_ts + float(config.PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS)
+    fire = a.connect_ts - (float(expected_s) + float(margin_s))
+    return RedeployPlan(connect_ts=a.connect_ts, earliest_ts=earliest, fire_ts=fire,
+                        fits=bool(fire >= earliest), available_s=a.connect_ts - earliest)
+
+
+def redeploy_allowed(ts: float, expected_s: float, margin_s: float) -> bool:
+    """True ONLY if the plan exists (post-B gap) and fits and plan.fire_ts <= ts < plan.connect_ts.
+    Structurally impossible between A and B, inside a session, in a lead or in a drain."""
+    ts = _ts(ts)
+    plan = redeploy_plan(ts, expected_s, margin_s)
+    return bool(plan is not None and plan.fits and plan.fire_ts <= ts < plan.connect_ts)
