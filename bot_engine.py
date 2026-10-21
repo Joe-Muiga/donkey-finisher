@@ -735,3 +735,4 @@ class BotEngine:
                 keep_alive.set_active_trades(len(self._open))
             except Exception:
                 pass
+ 
