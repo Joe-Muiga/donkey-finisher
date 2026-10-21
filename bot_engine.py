@@ -1,16 +1,19 @@
 """
 bot_engine.py – lean engine: the walk-forward digit predictor is the ONLY strategy.
 
-Runs continuously (no scheduled redeploy). Self-healing is done in-process: the Deriv
-client reconnects forever with backoff, a watchdog re-subscribes / reconnects when a tick
-stream goes quiet, the predictor is re-synced after every reconnect and re-fitted
-periodically, and the whole engine is restarted by main.py if anything fatal escapes.
+One long-lived process, two exact-second sessions per hour (window_scheduler): connected to
+Deriv only from a short connect lead before a session until a bounded drain after it, fully
+disconnected in between. run() is the session loop (IDLE > CONNECTING > WARMING > LIVE > DRAINING).
+Self-healing inside a session is in-process: the Deriv client reconnects with backoff, a watchdog
+re-subscribes / reconnects when a tick stream goes quiet, the predictor is re-synced after every
+reconnect and re-fitted periodically, and the whole engine is restarted by main.py if anything
+fatal escapes.
 
 Replaces the old multi-strategy engine. There are no trading gates here: no kill
 switch, no loss/drawdown/streak limits, no cooldowns, no news filter, no early
 exits (digit contracts run to expiry). Only technical necessities remain:
-reconnect (deriv_client), auth, rate-limit backoff, error logging, and draining
-open contracts before the scheduled redeploy.
+reconnect (deriv_client), auth, rate-limit backoff, error logging, the session gate
+(window_scheduler.buy_allowed_at) and draining open contracts after a session closes.
 
 Per tick, per symbol:  rank() the tradable contexts -> live proposal (exact
 contract, flat stake) -> payout/stake >= MIN_PAYOUT_RATIO and p_lower > 1/ratio
@@ -27,9 +30,14 @@ import config
 import predictor as pred
 import main_money
 import predictor_stats
-import restart_scheduler
 import target_guard
+import window_scheduler as ws
 from deriv_client import DerivClient
+
+try:                                    # the single pre-A redeploy guard; a missing module never holds the connect
+    import redeploy_guard as _redeploy_guard
+except Exception:                       # pragma: no cover
+    _redeploy_guard = None
 
 try:                                    # follower system is optional; the main account never depends on it
     import db as _follower_db
@@ -45,6 +53,25 @@ logger = logging.getLogger(__name__)
 
 def _cfg(name, default):
     return getattr(config, name, default)
+
+
+def _hold_preconnect() -> bool:
+    """redeploy_guard.hold_preconnect(); False if the module is missing or raises."""
+    if _redeploy_guard is None:
+        return False
+    try:
+        return bool(_redeploy_guard.hold_preconnect())
+    except Exception:
+        return False
+
+
+def _ts_or_zero(x) -> float:
+    """Epoch seconds for the dashboard keys: 0 when unknown / infinite (schedule-off 'ALL' session)."""
+    try:
+        x = float(x)
+    except Exception:
+        return 0.0
+    return x if x == x and abs(x) != float("inf") else 0.0
 
 
 class BotEngine:
@@ -63,13 +90,17 @@ class BotEngine:
         self._ratios: Dict[str, Dict[pred.Candidate, float]] = {}
         self._recent_epochs: Dict[str, List[float]] = {}
         self._last_epoch: Dict[str, float] = {}
-        self._halted_until = 0.0
-        self._drain_started: Optional[float] = None
         self._lag_obs: List[int] = []
         self._last_decision = "—"
         self.balance = 0.0
-        self._target_done = asyncio.Event()   # set once the TARGET_BALANCE / window-end shutdown has finished
-        self._session_over = False            # trade window closed: no buys, socket dropped, engine returns
+        self._target_done = asyncio.Event()   # set once the TARGET_BALANCE shutdown has finished
+        self._session_over = False            # session closed: no buys until the next session starts
+        self.session: Optional[ws.Session] = None   # the active session (None while IDLE)
+        self._booted = False                  # True once the boot fit (_init_symbols) has succeeded in this process
+        self._last_drain_end = 0.0            # drain_end_ts of the last session we handled (never repeat a session)
+        self._lead_t0 = 0.0
+        self._lead_seconds = 0.0
+        self._lead_stage = ""
         self._feed_followers = True           # SetEngine turns this off (no follower stats / mirroring)
         # ── self-healing state ──
         self._last_tick_wall: Dict[str, float] = {}
@@ -91,75 +122,387 @@ class BotEngine:
         self._total_pnl = 0.0
         self._stakes_won = 0.0        # sum of profit/stake (stakes vary with the money rules)
 
-    # ── lifecycle ────────────────────────────────────────────────────────────
+    # ── lifecycle: the session loop (contract section 4) ─────────────────────
     async def run(self):
+        """IDLE -> CONNECTING -> WARMING -> LIVE -> DRAINING -> IDLE, once per session, forever. Returns only
+        when the balance target is reached; a crash propagates so main.py rebuilds the engine."""
         logger.info("=" * 64)
         logger.info("  Digit predictor bot  –  min stake %.2f (PREDICTOR_STAKE), symbols %s", self.stake, self.symbols)
         logger.info("=" * 64)
-        ws_task = asyncio.create_task(self.client.connect())
-        for _ in range(60):
-            if self.client.is_connected:
-                break
-            await asyncio.sleep(1)
-        if not self.client.is_connected:
-            logger.error("Could not connect/authorise within 60 s")
-            ws_task.cancel()
-            return
-        self.balance = self.client.balance
-        # Target check BEFORE anything is warmed up: if the balance is already at/above
-        # TARGET_BALANCE (e.g. service resumed without raising the target) never trade.
-        if target_guard.target() is not None:
-            try:
-                self.balance = await self.client.fetch_balance_live()
-            except Exception as exc:
-                logger.warning("Initial live balance fetch failed (%s) - using subscribed value", exc)
-            logger.info("TARGET GUARD: target=%.2f  live balance=%.2f", target_guard.target(), self.balance)
-            if target_guard.should_stop(self.balance):
-                if target_guard.mark_reached(self.balance):
-                    await self._shutdown_for_target(self.balance)
-                ws_task.cancel()
+        scheduled = bool(_cfg("SESSION_SCHEDULE_ENABLED", 1))
+        if not scheduled:
+            logger.warning("SESSION_SCHEDULE_ENABLED=0: one endless session 'ALL' (dev override), no schedule")
+        first_pass = True
+        while True:
+            if target_guard.is_reached() or self._target_done.is_set():
+                return                                      # target already reached: never connect again
+            if scheduled and not ws.schedule_ok():
+                logger.critical("SESSION SCHEDULE INCONSISTENT (ws.schedule_ok() is False): failing closed, "
+                                "no connection")
+                await asyncio.sleep(5)
+                continue
+            sess = self._pick_session(first_pass, scheduled)
+            first_pass = False
+            self._publish_idle(sess)
+            if not await self._wait_for_lead(sess):
+                continue
+            if await self._run_session(sess):
                 return
-        else:
-            logger.info("TARGET GUARD: TARGET_BALANCE not set - no balance target")
-        try:
-            await self.money.start(self.client)          # saved floor/P, live balance, midnight reset
-        except Exception as exc:
-            logger.error("MAIN MONEY could not start (%s) - the bot will not trade until it can", exc)
-        self.client.on_balance(self._on_balance)
-        self._seen_conn = self._conn_count()
 
-        ready = await self._init_symbols()
-        self.symbols = ready
-        if not self.symbols:
-            raise RuntimeError("no tradable symbol could be started")
-        logger.info("SYMBOLS ACTIVE (%d): %s", len(self.symbols), ",".join(self.symbols))
+    def _pick_session(self, first_pass: bool, scheduled: bool) -> "ws.Session":
+        now = ws.now()
+        if not scheduled:
+            return ws.Session("ALL", now, float("inf"), now)
+        ref = max(now, self._last_drain_end)                # never repeat a session we already handled
+        if first_pass:
+            cur = ws.current_session(now)
+            if cur is not None and not _cfg("RESUME_TRADING_MID_SESSION_AFTER_BOOT", False):
+                logger.warning("BOOT INSIDE SESSION %s (closes in %.0fs): not trading it, waiting for the next "
+                               "session", cur.name, cur.close_ts - now)
+                ref = max(ref, cur.drain_end_ts)
+        sess = ws.upcoming_session(ref)
+        if sess.close_ts <= now:                            # its close has passed (drain only): skip it
+            sess = ws.upcoming_session(max(ref, sess.drain_end_ts))
+        return sess
 
-        tasks = [asyncio.create_task(self._worker(s)) for s in self.symbols if s not in self._worker_started]
-        tasks += self._early_tasks
-        tasks += [asyncio.create_task(self._settle_loop()),
-                  asyncio.create_task(self._flush_loop()),
-                  asyncio.create_task(self._dashboard_loop()),
-                  asyncio.create_task(self._watchdog_loop()),
-                  asyncio.create_task(self._refit_loop()),
-                  asyncio.create_task(self._target_monitor_loop()),
-                  asyncio.create_task(self._window_watch_loop()),
-                  asyncio.create_task(self._supervise_ws(ws_task))]
-        tasks += [asyncio.create_task(c) for c in self._extra_tasks()]
-        if _follower_mgr is not None:        # Deriv server-time offset for the follower scheduler (main account time)
-            tasks.append(asyncio.create_task(_follower_mgr.collector_time_sync(self.client)))
-        stopper = asyncio.create_task(self._target_done.wait())
-        main_t = asyncio.gather(*tasks)
+    async def _wait_for_lead(self, sess: "ws.Session") -> bool:
+        """IDLE: sleep (no socket, no Deriv traffic) until connect_ts; honour redeploy_guard.hold_preconnect()."""
+        await self._sleep_until(sess.connect_ts)
+        warned = 0.0
+        while _hold_preconnect():
+            if ws.now() >= sess.close_ts:
+                logger.critical("SESSION %s MISSED: redeploy_guard held the connection until after the close",
+                                sess.name)
+                self._last_drain_end = max(self._last_drain_end, sess.drain_end_ts)
+                return False
+            if time.time() - warned >= 30:
+                warned = time.time()
+                logger.warning("SESSION %s: connect held by redeploy_guard (deploy in flight)", sess.name)
+            await asyncio.sleep(1.0)
+        return True
+
+    async def _sleep_until(self, ts: float, watch: Optional[list] = None, connected: bool = False) -> Optional[str]:
+        """Sleep until Deriv-server time `ts`: one computed sleep, then 5-50 ms steps inside the last 2 s
+        (never a flat 5 s nap). While connected it also watches for a finished target shutdown ('target') and
+        re-raises a crash of any watched task."""
+        cap = 1.0 if (connected or watch) else 30.0
+        while True:
+            if watch:
+                self._check_watch(watch)
+            if connected and self._target_done.is_set():
+                return "target"
+            rem = ts - ws.now()
+            if rem <= 0:
+                return None
+            if rem > 2.0:
+                await asyncio.sleep(max(0.005, min(rem - 2.0, cap)))
+            else:
+                await asyncio.sleep(min(0.05, max(0.005, rem / 2.0)))
+
+    @staticmethod
+    def _check_watch(tasks: list):
+        for t in tasks:
+            if t.done() and not t.cancelled() and t.exception() is not None:
+                raise t.exception()
+
+    # ── status publishing (local only, never Deriv) ──────────────────────────
+    def _publish(self, **kw):
         try:
-            await asyncio.wait({main_t, stopper}, return_when=asyncio.FIRST_COMPLETED)
-            if main_t.done() and not main_t.cancelled():
-                main_t.result()                       # re-raise a crash so main.py restarts the engine
-        except asyncio.CancelledError:
+            import keep_alive
+            keep_alive.update_status(**kw)
+        except Exception:
             pass
+
+    def _sess_keys(self, sess: "ws.Session") -> dict:
+        return {"session_name": sess.name, "session_open_ts": _ts_or_zero(sess.open_ts),
+                "session_close_ts": _ts_or_zero(sess.close_ts), "session_connect_ts": _ts_or_zero(sess.connect_ts)}
+
+    def _publish_idle(self, sess: "ws.Session"):
+        self._publish(session_state="IDLE", session="IDLE - disconnected until next session",
+                      session_lead_stage="", open_contracts_count=len(self._open), **self._sess_keys(sess))
+
+    def _set_state(self, state: str, sess: "ws.Session", stage: Optional[str] = None):
+        kw = self._sess_keys(sess)
+        if stage is not None:
+            self._lead_stage = stage
+            kw["session_lead_stage"] = stage
+        self._publish(session_state=state, session=f"{state} (session {sess.name})", **kw)
+
+    def _set_stage(self, stage: str):
+        self._lead_stage = stage
+        self._publish(session_lead_stage=stage)
+
+    # ── one session ──────────────────────────────────────────────────────────
+    async def _run_session(self, sess: "ws.Session") -> bool:
+        """Connect, warm, trade, drain, disconnect. True = the balance target was reached (run() returns)."""
+        self.session = sess
+        self._session_over = False
+        self._lead_t0 = time.time()
+        tasks: list = []
+        ws_task: Optional[asyncio.Task] = None
+        try:
+            # ── 2. CONNECT ──
+            self._set_state("CONNECTING", sess, stage="connect")
+            ws.reset_clock_measured()
+            self.client.set_reconnect_enabled(True)
+            ws_task = await self._connect_in_lead(sess)
+            if ws_task is None:
+                return False                                # session ran out before we could connect
+            self.balance = self.client.balance
+            first = not self._booted
+            # Target check BEFORE anything is warmed up: if the balance is already at/above TARGET_BALANCE
+            # (e.g. service resumed without raising the target) never trade.
+            if await self._target_gate(first):
+                return True
+            if first:
+                try:
+                    await self.money.start(self.client)     # saved floor/P, live balance, midnight reset
+                except Exception as exc:
+                    logger.error("MAIN MONEY could not start (%s) - the bot will not trade until it can", exc)
+                self.client.on_balance(self._on_balance)
+                self._seen_conn = self._conn_count()
+            sup = asyncio.create_task(self._supervise_ws(ws_task))
+            tasks.append(sup)
+
+            # ── 3. WARMING ──
+            self._set_state("WARMING", sess, stage="clock sync")
+            warm = asyncio.create_task(self._warm(sess, first))
+            tasks.append(warm)
+            logged = False
+            while not warm.done():
+                self._check_watch([sup, warm])
+                if self._target_done.is_set():
+                    return True
+                if not logged and sess.name != "ALL" and ws.now() >= sess.open_ts - 2.0:
+                    logged = True                           # never open the gate early to compensate
+                    pend = []
+                    if not warm.done():
+                        pend.append(f"lead stage '{self._lead_stage}'")
+                    if not ws.clock_measured():
+                        pend.append("clock sync")
+                    if self._needs_resync():
+                        pend.append("resync after reconnect")
+                    if not self.client.is_connected:
+                        pend.append("connection")
+                    logger.critical("SESSION %s LEAD NOT FINISHED at open-2s: still pending: %s",
+                                    sess.name, ", ".join(pend) or "?")
+                await asyncio.wait({warm}, timeout=0.2)
+            self._check_watch([warm])
+            budget = float(_cfg("WINDOW_PRECONNECT_SECONDS", 120.0))
+            self._lead_seconds = time.time() - self._lead_t0
+            self._set_stage("ready")
+            self._publish(session_lead_seconds=round(self._lead_seconds, 1))
+            logger.info("LEAD DONE in %.1fs (budget %.0fs)", self._lead_seconds, budget)
+            # in-lead self-healing runs before the open too: a drop between 'ready' and open is resynced
+            for s in self.symbols:
+                self._last_tick_wall[s] = time.time()
+            tasks.append(asyncio.create_task(self._watchdog_loop()))
+            tasks.append(asyncio.create_task(self._refit_loop()))
+
+            # ── 4. LIVE ──
+            if await self._sleep_until(sess.open_ts, watch=[sup], connected=True) == "target":
+                return True
+            self._set_state("LIVE", sess, stage="ready")
+            if not ws.clock_measured():
+                logger.critical("SESSION %s OPEN WITHOUT A CLOCK SAMPLE this session: falling back to the local "
+                                "clock (offset 0, error assumed +/-1s)", sess.name)
+                ws.set_clock_offset(0.0, 1.0)
+            n_samples = int(getattr(self.client, "clock_samples", 0) or 0)
+            logger.info("SESSION %s OPEN: offset %+.2fs, error +/-%.2fs, samples %d",
+                        sess.name, ws.get_clock_offset(), ws.get_clock_error(), n_samples)
+            self._publish(clock_offset=round(ws.get_clock_offset(), 3), clock_error=round(ws.get_clock_error(), 3))
+            self._on_session_open(sess)
+            for s in self.symbols:
+                self._last_tick_wall[s] = time.time()
+            tasks += [asyncio.create_task(self._worker(s)) for s in self.symbols if s not in self._worker_started]
+            tasks += list(self._early_tasks)                # started by a boot fit during the lead
+            tasks += [asyncio.create_task(self._settle_loop()),
+                      asyncio.create_task(self._flush_loop()),
+                      asyncio.create_task(self._dashboard_loop()),
+                      asyncio.create_task(self._target_monitor_loop()),
+                      asyncio.create_task(self._clock_resync_loop())]
+            tasks += [asyncio.create_task(c) for c in self._extra_tasks()]
+
+            # ── 5. CLOSE, DRAIN, DISCONNECT ──
+            if await self._sleep_until(sess.close_ts, watch=tasks, connected=True) == "target":
+                return True
+            self._session_over = True                       # _blocked() is now True: no new proposals/buys
+            drain = float(_cfg("SESSION_DRAIN_SECONDS", 10.0))
+            logger.warning("SESSION %s CLOSED: no new trades; draining %d open contract(s) (max %.0fs)",
+                           sess.name, len(self._open), drain)
+            try:
+                self._on_session_close(sess)
+            except Exception as exc:
+                logger.error("_on_session_close failed: %s", exc, exc_info=True)
+            self._set_state("DRAINING", sess)
+            drain_end = sess.close_ts + drain
+            while (self._open or self._busy) and ws.now() < drain_end:   # also in-flight attempts: a buy frame
+                #                                                         # already sent must not lose its reply
+                self._check_watch(tasks)
+                if self._target_done.is_set():
+                    return True
+                await asyncio.sleep(min(0.5, max(0.01, drain_end - ws.now())))
+            try:
+                await asyncio.wait_for(self._before_disconnect(sess), timeout=30)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                        # incl. TimeoutError: bounded, never blocks the disconnect
+                logger.error("_before_disconnect failed/timed out: %r", exc)
+            try:
+                await asyncio.wait_for(self.stats.flush(force=True), timeout=5)
+            except Exception as exc:
+                logger.warning("session end: stats flush skipped: %s", exc)
+            return False
         finally:
-            for t in tasks:
-                t.cancel()
-            stopper.cancel()
+            await self._disconnect(sess, tasks, ws_task)
+
+    async def _connect_in_lead(self, sess: "ws.Session") -> Optional["asyncio.Task"]:
+        """Start the client and wait until it is connected + authorised. Failures (token/OTP/Deriv down) are
+        retried with backoff for as long as the session lasts; nothing is ever attempted after the close."""
+        backoff = 1.0
+        ws_task: Optional[asyncio.Task] = None
+        while ws.now() < sess.close_ts:
+            if ws_task is not None and ws_task.done():
+                err = None if ws_task.cancelled() else ws_task.exception()
+                logger.error("SESSION %s CONNECT failed (%r) - retrying in %.0fs", sess.name, err, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+                ws_task = None
+                try:
+                    await self.client.shutdown("connect retry")
+                except Exception:
+                    pass
+                self.client.set_reconnect_enabled(True)
+                if ws.now() >= sess.close_ts:
+                    break
+            if ws_task is None:
+                ws_task = asyncio.create_task(self.client.connect())
+            t_end = time.time() + 20.0
+            while time.time() < t_end and not ws_task.done():
+                if self.client.is_connected:
+                    return ws_task
+                await asyncio.sleep(0.1)
+            if self.client.is_connected:
+                return ws_task
+            if not ws_task.done():
+                logger.warning("SESSION %s CONNECT: not ready after 20s (client keeps retrying) - still waiting",
+                               sess.name)
+        logger.critical("SESSION %s MISSED: could not connect before the close", sess.name)
+        if ws_task is not None:
             ws_task.cancel()
+            await asyncio.gather(ws_task, return_exceptions=True)
+        return None
+
+    async def _target_gate(self, first: bool) -> bool:
+        """True when the balance target is already reached (shutdown done): the session must not trade."""
+        if target_guard.target() is None:
+            if first:
+                logger.info("TARGET GUARD: TARGET_BALANCE not set - no balance target")
+            return False
+        try:
+            self.balance = await self.client.fetch_balance_live()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Initial live balance fetch failed (%s) - using subscribed value", exc)
+        logger.info("TARGET GUARD: target=%.2f  live balance=%.2f", target_guard.target(), self.balance)
+        if target_guard.should_stop(self.balance):
+            if target_guard.mark_reached(self.balance):
+                await self._shutdown_for_target(self.balance)
+            return True
+        return False
+
+    async def _warm(self, sess: "ws.Session", first: bool):
+        """Everything slow, finished BEFORE open_ts: clock burst, then boot fit (first session after process
+        start) or the _lead_prepare hook (later sessions)."""
+        await self._sync_clock_lead()
+        if first:
+            self._set_stage("refit")
+            ready = await self._init_symbols()
+            self.symbols = ready
+            if not self.symbols:
+                raise RuntimeError("no tradable symbol could be started")
+            logger.info("SYMBOLS ACTIVE (%d): %s", len(self.symbols), ",".join(self.symbols))
+            self._booted = True
+        else:
+            await self._lead_prepare(sess)
+            if self._needs_resync():                        # hook did not resync (plain BotEngine): do it here
+                await self._resync_in_lead()
+
+    async def _sync_clock_lead(self):
+        """The lead's clock burst (fine: also catch the integer-second flip). Retries; a total failure is only
+        logged here - open_ts then logs CRITICAL and falls back to the local clock."""
+        for attempt in (1, 2, 3):
+            try:
+                await self.client.sync_clock(fine=True)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("CLOCK SYNC attempt %d failed: %s", attempt, exc)
+                await asyncio.sleep(1.0)
+
+    async def _resync_in_lead(self):
+        """Fallback gap resync for engines whose _lead_prepare does not do one: refit + re-subscribe every symbol."""
+        self._set_stage("gap resync")
+        conn_now = self._conn_count()
+        ok_all = True
+        for sym in self.symbols:
+            try:
+                ok_all = bool(await self._fit_symbol(sym)) and ok_all
+                await self.client.refresh_ticks(sym, lambda tick, s=sym: self._on_tick(s, tick))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                ok_all = False
+                logger.error("lead resync error %s: %s", sym, exc)
+        if ok_all and self._conn_count() == conn_now:
+            self._seen_conn = conn_now
+
+    async def _clock_resync_loop(self):
+        """Light clock resync while connected (per-session task)."""
+        interval = float(_cfg("SESSION_CLOCK_RESYNC_SECONDS", 300.0))
+        if interval <= 0:
+            return
+        samples = max(3, int(_cfg("SESSION_CLOCK_SYNC_SAMPLES", 10)) // 3)
+        while True:
+            await asyncio.sleep(interval)
+            if not self.client.is_connected:
+                continue
+            try:
+                await self.client.sync_clock(samples=samples)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("clock resync failed: %s", exc)
+
+    async def _disconnect(self, sess: "ws.Session", tasks: list, ws_task: Optional["asyncio.Task"]):
+        """Cancel EVERY session task, stop reconnecting, drop the socket. Runs on every exit path (also a crash)."""
+        self._session_over = True
+        pool = [t for t in tasks + list(self._early_tasks) if t is not None]
+        for t in pool:
+            t.cancel()
+        try:
+            await asyncio.gather(*pool, return_exceptions=True)
+        finally:
+            self._early_tasks = []
+            self._worker_started.clear()
+            self._busy.clear()
+        try:
+            self.client.set_reconnect_enabled(False)
+        except Exception as exc:
+            logger.warning("set_reconnect_enabled(False) failed: %s", exc)
+        try:
+            await self.client.shutdown("session closed")
+        except Exception as exc:
+            logger.warning("client shutdown error: %s", exc)
+        if ws_task is not None:
+            ws_task.cancel()
+            await asyncio.gather(ws_task, return_exceptions=True)
+        self.session = None
+        self._last_drain_end = max(self._last_drain_end, sess.drain_end_ts)
+        logger.warning("SESSION %s ENDED: disconnected from Deriv (%d contract(s) left to settle on Deriv's side)",
+                       sess.name, len(self._open))
 
     async def _init_symbols(self) -> list:
         """Initialise all symbols one after another (MHEngine overrides this with a concurrent boot)."""
@@ -187,8 +530,27 @@ class BotEngine:
         return ready
 
     def _extra_tasks(self) -> list:
-        """Coroutines a subclass wants run next to the standard loops (none for the original engine)."""
+        """Coroutines a subclass wants run next to the standard loops (none for the original engine).
+        Called once per session at OPEN; every task made from them is cancelled at disconnect."""
         return []
+
+    # ── session hooks (no-op defaults; MHEngine overrides) ───────────────────
+    async def _lead_prepare(self, sess: "ws.Session") -> None:
+        """Runs connected, inside the lead, before open: refit, gap resync, quotes (not for the first session
+        after process start, which runs the boot fit instead)."""
+        return
+
+    async def _before_disconnect(self, sess: "ws.Session") -> None:
+        """After the drain, right before the socket is dropped: reconcile in-doubt buys, ledger, flush."""
+        return
+
+    def _on_session_open(self, sess: "ws.Session") -> None:
+        """At open_ts, before the workers start: reset per-session bookkeeping."""
+        return
+
+    def _on_session_close(self, sess: "ws.Session") -> None:
+        """At close_ts, before the drain."""
+        return
 
     def _pr_desc(self, pr) -> str:
         return f"tradable contexts={len(pr.selected)}"
@@ -290,24 +652,21 @@ class BotEngine:
         been missed, so the digit context would be wrong."""
         return self._conn_count() != self._seen_conn
 
-    @staticmethod
-    def _in_trade_window(ts: float) -> bool:
-        """True when `ts` (epoch seconds, UTC) is inside the allowed minutes of the hour."""
-        if not _cfg("TRADE_WINDOW_ENABLED", False):
-            return True
-        minute = int(ts // 60) % 60
-        return int(_cfg("TRADE_WINDOW_START_MINUTE", 0)) <= minute <= int(_cfg("TRADE_WINDOW_END_MINUTE", 59))
-
     def _next_stake(self) -> Optional[float]:
         """Stake from the money rules for the next buy; None = stopped (floor reached) or not ready."""
         return self.money.next_stake()
 
     def _blocked(self) -> bool:
-        # Only technical blocks remain: no socket, or predictor not yet re-synced after a
-        # reconnect (a few seconds), or the optional scheduled redeploy (off by default).
-        return (not self._in_trade_window(time.time()) or target_guard.is_reached() or self._session_over
-                or restart_scheduler.is_redeploy_pending() or time.time() < self._halted_until
-                or not self.client.is_connected or self._needs_resync())
+        # Only technical blocks remain: no socket, session over, outside the buy window (Deriv server clock),
+        # balance target reached, or the predictor not yet re-synced after a reconnect (a few seconds).
+        return (not self.client.is_connected or self._session_over or not ws.buy_allowed_at(ws.now())
+                or target_guard.is_reached() or self._needs_resync())
+
+    def _gate_buy(self):
+        """Engine-side twin of the DerivClient send-time gate: called right before a buy frame is handed to the
+        client. Raises ws.SessionClosed ('definitely not sent') when a buy would go out at/after the close."""
+        if not ws.buy_allowed_at(ws.now()):
+            raise ws.SessionClosed("buy not sent: outside the session buy window")
 
     # ── trading ──────────────────────────────────────────────────────────────
     async def _worker(self, sym: str):
@@ -316,10 +675,6 @@ class BotEngine:
             await ev.wait()
             ev.clear()
             if self._blocked() or sym in self._busy:
-                if not self._in_trade_window(time.time()):
-                    self._last_decision = (f"outside trade window "
-                                           f"(minutes {int(_cfg('TRADE_WINDOW_START_MINUTE', 0))}-"
-                                           f"{int(_cfg('TRADE_WINDOW_END_MINUTE', 59))})")
                 continue
             self._busy.add(sym)
             try:
@@ -342,6 +697,7 @@ class BotEngine:
     async def _buy_direct(self, sym: str, cand: pred.Candidate, price: float, stake: Optional[float] = None,
                           duration: Optional[int] = None, timeout: float = 10) -> dict:
         """Buy without a proposal id: {"buy": "1", "price": max_price, "parameters": {...}}."""
+        self._gate_buy()                                    # a decision at 16:00.9 is never sent after 16:01.000
         return await self.client._send(
             {"buy": "1", "price": price, "parameters": self._contract_params(sym, cand, self.stake if stake is None else stake, duration)},
             timeout=timeout)
@@ -367,8 +723,8 @@ class BotEngine:
         if not picks:
             return
         tick_epoch = self._last_epoch.get(sym)
-        if tick_epoch is not None and not self._in_trade_window(float(tick_epoch)):
-            return                                          # the signal tick itself is outside the window
+        if tick_epoch is not None and not ws.in_window(float(tick_epoch)):
+            return                                          # the signal tick itself is outside the session
         stake = self._next_stake()                          # money rules: None = stopped / floor reached
         if stake is None:
             self._last_decision = "stopped by money rules (floor reached) - resumes at next reset"
@@ -398,6 +754,7 @@ class BotEngine:
                 if self._direct_buy:
                     resp = await self._buy_direct(sym, pk.cand, ask, stake)
                 else:
+                    self._gate_buy()                        # before the frame is built/sent (retry path gates itself)
                     try:
                         resp = await self.client._send({"buy": prop["id"], "price": ask}, timeout=10)
                     except Exception as exc:
@@ -408,6 +765,11 @@ class BotEngine:
                         resp = await self._buy_direct(sym, pk.cand, ask, stake)
                         self._direct_buy = True
                         logger.info("Direct buy worked - using it for all further trades")
+            except ws.SessionClosed as exc:                 # definitely NOT sent: free the money, no error handling
+                self.money.release(stake)
+                self._last_decision = "buy blocked at session close"
+                logger.warning("BUY BLOCKED AT CLOSE %s: %s", sym, exc)
+                return
             except Exception as exc:
                 self.money.release(stake)
                 await self._on_api_error("buy", exc)        # error handling, not a gate
@@ -444,49 +806,13 @@ class BotEngine:
 
     # ── self-healing ─────────────────────────────────────────────────────────
     async def _supervise_ws(self, ws_task: "asyncio.Task"):
-        """connect() is meant to run forever. If it ever ends, raise so main.py rebuilds the
-        whole engine instead of leaving a zombie that is 'running' but never trades."""
-        await ws_task
-        if target_guard.is_reached() or self._session_over:   # intentional shutdown, not a crash
-            await self._target_done.wait()
-            return
-        raise RuntimeError("Deriv WebSocket task ended unexpectedly")
-
-    # ── trade window: connected only for the window, then drain + disconnect ──
-    async def _window_watch_loop(self):
-        """Once the window has been seen open and then closes: end the session (main.py then
-        redeploys with a cleared build cache and idles until the next window)."""
-        seen = False
-        while True:
-            await asyncio.sleep(1)
-            if self._in_trade_window(time.time()):
-                seen = True
-            elif seen:
-                break
-        await self._end_session()
-
-    async def _end_session(self):
-        self._session_over = True                       # _blocked() is now True: no new proposals/buys
-        drain = float(_cfg("SESSION_DRAIN_SECONDS", 45))
-        logger.warning("TRADE WINDOW CLOSED: no new trades; draining %d open contract(s) (max %.0fs)",
-                       len(self._open), drain)
-        t0 = time.time()
-        while self._open and time.time() - t0 < drain:
-            await asyncio.sleep(1)
-        try:
-            await asyncio.wait_for(self.stats.flush(force=True), timeout=5)
-        except Exception as exc:
-            logger.warning("session end: stats flush skipped: %s", exc)
-        try:
-            import keep_alive
-            keep_alive.update_status(session="IDLE - disconnected until next window",
-                                     open_contracts_count=len(self._open))
-        except Exception:
-            pass
-        await self.client.shutdown("trade window closed")
-        logger.warning("SESSION ENDED: disconnected from Deriv (%d contract(s) left to settle on Deriv's side)",
-                       len(self._open))
-        self._target_done.set()
+        """connect() runs for the whole session. If it ends while the session is still live, raise so
+        main.py rebuilds the whole engine instead of leaving a zombie that is 'running' but never trades."""
+        await asyncio.wait({ws_task})                       # not `await ws_task`: cancelling us must not cancel it
+        if target_guard.is_reached() or self._session_over or self._target_done.is_set():
+            return                                          # intentional shutdown, not a crash
+        exc = None if ws_task.cancelled() else ws_task.exception()
+        raise RuntimeError("Deriv WebSocket task ended unexpectedly") from exc
 
     # ── balance target ───────────────────────────────────────────────────────
     def _on_balance(self, bal: float):
@@ -519,6 +845,10 @@ class BotEngine:
                 import keep_alive
                 keep_alive.update_status(session="TARGET REACHED - STOPPED",
                                          open_contracts_count=len(self._open))
+            except Exception:
+                pass
+            try:
+                self.client.set_reconnect_enabled(False)
             except Exception:
                 pass
             await self.client.shutdown("balance target reached")
@@ -678,40 +1008,17 @@ class BotEngine:
             pass
 
     async def _settle_loop(self):
-        max_wait = float(_cfg("REDEPLOY_DRAIN_MAX_SECONDS", 60))
-        halt_max = float(_cfg("REDEPLOY_HALT_MAX_SECONDS", 600))
-        drain = bool(int(_cfg("REDEPLOY_DRAIN", 1)))          # 0 = redeploy at once, open contracts are not awaited
+        """Poll contracts that did not report their result (stragglers). Per-session task: stops at disconnect."""
         while True:
             await asyncio.sleep(2)
+            if not self.client.is_connected:
+                continue
             now = time.time()
-            if restart_scheduler.consume_failure():            # deploy request failed: the old instance keeps trading
-                self._halted_until = 0.0
             for cid, info in list(self._open.items()):         # poll stragglers
                 if now - info["t0"] > 20:
                     poc = await self.client.force_check_contract(cid)
                     if poc:
                         await self._on_contract_result(cid, {"proposal_open_contract": poc})
-            if not restart_scheduler.is_redeploy_pending() or now < self._halted_until:
-                self._drain_started = None
-                continue
-            if self._drain_started is None:
-                self._drain_started = now
-                logger.warning("REDEPLOY DUE: no new trades; draining %d open contract(s)", len(self._open))
-            if drain and self._open and now - self._drain_started < max_wait:
-                continue
-            if self._open and drain:
-                logger.warning("Drain timeout: redeploying with %d contract(s) still open", len(self._open))
-            await self.stats.flush(force=True)
-            await self._before_redeploy()
-            logger.warning("REDEPLOY: firing Render deploy")
-            restart_scheduler.trigger_redeploy()
-            self._halted_until = time.time() + halt_max         # old instance idle until replaced
-            self._drain_started = None
-            await asyncio.sleep(5)
-
-    async def _before_redeploy(self):
-        """Hook: called after the drain, right before the deploy is requested (MHEngine flushes its ledger here)."""
-        return
 
     async def _flush_loop(self):
         while True:
