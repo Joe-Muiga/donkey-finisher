@@ -404,4 +404,3 @@ class MHSymbol:
                 out.append((c, float(p[c]), float(lb[c]), float(e)))
         out.sort(key=lambda x: -x[3])
         return out
- 
