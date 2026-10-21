@@ -1232,31 +1232,7 @@ MAX_BUY_PER_SECOND     = 3
 # ── RENDER ──────────────────────────────────────────────────
 RENDER_DEPLOY_HOOK_URL = os.environ.get(
     "RENDER_DEPLOY_HOOK_URL","")
-# REDEPLOY_EVERY_N_CYCLES previously = 8. With SETTLE_WAIT_SECS defaulting to
-# 15s (bot_engine._settle_loop), that was an 8*15=120s cycle-based redeploy —
-# fighting restart_scheduler.py's timer. Set high enough that it never fires
-# on its own; restart_scheduler.py's daily Kenya-midnight timer (see
-# REDEPLOY_TIMEZONE below) is the only authoritative redeploy trigger. Lower
-# this back down only if you deliberately want a SECOND, settle-count-based
-# redeploy path in addition to the daily timer.
-REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
-
-# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS, anchored to
-# 00:00 in this zone (Africa/Nairobi = EAT = UTC+3 year-round, no DST) —
-# so with the default of 6 that's 00:00 / 06:00 / 12:00 / 18:00 EAT (4
-# redeploys/day). Was a once-daily fixed 00:00 timer per Implementation
-# Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
-# _next_scheduled_fire().
-REDEPLOY_TIMEZONE = "Africa/Nairobi"
-# 0 (default) = scheduled self-redeploy DISABLED: the bot runs continuously and heals
-# itself in-process (reconnect, stale-tick watchdog, periodic refit). Set a positive
-# number of seconds only if you really want the old rolling redeploy back.
-REDEPLOY_INTERVAL_SECONDS = float(os.environ.get("REDEPLOY_INTERVAL_SECONDS", "0"))
-REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0   # legacy derived value; hours since
-                                      # that's the unit restart_scheduler.py
-                                      # expects (interval_secs = hours*3600).
-                                      # Was 13.7 min, before that 1h, 3h.
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
@@ -1637,19 +1613,17 @@ def _env_tuple(k, d):
     return tuple(int(x) for x in raw.split(",") if x.strip())
 
 
-# Render API credentials: redeploy trigger + persisting minute-of-hour stats across redeploys.
+# Render API credentials: the single pre-A redeploy (redeploy_guard.py), the target-balance suspend, and (only if
+# STATS_PERSIST_TO_RENDER=1) persisting stats. RENDER_API_KEY is required for the pre-A redeploy.
 RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # PREDICTOR_SYMBOLS is defined next to DIGIT_SYMBOLS above.
-# Trade window: the bot opens contracts ONLY while the clock (UTC) is between minute 29 and minute 36
-# of the hour, inclusive: 29:00.0 up to and including 36:59.9. Strict - not an env var, so a stale value
-# on Render can never widen it. Outside it nothing is bought (ticks keep feeding the predictor).
-# SESSION_WINDOW_ENABLED (Render env var, default ON): 1 = trade only minutes 29-36, disconnected + redeployed
-# (cache cleared) the rest of the hour. 0 = window OFF: connected and trading every minute, no hourly redeploy.
-TRADE_WINDOW_ENABLED      = os.environ.get("SESSION_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-TRADE_WINDOW_START_MINUTE = 29
-TRADE_WINDOW_END_MINUTE   = 36
+# Trading sessions: the bot opens contracts ONLY inside the two hourly sessions A and B (UTC, judged on Deriv's SERVER
+# clock, open inclusive / close exclusive) and is connected to Deriv only from the connect lead before a session until
+# the drain after it. The schedule is the "SESSION SCHEDULE" block near the bottom of this file; the logic is in
+# window_scheduler.py. The session times are plain constants, NOT env vars, so a stale value on Render can never widen
+# a session. Outside a session nothing is bought and nothing is connected (ticks only arrive while connected).
 PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
 # Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
 # MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
@@ -1675,7 +1649,7 @@ PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates pr
 
 # ─── SET MODE: predict a set of next digits, buy the Over/Under that covers it ─────────────────────
 # (set_predictor.py + set_engine.py). ON by default; SET_MODE=0 runs the original single-contract engine.
-# It honours TRADE_WINDOW_* (29-36), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, sizes stakes with the money rules (PREDICTOR_STAKE = minimum; SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
+# It honours the two hourly sessions (SESSION SCHEDULE block below), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, sizes stakes with the money rules (PREDICTOR_STAKE = minimum; SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
 # and is DEMO-ONLY unless SET_ALLOW_REAL=1.
 SET_MODE               = os.environ.get("SET_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
 SET_ALLOW_REAL         = os.environ.get("SET_ALLOW_REAL", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -1726,7 +1700,11 @@ MH_RECONCILE_RETRY_SECONDS = _env_f("MH_RECONCILE_RETRY_SECONDS", 3.0)   # in-do
 MH_RECONCILE_SAFETY_SECONDS = _env_f("MH_RECONCILE_SAFETY_SECONDS", 30.0)  # unresolved buy: hold the reservation this much longer
 MH_RANK_KEY            = os.environ.get("MH_RANK_KEY", "mass").strip().lower()   # mass (raw top-cluster mass, old) | edge (calibrated lb*r-1)
 MH_RANK_MIN_EDGE       = _env_f("MH_RANK_MIN_EDGE", _env_f("MH_MIN_EDGE", 0.0))  # edge floor when MH_RANK_KEY=edge (replaces SET_MIN_SET_PROB)
-MH_RANK_WINDOW_SECONDS = _env_i("MH_RANK_WINDOW_SECONDS", 30)     # ranking window: 30 (:00/:30 UTC) or 60 (old per-minute behaviour)
+MH_RANK_WINDOW_SECONDS = _env_i("MH_RANK_WINDOW_SECONDS", 15)     # ranking window: 15 (default, :00/:15/:30/:45 UTC), 30 or 60 (60 = the old per-minute behaviour)
+MH_EARLY_TRIGGER           = _env_b("MH_EARLY_TRIGGER", 1)        # 1 = pick as soon as the admissible pool has >= MH_EARLY_POOL_MIN candidates (never before rank_delay)
+MH_EARLY_POOL_MIN          = _env_i("MH_EARLY_POOL_MIN", 5)
+MH_FALLBACK_FRAC           = _env_f("MH_FALLBACK_FRAC", 0.7)       # else pick at window_start + this fraction of the window with whatever admissible pool exists (>= 1)
+MH_BOARD_MAX_AGE_SECONDS   = _env_f("MH_BOARD_MAX_AGE_SECONDS", 30.0)   # a rolling-board candidate older than this is dropped
 MH_WINDOW_TOP_N        = _env_i("MH_WINDOW_TOP_N", _env_i("MH_MINUTE_TOP_N", 1))   # contracts bought per window
 MH_RANK_MODE           = os.environ.get("MH_RANK_MODE", "snapshot").strip().lower()   # snapshot (old) | bar (rank closed window, buy at current state)
 MH_INPROC_REFIT_SECONDS = _env_f("MH_INPROC_REFIT_SECONDS", 0.0)   # 0 = off; else rebuild each symbol's models in the background this often
@@ -1734,14 +1712,11 @@ MH_WILSON_Z            = _env_f("MH_WILSON_Z", 1.64)              # Wilson z of 
 MH_OOS_CHECK           = _env_b("MH_OOS_CHECK", 0)                # 0 = held-out check is logged only; 1 = enforce (bins must beat break-even out of sample)
 MH_OOS_MIN_N           = _env_i("MH_OOS_MIN_N", 30)               # min held-out samples in a bin for it to be admissible (enforce)
 MH_OOS_MARGIN          = _env_f("MH_OOS_MARGIN", 0.0)             # held-out Wilson lb must exceed break-even + margin (enforce)
-MH_MAX_QUOTE_AGE_SECONDS = _env_f("MH_MAX_QUOTE_AGE_SECONDS", 0.0)   # 0 = off; else refuse/refetch admission quotes older than this
+MH_MAX_QUOTE_AGE_SECONDS = _env_f("MH_MAX_QUOTE_AGE_SECONDS", 45.0)   # a quote older than this is refetched (bounded timeout) and min ratio / edge re-checked before the buy; 0 = off
 MH_ADOPT_ORPHANS_ON_BOOT = _env_b("MH_ADOPT_ORPHANS_ON_BOOT", 1)   # adopt open digit contracts found on Deriv at boot
-REDEPLOY_DRAIN         = _env_i("REDEPLOY_DRAIN", 0 if MH_MODE else 1)   # 0 = redeploy without waiting for open contracts
 PREDICTOR_STATS_FLUSH_SECONDS = _env_f("PREDICTOR_STATS_FLUSH_SECONDS", 30)
 MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
 WINDOW_MINUTES           = _env_i("WINDOW_MINUTES", 10)
-REDEPLOY_DRAIN_MAX_SECONDS = _env_f("REDEPLOY_DRAIN_MAX_SECONDS", 60)
-REDEPLOY_HALT_MAX_SECONDS  = _env_f("REDEPLOY_HALT_MAX_SECONDS", 600)
 
 # ─── Continuous-running / self-healing (replaces the rolling redeploy) ────────
 # Reconnect forever (0 = unlimited) with exponential backoff capped at 60 s.
@@ -1759,55 +1734,48 @@ REFIT_INTERVAL_SECONDS        = _env_f("REFIT_INTERVAL_SECONDS", 300)
 # WARMUP_TICKS in total.
 TICK_HISTORY_PAGE_SIZE        = _env_i("TICK_HISTORY_PAGE_SIZE", 1000)
 # Persisting stats into a Render env var makes Render treat it as a config change
-# (it can restart the service). Only needed when self-redeploying; off otherwise.
-STATS_PERSIST_TO_RENDER       = os.environ.get(
-    "STATS_PERSIST_TO_RENDER",
-    "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
+# (it can restart the service). Off by default; independent of any redeploy setting.
+STATS_PERSIST_TO_RENDER       = os.environ.get("STATS_PERSIST_TO_RENDER", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
-#  AUTO REDEPLOY  -  EASY-EDIT SECTION (keep this block at the very bottom of the file)
+#  SESSION SCHEDULE  -  EASY-EDIT SECTION (logic: window_scheduler.py)
 # ════════════════════════════════════════════════════════════════════════════════════════════
-#  ALWAYS ON: the bot redeploys itself every AUTO_REDEPLOY_SECONDS (below), forever, in a never-ending
-#  cycle (the AUTO_REDEPLOY env var is no longer consulted). The only off switch is the Render env var
-#  REDEPLOY_INTERVAL_SECONDS=0. Needs RENDER_API_KEY set on Render.
+#  Two sessions every hour, every day, UTC, judged on Deriv's SERVER clock. Buying is allowed when open <= t < close.
 #
-#  A redeploy wipes the instance's local data - that is expected.
-#  While ON, the hourly trade window (minutes 29-36) is switched OFF, because the window scheduler
-#  runs its own redeploy cycle and the two would fight each other. Each cycle the bot stops opening
-#  trades, drains open contracts (max REDEPLOY_DRAIN_MAX_SECONDS), then fires the Render redeploy.
+#    Session | open (inclusive)  | close (exclusive) | connect lead starts | drain ends (about)
+#    A       | HH:06:00.000      | HH:16:01.000      | open - lead         | close + 10 s = HH:16:11
+#    B       | HH:21:00.000      | HH:29:01.000      | open - lead         | close + 10 s = HH:29:11
 #
-#  >>> CHANGE THE INTERVAL HERE (seconds). 420 = 7 minutes. <<<
-AUTO_REDEPLOY_SECONDS = 420
-# ────────────────────────────────────────────────────────────────────────────────────────────
-AUTO_REDEPLOY_ENABLED = True
+#  The bot is connected to Deriv ONLY from the connect lead before a session until the bounded drain after it, and is
+#  fully disconnected in between (no websocket, no authorise/OTP, no polling). The periodic auto-redeploy is gone; exactly
+#  ONE redeploy per hour remains (PRE_A_REDEPLOY_*): fired while idle in the long gap after Session B, timed to FINISH
+#  just before the Session A connect lead, always clearCache="do_not_clear". Needs RENDER_API_KEY.
+SESSION_SCHEDULE_ENABLED     = _env_b("SESSION_SCHEDULE_ENABLED", 1)   # dev override only; 0 is logged CRITICAL at boot; default ON
+SESSION_A_OPEN_SECOND, SESSION_A_END_SECOND = 360, 960                 # plain constants
+SESSION_B_OPEN_SECOND, SESSION_B_END_SECOND = 1260, 1740
+SESSION_CLOSE_EXTRA_SECONDS  = 1.0                                     # close = END + this (own constant, flip it as needed)
+WINDOW_PRECONNECT_SECONDS    = _env_f("WINDOW_PRECONNECT_SECONDS", 120.0)  # the connect lead
+SESSION_DRAIN_SECONDS        = _env_f("SESSION_DRAIN_SECONDS", 10.0)   # the ONLY connected time after a close
+SESSION_BUY_CUTOFF_SECONDS   = _env_f("SESSION_BUY_CUTOFF_SECONDS", 0.0)
+SESSION_CLOCK_SYNC_SAMPLES   = _env_i("SESSION_CLOCK_SYNC_SAMPLES", 10)   # burst size
+SESSION_CLOCK_MIN_INTERVAL   = _env_f("SESSION_CLOCK_MIN_INTERVAL", 0.25) # spacing between time calls (rate limits)
+SESSION_CLOCK_FLIP_SECONDS   = _env_f("SESSION_CLOCK_FLIP_SECONDS", 4.0)  # rapid sampling to catch the integer-second flip
+SESSION_CLOCK_RESYNC_SECONDS = _env_f("SESSION_CLOCK_RESYNC_SECONDS", 300.0)
+RESUME_TRADING_MID_SESSION_AFTER_BOOT = _env_b("RESUME_TRADING_MID_SESSION_AFTER_BOOT", 0)
+PRE_A_REDEPLOY_ENABLED                  = _env_b("PRE_A_REDEPLOY_ENABLED", 1)
+PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS = _env_f("PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS", 180.0)  # until deploy history exists
+PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS    = _env_f("PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS", 240.0)
+PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS = _env_f("PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS", 15.0)
+PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS   = _env_f("PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS", 180.0)  # deploy older than expected+this = stalled
+PRE_A_REDEPLOY_BACKOFF_BASE_SECONDS     = _env_f("PRE_A_REDEPLOY_BACKOFF_BASE_SECONDS", 60.0)
+PRE_A_REDEPLOY_BACKOFF_MAX_SECONDS      = _env_f("PRE_A_REDEPLOY_BACKOFF_MAX_SECONDS", 1800.0)
 
-# Everything below applies the switch - no need to edit.
-REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
-# (The 7-minute cycle is always on; REDEPLOY_INTERVAL_SECONDS=0 in the Render env is the only way to stop it.)
-_ri_env = (os.environ.get("REDEPLOY_INTERVAL_SECONDS") or "").strip()
-if _ri_env:                               # an explicit env value always wins (0 = off)
-    try:
-        REDEPLOY_INTERVAL_SECONDS = float(_ri_env)
-    except ValueError:
-        pass
-REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0
-if REDEPLOY_INTERVAL_SECONDS > 0:
-    TRADE_WINDOW_ENABLED = False          # a timed redeploy replaces the hourly window
-STATS_PERSIST_TO_RENDER = os.environ.get(
-    "STATS_PERSIST_TO_RENDER",
-    "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
-
-if AUTO_REDEPLOY_ENABLED and "REDEPLOY_DRAIN" not in os.environ:
-    REDEPLOY_DRAIN = 1                    # the cycle must drain open contracts before redeploying (explicit env still wins)
-
-# ─── Redeploy cycle safety (restart_scheduler.py / redeploy_guard.py) ─────────────────────────────
-# Deploys are ALWAYS requested with clearCache="do_not_clear" (latest commit); nothing in this path clears the cache.
-REDEPLOY_BUY_BLOCK_SECONDS     = _env_f("REDEPLOY_BUY_BLOCK_SECONDS", 20)      # no new buys in the last N s before a redeploy
-REDEPLOY_HEALTH_TIMEOUT_SECONDS = _env_f("REDEPLOY_HEALTH_TIMEOUT_SECONDS", 180)  # new deploy must be live within this
-REDEPLOY_BACKOFF_BASE_SECONDS  = _env_f("REDEPLOY_BACKOFF_BASE_SECONDS", 60)   # after a failed deploy: base * 2^(fails-1)
-REDEPLOY_BACKOFF_MAX_SECONDS   = _env_f("REDEPLOY_BACKOFF_MAX_SECONDS", 1800)
-REDEPLOY_MIN_UPTIME_SECONDS    = _env_f("REDEPLOY_MIN_UPTIME_SECONDS", 120)    # never redeploy an instance younger than this
+# Old rolling-redeploy / window env vars that are still set on Render. They are IGNORED (they can neither bring the
+# rolling redeploy back nor disable the schedule); main.py logs one WARNING listing them. No new setting uses REDEPLOY_.
+LEGACY_REDEPLOY_ENV_SET = sorted(
+    k for k in os.environ
+    if k in ("AUTO_REDEPLOY", "AUTO_REDEPLOY_SECONDS", "SESSION_WINDOW_ENABLED") or k.startswith("REDEPLOY_"))
 
 # ─── TEST MODE: pre-registered, frozen experiment (exp_mode.py) ──────────────────────────────────
 # Primary test: all non-blocklisted symbols, h=1, OVER5 / UNDER4, fixed zone threshold, flat stake, demo only.
