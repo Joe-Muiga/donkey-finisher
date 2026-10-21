@@ -2374,3 +2374,4 @@ class DerivClient:
     @property
     def is_connected(self) -> bool:
         return self._connected and self._authorized
+ 
