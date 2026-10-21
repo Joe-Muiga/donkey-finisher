@@ -1,6 +1,23 @@
 """
 deriv_client.py – Async Deriv WebSocket client.
 
+v16 — TWO EXACT-SECOND SESSIONS PER HOUR (donkey-finisher; contract sections 4/5):
+
+  - connect() no longer reconnects forever on request: set_reconnect_enabled(False) makes every
+    reconnect loop iteration return BEFORE minting an OTP or opening a socket. connect() itself is
+    a no-op while reconnect is disabled, so no OTP / authorise / connect can happen outside a lead.
+  - shutdown() leaves the object reusable: it cancels the contract polling task (restarted by the
+    next connect()), fails pending requests, clears is_connected, and a later connect() on the same
+    object works (it clears the _stopped latch).
+  - _polling_loop() sends nothing while there is no socket.
+  - sync_clock(samples=None, fine=False) -> (offset, error): spaced burst of {"time":1}, RTT per sample,
+    lowest-RTT samples only, optional rapid sampling to catch the integer-second flip; calls
+    window_scheduler.set_clock_offset(offset, error). Sanity limit abs(offset) < 120 kept.
+  - Send-time buy gate in _send(): a buy frame is only written (and its pending future only registered)
+    when window_scheduler.buy_allowed_at(window_scheduler.now()); otherwise SessionClosed is raised
+    and NOTHING was sent. Every buy path funnels through _send, so every path is gated, retries included.
+  - The _send timeout, late-buy capture and pop_late_buy logic are untouched.
+
 v15 — ADAPTIVE EXIT ENGINE SUPPORT (additive, no existing contract logic
       touched):
 
@@ -146,6 +163,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import config
+import window_scheduler as _sched      # contract section 3 (aliased: connect()/shutdown() use a local named `ws`)
 
 # Deriv's newer Options trading API (REST for account/OTP setup, WS for trading).
 # Replaces the legacy wss://ws.derivws.com/websockets/v3?app_id=... endpoint,
@@ -195,6 +213,26 @@ def _mark_sent(exc: BaseException, req_id: int) -> None:
         pass
 
 
+def clock_interval(obs):
+    """obs = [(rtt, t0, t1, T)]: local send time t0, local receive time t1, Deriv's whole-second `time` T.
+    The server read its clock at some instant p in [t0, t1] with floor(p + offset) == T, so
+    offset lies in [T - t1, T + 1 - t0). Intersecting samples needs no symmetric-delay assumption, and the
+    lowest-RTT samples give the narrowest intervals; samples above ~2x the minimum RTT are ignored. Returns (lo, hi, n_used)."""
+    ordered = sorted(obs)
+    cut = max(2.0 * ordered[0][0], ordered[0][0] + 0.02)           # trust only near-minimum-RTT samples (NTP-style)
+    best = [o for o in ordered if o[0] <= cut]
+    if len(best) < 3:
+        best = ordered[:3]
+    lo = max(T - t1 for _, _, t1, T in best)
+    hi = min(T + 1.0 - t0 for _, t0, _, T in best)
+    if lo <= hi:
+        return lo, hi, len(best)
+    # inconsistent (jitter / a stale server second): median of the three lowest-RTT midpoints, +/-0.5 s
+    mids = sorted(T + 0.5 - (t0 + t1) / 2.0 for _, t0, t1, T in best[:3])
+    m = mids[len(mids) // 2]
+    return m - 0.5, m + 0.5, len(best)
+
+
 LATE_BUY_MAX = 300          # late buy replies kept (bounded)
 LATE_BUY_TTL = 120.0        # seconds a late buy reply is kept
 
@@ -220,7 +258,11 @@ class DerivClient:
         self._balance: float             = 0.0
         self._balance_ts: float          = 0.0          # epoch of last successful fetch
         self._balance_callbacks: List[Callable] = []
-        self._stopped: bool              = False        # set by shutdown(): never reconnect again
+        self._stopped: bool              = False        # set by shutdown(): the reconnect loop ends (connect() clears it)
+        self._reconnect_enabled: bool    = True         # set_reconnect_enabled(False): never (re)connect
+        self._polling_task: Optional[asyncio.Task] = None   # cancelled by shutdown(), restarted by connect()
+        self.clock_samples: int          = 0            # low-RTT samples used by the last sync_clock()
+        self._clock_last_send: float     = 0.0          # spacing between `time` calls holds across sync_clock() calls
 
         # ── Polling-based contract resolution ──────────────────────────────────
         # {contract_id: {"callback": fn, "placed_at": time}}
@@ -360,10 +402,15 @@ class DerivClient:
         WEBSOCKET_RECONNECT_INTERVAL from config (falls back to module defaults).
         Starts the contract polling loop once before the reconnect loop begins.
         """
+        if not self._reconnect_enabled:
+            logger.warning("connect() ignored: reconnect is disabled (we are outside a session lead)")
+            return
+        self._stopped = False                      # reusable after shutdown()
         self._loop = asyncio.get_event_loop()
 
-        # Start the contract polling loop once — persists across reconnects
-        asyncio.create_task(self._polling_loop())
+        # Contract polling loop: one per connect() call, kept across reconnects, cancelled by shutdown()
+        if self._polling_task is None or self._polling_task.done():
+            self._polling_task = asyncio.create_task(self._polling_loop())
 
         reconnect_interval = getattr(
             config, "WEBSOCKET_RECONNECT_INTERVAL", _DEFAULT_RECONNECT_INTERVAL
@@ -376,10 +423,15 @@ class DerivClient:
         connected_at = 0.0
 
         while True:
+            if self._stopped or not self._reconnect_enabled:       # checked BEFORE any OTP is minted
+                logger.warning("WebSocket connect loop ended (shutdown / reconnect disabled)")
+                return
             connected_at = 0.0
             attempt_start = attempt
             try:
                 ws_url = await self._fetch_otp_ws_url()
+                if self._stopped or not self._reconnect_enabled:   # shut down while the OTP was being minted
+                    return
                 logger.info(f"Connecting to {self._mask_otp(ws_url)} …")
                 async with websockets.connect(
                     ws_url,
@@ -460,7 +512,7 @@ class DerivClient:
                         _fut.set_exception(ConnectionError("WebSocket disconnected"))
                 self._pending.clear()
 
-            if self._stopped:
+            if self._stopped or not self._reconnect_enabled:
                 logger.warning("WebSocket shut down on purpose - reconnect loop ended")
                 return
 
@@ -494,16 +546,109 @@ class DerivClient:
             except Exception as exc:
                 logger.debug(f"force_reconnect close error: {exc}")
 
+    def set_reconnect_enabled(self, enabled: bool) -> None:
+        """False: the reconnect loop must NOT reconnect (no OTP, no socket) and connect() is a no-op.
+        True (the default): normal behaviour. BotEngine sets it True at the start of each lead and False
+        before shutdown() at the end of each session."""
+        self._reconnect_enabled = bool(enabled)
+
     async def shutdown(self, reason: str = "") -> None:
-        """Close the socket and keep it closed (connect()'s loop exits instead of reconnecting)."""
+        """Close the socket and keep it closed (connect()'s loop exits instead of reconnecting). The object stays
+        reusable: a later connect() works. Afterwards is_connected is False and nothing sends."""
         self._stopped = True
         logger.warning(f"DERIV CLIENT SHUTDOWN{': ' + reason if reason else ''}")
+        task, self._polling_task = self._polling_task, None
+        if task is not None and not task.done():
+            task.cancel()                                  # restarted by the next connect()
+            if task is not asyncio.current_task():
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
         ws = self._ws
         if ws is not None:
             try:
                 await asyncio.wait_for(ws.close(), timeout=5)
             except Exception as exc:
                 logger.debug(f"shutdown close error: {exc}")
+        # Make the state true right away even if no connect() task is running (or it is slow to notice).
+        self._ready.clear()
+        self._connected  = False
+        self._authorized = False
+        self._ws         = None
+        for _fut in list(self._pending.values()):
+            if not _fut.done():
+                _fut.set_exception(ConnectionError("Client shut down"))
+        self._pending.clear()
+
+    # ─── Server-clock sync (contract section 5) ───────────────────────────────
+
+    async def sync_clock(self, samples: Optional[int] = None, fine: bool = False) -> tuple:
+        """Measure Deriv's server clock: returns (offset, error) in seconds, server_time ~= time.time() + offset,
+        error = +/- half the final uncertainty interval. Deriv's `time` is whole seconds, so:
+          1. a burst of {"time":1} spaced >= SESSION_CLOCK_MIN_INTERVAL (rate limits), RTT measured per sample;
+          2. only the lowest-RTT samples are trusted, their offset intervals are intersected (clock_interval);
+          3. fine=True: for up to SESSION_CLOCK_FLIP_SECONDS send one sample per second timed to straddle the
+             predicted integer-second flip, which bisects the sub-second phase.
+        Calls window_scheduler.set_clock_offset(offset, error) and publishes clock_offset / clock_error."""
+        n = int(samples if samples is not None else getattr(config, "SESSION_CLOCK_SYNC_SAMPLES", 10))
+        gap = float(getattr(config, "SESSION_CLOCK_MIN_INTERVAL", 0.25))
+        flip_s = float(getattr(config, "SESSION_CLOCK_FLIP_SECONDS", 4.0))
+        obs: list = []
+
+        async def one():
+            wait = self._clock_last_send + gap - time.time()             # never closer together than MIN_INTERVAL
+            if wait > 0:
+                await asyncio.sleep(wait)
+            t0 = time.time()
+            self._clock_last_send = t0
+            resp = await self._send({"time": 1}, timeout=5)
+            t1 = time.time()
+            obs.append((t1 - t0, t0, t1, int(resp["time"])))
+
+        for _ in range(max(3, n)):
+            try:
+                await one()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(f"clock sample failed: {exc}")
+        if not obs:
+            raise RuntimeError("clock sync: no time sample was answered")
+        if fine:
+            t_end = time.time() + flip_s
+            while True:
+                lo, hi, _used = clock_interval(obs)
+                mid = (lo + hi) / 2.0
+                rtt = min(o[0] for o in obs)
+                nxt = math.floor(time.time() + mid) + 1.0   # next integer server second
+                send_at = nxt - mid - rtt / 2.0             # centre the request on the predicted flip
+                while send_at < max(time.time(), self._clock_last_send + gap):
+                    send_at += 1.0
+                if send_at >= t_end:
+                    break
+                await asyncio.sleep(max(0.0, send_at - time.time()))
+                try:
+                    await one()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug(f"clock flip sample failed: {exc}")
+                    break
+        lo, hi, used = clock_interval(obs)
+        offset, error = (lo + hi) / 2.0, (hi - lo) / 2.0
+        if abs(offset) >= 120:                              # existing sanity limit
+            raise RuntimeError(f"clock sync: offset {offset:+.1f}s out of range - ignored")
+        self.clock_samples = used
+        _sched.set_clock_offset(offset, error)
+        logger.info("CLOCK SYNC: offset %+.3fs error +/-%.3fs (%d of %d samples used, fine=%s)",
+                    offset, error, used, len(obs), fine)
+        try:
+            import keep_alive
+            keep_alive.update_status(clock_offset=round(offset, 3), clock_error=round(error, 3))
+        except Exception:
+            pass
+        return offset, error
 
     async def fetch_balance_live(self, timeout: float = 8.0) -> float:
         """Ask Deriv for the balance RIGHT NOW (no cache), update the cached value and fire
@@ -641,6 +786,8 @@ class DerivClient:
             await asyncio.sleep(_CONTRACT_POLL_INTERVAL)
             if self._stopped:
                 return
+            if not self._connected:
+                continue                                    # no socket (gap / reconnecting): nothing is sent
             # Task 2 observability requirement — cheap, always logged
             # (regardless of whether there's anything to poll) so tracking-
             # set sizes are visible on a predictable cadence rather than
@@ -959,6 +1106,10 @@ class DerivClient:
                 raise RuntimeError("TARGET_REACHED: trading stopped, order not sent")
         if not self._ws or not self._connected:
             raise RuntimeError("Not connected")
+        if "buy" in payload and not _sched.buy_allowed_at(_sched.now()):
+            # Send-time gate (contract section 5): nothing awaits between this check and the frame write, and the
+            # pending future is not registered yet. Means "definitely not sent", never "in doubt".
+            raise _sched.SessionClosed("buy not sent: outside the session buy window")
 
         req_id                = self._req_id_counter
         self._req_id_counter += 1
