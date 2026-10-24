@@ -7,11 +7,12 @@ When the switch is ON ("paused"):
   * contracts that are already open are left alone and settle normally;
   * the bot stays connected and the dashboard keeps updating.
 
-The state survives redeploys (this bot redeploys itself on a schedule): it
-is mirrored into this service's own KILL_SWITCH env var through the same
-Render-API mechanism fixed_cycle.py already uses, and read back at boot.
+The state survives redeploys (this bot redeploys itself once an hour, before
+Session A): it is mirrored into this service's own KILL_SWITCH env var through
+env_persist.put_env_vars_sync (Render API), and read back at boot.
 Without RENDER_API_KEY the switch still works, but only until the next
-redeploy — the dashboard says so.
+redeploy — the dashboard says so. Note: Render may restart the service when
+an env var changes, so toggling the switch can itself restart the instance.
 
 Security: the dashboard URL is public, so toggling requires a PIN. With no
 extra setup the PIN is the LAST 6 CHARACTERS OF YOUR DERIV_API_TOKEN (you
@@ -85,8 +86,10 @@ def set_paused(paused: bool, source: str = "dashboard") -> bool:
     except Exception:
         pass
     try:
-        import fixed_cycle
-        fixed_cycle._persist_env_vars({"KILL_SWITCH": "1" if _paused else "0"})
+        import env_persist
+        if not env_persist.put_env_vars_sync({"KILL_SWITCH": "1" if _paused else "0"}):
+            logger.error("KILL SWITCH: state NOT persisted to Render (RENDER_API_KEY/RENDER_SERVICE_ID missing or the "
+                         "API refused) - it holds until the next redeploy only")
     except Exception as exc:
         logger.error(f"KILL SWITCH: could not persist state: {exc}")
     return _paused
