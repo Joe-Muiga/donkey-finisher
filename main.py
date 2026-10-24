@@ -175,7 +175,7 @@ def _log_startup() -> None:
                     "connect lead %.0fs, disconnect after drain",
                     _mmss(config.SESSION_A_OPEN_SECOND), _mmss(config.SESSION_A_END_SECOND + close_x),
                     _mmss(config.SESSION_B_OPEN_SECOND), _mmss(config.SESSION_B_END_SECOND + close_x),
-                    close_x, config.SESSION_CONNECT_LEAD_SECONDS)
+                    close_x, config.WINDOW_PRECONNECT_SECONDS)
     if config.PRE_A_REDEPLOY_ENABLED and config.SESSION_SCHEDULE_ENABLED:
         import render_api
         has_api = render_api.api_configured()
