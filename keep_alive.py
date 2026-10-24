@@ -75,7 +75,6 @@ _state: dict = {
     "avg_rr":                0.0,
     "best_trade":            0.0,
     "worst_trade":           0.0,
-    "redeploy_pending":      False,
     "active_trades":         0,
     "all_trades":            [],
     "hourly_pnl":            {},
@@ -106,10 +105,21 @@ _state: dict = {
     # remaining caller of SymbolManager.suspend()) get their own,
     # separately-labeled key so the two are never conflated again.
     "circuit_breaker_symbols": [],
-    # Task 7 dashboard visibility — set by restart_scheduler.py.
-    "redeploy_hook_missing":         False,
-    "redeploy_watchdog_overdue":     False,
-    "redeploy_watchdog_overdue_mins": 0.0,
+    # Session / schedule status (contract section 8). Written by the engine, the
+    # lead code and redeploy_guard through update_status(**kw); read by the
+    # dashboard. The free-text "session" key above stays as the human-readable line.
+    "session_state":         "IDLE",   # IDLE | CONNECTING | WARMING | LIVE | DRAINING | REDEPLOYING
+    "session_name":          "",       # "A" | "B" | "ALL" | ""  (active or upcoming)
+    "session_open_ts":       0.0,      # epoch seconds (Deriv-synced), 0 = unknown
+    "session_close_ts":      0.0,
+    "session_connect_ts":    0.0,
+    "session_lead_stage":    "",       # "" | connect | clock sync | adopt | refit | gap resync | quotes | ready
+    "session_lead_seconds":  0.0,      # last measured lead length
+    "clock_offset":          0.0,
+    "clock_error":           0.0,
+    "redeploy_state":        "",       # "" | scheduled | fired | skipped | failed
+    "redeploy_fire_ts":      0.0,      # planned or actual fire time, epoch seconds
+    "redeploy_note":         "",       # short text: why skipped, expected duration
 }
 
 _status = _state   # alias for bot_engine imports
@@ -122,13 +132,9 @@ def update_status(**kwargs) -> None:
     _state["uptime_seconds"] = int(time.time() - _state["start_time"])
 
 
-def set_redeploy_pending(value: bool) -> None:
-    _state["redeploy_pending"] = value
-    logger.info(f"redeploy_pending set to {value}")
-
-
-def is_redeploy_pending() -> bool:
-    return bool(_state.get("redeploy_pending", False))
+def get_state(key, default=None):
+    """Read access to _state (e.g. redeploy_guard reads session_state)."""
+    return _state.get(key, default)
 
 
 def set_active_trades(count: int) -> None:
@@ -342,29 +348,6 @@ def update_suspended_symbols(suspended: list) -> None:
     dicts) — the correct, per-(indicator, symbol) suspension source.
     """
     _state["suspended_symbols"] = list(suspended)
-
-
-def trigger_redeploy() -> None:
-    import render_api
-    target = render_api.deploy_target()
-    if not target:
-        logger.error("trigger_redeploy: neither RENDER_API_KEY nor RENDER_DEPLOY_HOOK_URL is set")
-        return
-    url, hdrs = target
-    logger.info("trigger_redeploy: sending POST to Render …")
-    try:
-        resp = requests.post(url, headers=hdrs, timeout=15)
-        if resp.ok:
-            logger.info(f"trigger_redeploy: SUCCESS — HTTP {resp.status_code}")
-        else:
-            logger.error(
-                f"trigger_redeploy: FAILED — HTTP {resp.status_code} — {resp.text[:300]}")
-    except requests.exceptions.Timeout:
-        logger.error("trigger_redeploy: FAILED — request timed out after 15 s")
-    except requests.exceptions.ConnectionError as exc:
-        logger.error(f"trigger_redeploy: FAILED — connection error: {exc}")
-    except Exception as exc:
-        logger.error(f"trigger_redeploy: FAILED — {type(exc).__name__}: {exc}")
 
 
 # ── Time helpers ────────────────────────────────────────────────────────────────
@@ -592,6 +575,231 @@ def _build_hourly_svg(hourly_pnl: dict) -> str:
 
 # ── Dashboard renderer ──────────────────────────────────────────────────────────
 
+# ── Session / schedule status panel (contract section 8) ────────────────────────
+# Server-rendered (works with JavaScript off); a tiny inline script ticks the
+# countdowns between the 10 s page refreshes. All timestamps are Deriv-synced
+# epoch seconds, 0 = unknown. "Now" for the countdowns is the bot host's
+# time.time() + clock_offset at render time, then advanced with the browser's
+# monotonic clock, so the viewer's own (possibly wrong) clock never matters.
+
+import html as _html
+import math as _math
+
+_SESSION_STATES = ("IDLE", "CONNECTING", "WARMING", "LIVE", "DRAINING", "REDEPLOYING")
+
+# which countdown is meaningful in which state
+_CD_WHEN = {
+    "connect": ("IDLE", "REDEPLOYING"),
+    "open":    ("IDLE", "CONNECTING", "WARMING", "REDEPLOYING"),
+    "close":   ("LIVE",),
+}
+
+_SESSION_CSS = """
+  .sx-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px;}
+  .sx-head{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:10px;}
+  .sx-badge{display:inline-block;padding:4px 10px;border-radius:6px;font-size:13px;font-weight:700;letter-spacing:.03em;}
+  .sx-idle{background:#21262d;color:var(--muted);}
+  .sx-warn{background:#3a2a1a;color:var(--yellow);}
+  .sx-info{background:#1a2a3a;color:var(--accent);}
+  .sx-live{background:#1a3a1f;color:var(--green);}
+  .sx-redeploy{background:#2a1a3a;color:#c084fc;}
+  .sx-sub{font-size:12px;color:var(--muted);}
+  .sx-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;}
+  .sx-item{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:8px 10px;}
+  .sx-wide{grid-column:1/-1;}
+  .sx-val{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums;}
+  .sx-dim{color:var(--muted);font-weight:400;}
+  .sx-rd-scheduled{color:var(--accent);} .sx-rd-fired{color:#c084fc;}
+  .sx-rd-skipped{color:var(--yellow);}   .sx-rd-failed{color:var(--red);}
+"""
+
+_SESSION_JS = """
+(function () {
+  var p = document.getElementById('sess-panel');
+  if (!p || !window.performance || !performance.now) return;
+  var base = parseFloat(p.getAttribute('data-now'));
+  if (!isFinite(base)) return;
+  var t0 = performance.now();
+  function two(n) { return (n < 10 ? '0' : '') + n; }
+  function fmt(s) {
+    s = Math.floor(s);
+    if (!(s > 0)) return '0s';
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+    return h ? h + 'h ' + two(m) + 'm ' + two(x) + 's' : m ? m + 'm ' + two(x) + 's' : x + 's';
+  }
+  function tick() {
+    var now = base + (performance.now() - t0) / 1000;
+    var els = p.querySelectorAll('[data-cd]');
+    for (var i = 0; i < els.length; i++) {
+      var ts = parseFloat(els[i].getAttribute('data-cd'));
+      if (isFinite(ts)) els[i].textContent = fmt(ts - now);
+    }
+  }
+  tick();
+  setInterval(tick, 250);
+})();
+"""
+
+
+def _num(v, default: float = 0.0) -> float:
+    """float(v), or default for None / text / NaN / inf."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if _math.isfinite(f) else default
+
+
+def _fmt_countdown(sec: float) -> str:
+    """'1h 02m 03s' | '4m 05s' | '7s'. Never negative (clamped to '0s'). Same format as _SESSION_JS."""
+    s = int(_math.floor(_num(sec)))
+    if s <= 0:
+        return "0s"
+    h, m, x = s // 3600, (s % 3600) // 60, s % 60
+    if h:
+        return f"{h}h {m:02d}m {x:02d}s"
+    if m:
+        return f"{m}m {x:02d}s"
+    return f"{x}s"
+
+
+def _fmt_utc(ts) -> str:
+    """'HH:MM:SS UTC' for an epoch timestamp, or a dash when unknown (<= 0)."""
+    t = _num(ts)
+    if t <= 0:
+        return "—"
+    try:
+        return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%H:%M:%S") + " UTC"
+    except (OverflowError, OSError, ValueError):
+        return "—"
+
+
+def _session_view(s: dict) -> dict:
+    """Pure: turn the section-8 keys into what the panel shows. Tolerates missing / odd values."""
+    state = str(s.get("session_state") or "").strip().upper()
+    name  = str(s.get("session_name") or "").strip().upper()
+    ts    = {k: _num(s.get(f"session_{k}_ts")) for k in ("connect", "open", "close")}
+    # No usable schedule data (old engine writing only the free-text "session", or a
+    # default-IDLE state nobody has published to yet): fall back to the old text.
+    legacy = (state not in _SESSION_STATES) or (
+        state == "IDLE" and not name and not any(v > 0 for v in ts.values()))
+
+    if state == "LIVE":
+        label = ("LIVE - always on" if name == "ALL"
+                 else f"SESSION {name} LIVE" if name else "LIVE")
+        cls = "sx-live"
+    elif state == "CONNECTING":
+        label, cls = "CONNECTING", "sx-warn"
+    elif state == "WARMING":
+        label, cls = "WARMING UP", "sx-info"
+    elif state == "DRAINING":
+        label, cls = "DRAINING", "sx-warn"
+    elif state == "REDEPLOYING":
+        label, cls = "REDEPLOYING", "sx-redeploy"
+    else:
+        label, cls = "IDLE - disconnected", "sx-idle"
+
+    cd = {}
+    for kind in ("connect", "open", "close"):
+        if name == "ALL":
+            cd[kind] = ("always", 0.0)                       # schedule disabled: no countdown
+        elif ts[kind] <= 0 or state not in _CD_WHEN[kind]:
+            cd[kind] = ("dash", ts[kind])
+        else:
+            cd[kind] = ("cd", ts[kind])
+
+    return {
+        "legacy": legacy, "state": state, "name": name, "label": label, "cls": cls, "cd": cd,
+        "ts": ts,
+        "stage": str(s.get("session_lead_stage") or "").strip(),
+        "lead_s": _num(s.get("session_lead_seconds")),
+        "offset": _num(s.get("clock_offset")),
+        "error": _num(s.get("clock_error")),
+        "rd_state": str(s.get("redeploy_state") or "").strip().lower(),
+        "rd_ts": _num(s.get("redeploy_fire_ts")),
+        "rd_note": str(s.get("redeploy_note") or "").strip()[:200],
+        "old_text": str(s.get("session", "") or ""),
+    }
+
+
+def _render_session_panel(s: dict) -> str:
+    """HTML (+ its script) for the session status card. Returns '' on any error: the page must still render."""
+    try:
+        v = _session_view(s)
+        esc = _html.escape
+        if v["legacy"]:
+            return (
+                '<div class="sx-card" id="sess-panel">'
+                f'<div class="sx-head"><span class="sx-badge sx-idle">{esc(v["old_text"][:80] or "—")}</span>'
+                '<span class="sx-sub">no schedule data from the engine</span></div></div>'
+            )
+        server_now = time.time() + v["offset"]
+
+        def cd_span(ts: float) -> str:
+            return f'<span data-cd="{ts:.3f}">{_fmt_countdown(ts - server_now)}</span>'
+
+        def item(title: str, value: str, sub: str = "", wide: bool = False) -> str:
+            return (f'<div class="sx-item{" sx-wide" if wide else ""}"><div class="card-title">{title}</div>'
+                    f'<div class="sx-val">{value}</div>'
+                    + (f'<div class="card-sub">{sub}</div>' if sub else "") + '</div>')
+
+        def cd_item(title: str, kind: str) -> str:
+            mode, t = v["cd"][kind]
+            if mode == "always":
+                return item(title, '<span class="sx-dim">always on</span>')
+            sub = _fmt_utc(t) if t > 0 else ""
+            if mode == "cd":
+                return item(title, cd_span(t), sub)
+            return item(title, '<span class="sx-dim">—</span>', sub)
+
+        stage_shown = v["state"] in ("CONNECTING", "WARMING") and v["stage"]
+        sub_txt = f'stage: {esc(v["stage"])}' if stage_shown else ""
+        name_txt = ("ALL <span class=\"sx-dim\">(always on)</span>" if v["name"] == "ALL"
+                    else esc(v["name"]) if v["name"] else '<span class="sx-dim">—</span>')
+
+        # redeploy
+        rs, rd_ts, note = v["rd_state"], v["rd_ts"], v["rd_note"]
+        if not rs:
+            rd_val = '<span class="sx-dim">none planned</span>'
+        elif rs == "scheduled":
+            rd_val = ('<span class="sx-rd-scheduled">scheduled</span>'
+                      + (f' <span class="sx-dim">fires {_fmt_utc(rd_ts)} · in </span>{cd_span(rd_ts)}' if rd_ts > 0 else ""))
+        elif rs == "fired":
+            rd_val = ('<span class="sx-rd-fired">fired</span>'
+                      + (f' <span class="sx-dim">at {_fmt_utc(rd_ts)}</span>' if rd_ts > 0 else ""))
+        elif rs in ("skipped", "failed"):
+            rd_val = (f'<span class="sx-rd-{rs}">{rs}</span>'
+                      + (f' <span class="sx-dim">planned {_fmt_utc(rd_ts)}</span>' if rd_ts > 0 else ""))
+        else:
+            rd_val = esc(rs)
+        rd_item = item("Redeploy", rd_val, esc(note), wide=True)
+
+        offset_txt = f'{v["offset"]:+.3f} s' if (v["offset"] or v["error"]) else "—"
+        error_txt  = f'±{v["error"]:.3f} s' if v["error"] > 0 else "—"
+        lead_txt   = f'{v["lead_s"]:.1f} s' if v["lead_s"] > 0 else "—"
+
+        return (
+            f'<div class="sx-card" id="sess-panel" data-now="{server_now:.3f}">'
+            f'<div class="sx-head"><span class="sx-badge {v["cls"]}">{esc(v["label"])}</span>'
+            f'<span class="sx-sub">{sub_txt}</span></div>'
+            '<div class="sx-grid">'
+            + item("Session", name_txt)
+            + cd_item("Connects in", "connect")
+            + cd_item("Opens in", "open")
+            + cd_item("Closes in", "close")
+            + item("Lead stage", esc(v["stage"]) if stage_shown else '<span class="sx-dim">—</span>')
+            + item("Last lead", lead_txt)
+            + item("Clock offset", offset_txt)
+            + item("Clock error", error_txt)
+            + rd_item
+            + '</div></div>'
+            f'<script>{_SESSION_JS}</script>'
+        )
+    except Exception as exc:                      # never take the dashboard down for a status card
+        logger.exception(f"_render_session_panel error: {exc}")
+        return ""
+
+
 def _render_dashboard() -> str:
     try:
         s = _state
@@ -636,6 +844,7 @@ def _render_dashboard() -> str:
         now_utc= datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
         session      = str(s.get("session", "Starting"))
+        session_panel = _render_session_panel(s)
         queue_count  = int(s.get("tradeable_count", 0))
         current_sym  = str(s.get("current_symbol", "—"))
 
@@ -938,6 +1147,7 @@ def _render_dashboard() -> str:
   .susp-badge{{display:inline-block;padding:2px 7px;border-radius:4px;
                font-size:10px;font-weight:700;background:#3a2a1a;color:var(--yellow);}}
   .footer{{margin-top:20px;font-size:11px;color:var(--muted);text-align:right;}}
+{_SESSION_CSS}
 </style>
 </head>
 <body>
@@ -956,6 +1166,8 @@ def _render_dashboard() -> str:
     &nbsp;·&nbsp; Balance: <b class="{balance_color}">${balance:.4f}</b>
   </span>
 </div>
+
+{session_panel}
 
 <!-- ── 1. Header card ── -->
 <div class="grid">
@@ -1391,15 +1603,25 @@ def stats_route():
         "target_reached_balance": s.get("target_reached_balance"),
         "current_symbol":     str(s.get("current_symbol", "—")),
         "session":            str(s.get("session", "—")),
+        "session_state":      str(s.get("session_state", "IDLE")),
+        "session_name":       str(s.get("session_name", "")),
+        "session_open_ts":    _num(s.get("session_open_ts")),
+        "session_close_ts":   _num(s.get("session_close_ts")),
+        "session_connect_ts": _num(s.get("session_connect_ts")),
+        "session_lead_stage": str(s.get("session_lead_stage", "")),
+        "session_lead_seconds": _num(s.get("session_lead_seconds")),
+        "clock_offset":       _num(s.get("clock_offset")),
+        "clock_error":        _num(s.get("clock_error")),
+        "redeploy_state":     str(s.get("redeploy_state", "")),
+        "redeploy_fire_ts":   _num(s.get("redeploy_fire_ts")),
+        "redeploy_note":      str(s.get("redeploy_note", "")),
+        "server_time":        time.time(),   # bot-host clock now; the page adds clock_offset for countdowns
         "uptime_seconds":     int(s.get("uptime_seconds", 0)),
         "last_signal":        s.get("last_signal", "—"),
         "tradeable_count":    int(s.get("tradeable_count", 0)),
         "active_trades":      int(s.get("active_trades", 0)),
         "suspended_symbols":  s.get("suspended_symbols", []),  # Task 5 fix: now per-(indicator,symbol) pair data — see update_suspended_symbols() docstring
         "circuit_breaker_symbols": s.get("circuit_breaker_symbols", []),  # whole-symbol buy-failure suspensions, Task 5/6
-        "redeploy_hook_missing":          bool(s.get("redeploy_hook_missing", False)),
-        "redeploy_watchdog_overdue":      bool(s.get("redeploy_watchdog_overdue", False)),
-        "redeploy_watchdog_overdue_mins": round(float(s.get("redeploy_watchdog_overdue_mins", 0.0)), 1),
         "hourly_pnl":         s.get("hourly_pnl", {}),
         "daily_pnl_history":  s.get("daily_pnl_history", []),
         "all_trades_count":   len(s.get("all_trades", [])),
