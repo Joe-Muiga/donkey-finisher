@@ -28,6 +28,20 @@
   .note { font-size: .78rem; color: #d29922; margin-top: 12px; line-height: 1.5; }
   svg { width: 100%; height: 130px; display: block; }
   .tag { font-size: .68rem; border: 1px solid #484f58; border-radius: 10px; padding: 1px 6px; color: #8b949e; }
+  /* bot session status */
+  .sx-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .sx-badge { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: .85rem; font-weight: 700; letter-spacing: .03em; }
+  .sx-idle { background: #21262d; color: #8b949e; } .sx-warn { background: #3a2a1a; color: #d29922; }
+  .sx-info { background: #1a2a3a; color: #58a6ff; } .sx-live { background: #1a3a1f; color: #3fb950; }
+  .sx-redeploy { background: #2a1a3a; color: #c084fc; }
+  .sx-sub { font-size: .78rem; color: #8b949e; }
+  .sx-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .sx-item { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 8px 10px; }
+  .sx-item .sub { font-size: .7rem; color: #8b949e; margin-top: 3px; }
+  .sx-wide { grid-column: 1 / -1; }
+  .sx-val { font-size: 1rem; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .sx-dim { color: #8b949e; font-weight: 400; }
+  .sx-rd-scheduled { color: #58a6ff; } .sx-rd-fired { color: #c084fc; } .sx-rd-skipped { color: #d29922; } .sx-rd-failed { color: #f85149; }
 </style>
 </head>
 <body>
@@ -38,6 +52,11 @@
     <button class="btn on" id="b-utc" onclick="setTz('utc')">UTC</button>
     <button class="btn" id="b-loc" onclick="setTz('local')">Browser local (<span id="tzname"></span>)</button>
   </div>
+</div>
+
+<div class="section card" id="sx-wrap">
+  <h2>Bot session <span class="tag" id="sx-upd">loading…</span></h2>
+  <div id="sx"></div>
 </div>
 
 <div class="grid" id="overall"></div>
@@ -181,6 +200,101 @@ async function loadExp() {
   } catch (err) {}
 }
 loadExp(); setInterval(loadExp, 15000);
+
+// ── Bot session status ───────────────────────────────────────────────────────
+// Reads /stats (no PIN). Countdowns use the bot host's clock + clock_offset (Deriv time), advanced with the
+// browser's monotonic clock, so this machine's own clock never matters. If the new keys are missing
+// (older server / engine) the old free-text "session" is shown instead.
+const SX_STATES = ['IDLE', 'CONNECTING', 'WARMING', 'LIVE', 'DRAINING', 'REDEPLOYING'];
+const SX_WHEN = {connect: ['IDLE', 'REDEPLOYING'], open: ['IDLE', 'CONNECTING', 'WARMING', 'REDEPLOYING'], close: ['LIVE']};
+let sxBase = 0, sxT0 = 0;
+const num = v => { const f = Number(v); return Number.isFinite(f) ? f : 0; };
+const esc = t => String(t == null ? '' : t).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+const two = n => (n < 10 ? '0' : '') + n;
+function fmtCd(s) {                                   // never negative
+  s = Math.floor(s);
+  if (!(s > 0)) return '0s';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+  return h ? h + 'h ' + two(m) + 'm ' + two(x) + 's' : m ? m + 'm ' + two(x) + 's' : x + 's';
+}
+function fmtUtc(ts) {
+  ts = num(ts); if (ts <= 0) return '—';
+  const d = new Date(ts * 1000); if (isNaN(d.getTime())) return '—';
+  return two(d.getUTCHours()) + ':' + two(d.getUTCMinutes()) + ':' + two(d.getUTCSeconds()) + ' UTC';
+}
+const sxNow = () => sxBase + (performance.now() - sxT0) / 1000;
+function sxTick() {
+  const n = sxNow();
+  document.querySelectorAll('#sx [data-cd]').forEach(el => {
+    const t = parseFloat(el.getAttribute('data-cd')); if (isFinite(t)) el.textContent = fmtCd(t - n);
+  });
+}
+function renderSession(s) {
+  const state = String(s.session_state || '').trim().toUpperCase();
+  const name = String(s.session_name || '').trim().toUpperCase();
+  const ts = {connect: num(s.session_connect_ts), open: num(s.session_open_ts), close: num(s.session_close_ts)};
+  const legacy = !SX_STATES.includes(state) || (state === 'IDLE' && !name && !(ts.connect > 0 || ts.open > 0 || ts.close > 0));
+  if (legacy) {
+    document.getElementById('sx').innerHTML = `<div class="sx-head"><span class="sx-badge sx-idle">${esc(String(s.session || '—').slice(0, 80))}</span>
+      <span class="sx-sub">no schedule data from the engine</span></div>`;
+    return;
+  }
+  let label, cls;
+  if (state === 'LIVE') { label = name === 'ALL' ? 'LIVE - always on' : name ? 'SESSION ' + name + ' LIVE' : 'LIVE'; cls = 'sx-live'; }
+  else if (state === 'CONNECTING') { label = 'CONNECTING'; cls = 'sx-warn'; }
+  else if (state === 'WARMING') { label = 'WARMING UP'; cls = 'sx-info'; }
+  else if (state === 'DRAINING') { label = 'DRAINING'; cls = 'sx-warn'; }
+  else if (state === 'REDEPLOYING') { label = 'REDEPLOYING'; cls = 'sx-redeploy'; }
+  else { label = 'IDLE - disconnected'; cls = 'sx-idle'; }
+
+  const item = (title, val, sub, wide) => `<div class="sx-item${wide ? ' sx-wide' : ''}"><div class="label">${title}</div>
+    <div class="sx-val">${val}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
+  const dash = '<span class="sx-dim">—</span>';
+  const cdSpan = t => `<span data-cd="${t.toFixed(3)}">${fmtCd(t - sxNow())}</span>`;
+  const cdItem = (title, kind) => {
+    const t = ts[kind];
+    if (name === 'ALL') return item(title, '<span class="sx-dim">always on</span>');
+    const sub = t > 0 ? fmtUtc(t) : '';
+    return (t > 0 && SX_WHEN[kind].includes(state)) ? item(title, cdSpan(t), sub) : item(title, dash, sub);
+  };
+  const stage = String(s.session_lead_stage || '').trim();
+  const stageShown = (state === 'CONNECTING' || state === 'WARMING') && stage;
+  const offs = num(s.clock_offset), err = num(s.clock_error), lead = num(s.session_lead_seconds);
+
+  const rs = String(s.redeploy_state || '').trim().toLowerCase(), rts = num(s.redeploy_fire_ts);
+  const note = String(s.redeploy_note || '').trim().slice(0, 200);
+  let rd;
+  if (!rs) rd = '<span class="sx-dim">none planned</span>';
+  else if (rs === 'scheduled') rd = '<span class="sx-rd-scheduled">scheduled</span>' + (rts > 0 ? ` <span class="sx-dim">fires ${fmtUtc(rts)} · in </span>${cdSpan(rts)}` : '');
+  else if (rs === 'fired') rd = '<span class="sx-rd-fired">fired</span>' + (rts > 0 ? ` <span class="sx-dim">at ${fmtUtc(rts)}</span>` : '');
+  else if (rs === 'skipped' || rs === 'failed') rd = `<span class="sx-rd-${rs}">${rs}</span>` + (rts > 0 ? ` <span class="sx-dim">planned ${fmtUtc(rts)}</span>` : '');
+  else rd = esc(rs);
+
+  document.getElementById('sx').innerHTML =
+    `<div class="sx-head"><span class="sx-badge ${cls}">${esc(label)}</span><span class="sx-sub">${stageShown ? 'stage: ' + esc(stage) : ''}</span></div>
+     <div class="sx-grid">` +
+    item('Session', name === 'ALL' ? 'ALL <span class="sx-dim">(always on)</span>' : name ? esc(name) : dash) +
+    cdItem('Connects in', 'connect') + cdItem('Opens in', 'open') + cdItem('Closes in', 'close') +
+    item('Lead stage', stageShown ? esc(stage) : dash) +
+    item('Last lead', lead > 0 ? lead.toFixed(1) + ' s' : dash) +
+    item('Clock offset', (offs || err) ? (offs >= 0 ? "+" : "−") + Math.abs(offs).toFixed(3) + ' s' : dash) +
+    item('Clock error', err > 0 ? '±' + err.toFixed(3) + ' s' : dash) +
+    item('Redeploy', rd, esc(note), true) + '</div>';
+}
+async function loadSession() {
+  const tag = document.getElementById('sx-upd');
+  try {
+    const r = await fetch('/stats', {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const s = await r.json();
+    const st = num(s.server_time);
+    sxBase = (st > 0 ? st : Date.now() / 1000) + num(s.clock_offset);   // bot-host clock + offset = Deriv time
+    sxT0 = performance.now();
+    renderSession(s);
+    tag.textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (e) { tag.textContent = 'status unavailable (' + e.message + ')'; }
+}
+loadSession(); setInterval(loadSession, 5000); setInterval(sxTick, 250);
 </script>
 </body>
 </html>
