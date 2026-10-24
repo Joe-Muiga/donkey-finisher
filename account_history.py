@@ -102,16 +102,23 @@ async def fetch_24h(client) -> bool:
 
 
 async def run(client, period: float = 60.0) -> None:
-    """Background task: first fetch at boot, then refresh every `period` seconds."""
+    """Background task: fetch as soon as the client is connected, then refresh every `period` seconds.
+
+    It only talks to Deriv while client.is_connected is True: between sessions the bot is disconnected on purpose,
+    so the task just idles (short sleeps, no requests, no spinning) and fetches again right after the next connect.
+    Cancel-safe: the engine cancels it with its other Deriv tasks at disconnect."""
     while True:
+        wait = min(period, 5.0)                          # not connected: look again soon
         try:
-            if getattr(client, "is_connected", True):
-                await fetch_24h(client)
+            if getattr(client, "is_connected", False):
+                ok = await fetch_24h(client)
+                wait = period if ok else min(period, 15.0)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("ACCOUNT HISTORY refresh error: %s", exc)
-        await asyncio.sleep(period)
+            wait = min(period, 15.0)
+        await asyncio.sleep(wait)
 
 
 # ── live appends ─────────────────────────────────────────────────────────────
