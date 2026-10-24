@@ -77,7 +77,7 @@
 #   MH_DEADLINE_RTT=p95   # deadline gate uses the 95th-percentile RTT: conservative against tail latency (EWMA until 20 samples)
 #   MH_HMAX_TRADE=2       # trade only horizons 1-2, the ones the log-loss gate proves best
 #   MH_BUY_TIMEOUT_SECONDS=3   # buy reply timeout; a timed-out buy is reconciled (late reply / portfolio / profit_table)
-#   MH_RANK_WINDOW_SECONDS=60  # use 60 to compare Phases 1-4 on the old per-minute basis (code default is 15; allowed 15, 30, 60)
+#   MH_RANK_WINDOW_SECONDS=60  # use 60 to compare Phases 1-4 on the old per-minute basis (code default is 30 = max 2 trades/minute; allowed 30, 60)
 
 services:
   - type: web
