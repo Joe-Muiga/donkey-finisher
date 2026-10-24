@@ -1,4 +1,7 @@
 """
+NOTE: symbol_audit.py is a STANDALONE diagnostic (run it by hand: python symbol_audit.py). The bot never imports
+or starts it - there is no startup audit, and it must never run from the engine, keep_alive or the session clock.
+
 symbol_audit.py — One-time diagnostic: map every live Deriv symbol to its
 supported contract types, and cross-reference against what deriv_client.py
 can actually execute today.
