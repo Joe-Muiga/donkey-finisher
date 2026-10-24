@@ -6,11 +6,16 @@ mh_engine.py - MH MODE engine (subclass of SetEngine; flat stake, client, watchd
   * Signal: every tick, horizons 1..MH_HMAX_TRADE, all 18 Over/Under covers from the calibrated blended
     distribution; admitted when p_lb * payout/stake - 1 > MH_MIN_EDGE (lag-mixed P_eff, deadline gate).
   * Execution (MH_MINUTE_RANK=1, default): every symbol is scanned in parallel (own task per symbol) and ranked
-    TWICE inside each UTC minute: (1) the best contract (cover/horizon) of each symbol, (2) those per-symbol
-    bests ranked against each other; only the overall top MH_MINUTE_TOP_N (default 1) is bought in that minute.
-    The ranking lives for that minute only; the next minute starts from scratch. MH_MINUTE_RANK=0 = old
-    behaviour (every admitted candidate is bought). Direct buys run in parallel (API semaphore only).
-  * Everything new is in memory and rebuilt at boot; the 10-minute redeploy refits the models.
+    TWICE inside each ranking window (MH_RANK_WINDOW_SECONDS = 15 / 30 / 60, UTC grid, server clock): (1) the best
+    contract (cover/horizon) of each symbol (the ROLLING BOARD: newest signal per symbol, not cleared at a window
+    boundary), (2) the admissible board entries ranked against each other; only the overall top MH_WINDOW_TOP_N
+    (default 1) is bought per window. ONE pick round per window: EARLY trigger (admissible pool >= MH_EARLY_POOL_MIN,
+    never before rank_delay) or FALLBACK at MH_FALLBACK_FRAC x window with whatever is admissible (>= 1).
+    60 s windows keep the old minute behaviour (first admissible pick after rank_delay).
+    MH_MINUTE_RANK=0 = old behaviour (every admitted candidate is bought). Direct buys run in parallel (API semaphore only).
+  * Sessions (window_scheduler): the process is connected only in a session lead / session / drain. The first session
+    after a process start runs the boot fit (_init_symbols); every later one runs _lead_prepare (adopt, clear, refit,
+    gap resync, quotes) before open_ts. Everything is in memory; the only restart is the single pre-A redeploy.
 """
 import asyncio
 import collections
@@ -27,18 +32,19 @@ import numpy as np
 import account_history
 import config
 import exp_mode
-import restart_scheduler
 import stream_diag
 from exp_stats import EXP
 import mh_predictor as mp
 import predictor as pred
 import set_predictor as sp
 import target_guard
+import window_scheduler as ws
 from bot_engine import BotEngine, _cfg
 from set_engine import SetEngine, account_allowed
 
 logger = logging.getLogger(__name__)
 RATIO_TTL = float(getattr(config, "MH_RATIO_TTL", 600.0))   # digit-contract payout ratios are ~constant: cache long
+_PROCESS_T0 = time.time()                                   # ~process start (boot report: how long boot + first fit took)
 
 
 def parse_shortcode(sc) -> Optional[dict]:
@@ -93,7 +99,7 @@ class MHSignal:
 
 
 class Cand:
-    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score", "cl", "arm", "extra", "qts")
+    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score", "cl", "arm", "extra", "qts", "win")
 
     def __init__(self, sig, h, ci, p, lb, r, edge):
         self.sig, self.h, self.ci, self.p, self.lb, self.r, self.edge = sig, h, ci, p, lb, r, edge
@@ -102,6 +108,7 @@ class Cand:
         self.arm = None                                  # test mode: "test" | "ctl"
         self.extra = None                                # extra fields stored with the open contract
         self.qts = None                                  # wall-clock time of the admission quote (payout-slip diagnostics)
+        self.win = None                                  # ranking-window id AT PICK TIME (the slot a failed buy releases)
 
 
 def p_eff_mix(ph, pn, q: float):
@@ -186,7 +193,10 @@ class MHEngine(SetEngine):
         self._doubt_open: set = set()                     # reconcile tasks that have not reached a decision yet
         self._reconciles: set = set()
         self._known_cids: "collections.OrderedDict[str, None]" = collections.OrderedDict()   # every contract tracked (bounded)
-        self.max_quote_age = float(_cfg("MH_MAX_QUOTE_AGE_SECONDS", 0.0))   # 0 = off; else older quotes are refetched
+        mq = float(_cfg("MH_MAX_QUOTE_AGE_SECONDS", 45.0))
+        self.max_quote_age = mq if mq > 0 else 45.0                          # older quotes are refetched (scan cache TTL + again right before the buy)
+        self.quote_timeout = max(0.2, float(_cfg("MH_QUOTE_REFRESH_TIMEOUT_SECONDS", 2.0)))   # bound of the pre-buy refetch
+        self._qr = collections.Counter()                                     # quote refresh outcomes (log / report only)
         self._slips: collections.deque = collections.deque(maxlen=500)      # paid_ratio - quote_ratio (measurement only)
         self._slip_low = 0                                                  # buys with paid_ratio < MH_MIN_PAYOUT_RATIO
         self._slip_n = 0
@@ -206,23 +216,39 @@ class MHEngine(SetEngine):
         self._tcount: Dict[tuple, int] = {}
         # minute ranking: per-symbol best contract, then best overall, once per UTC minute
         self.minute_rank = bool(int(_num("MH_MINUTE_RANK", 1)))
-        rw = int(_num("MH_RANK_WINDOW_SECONDS", 30))
-        if rw not in (30, 60):
-            logger.warning("MH_RANK_WINDOW_SECONDS=%s is not 30 or 60: using 30", rw)
-            rw = 30
-        self.rank_window = rw                                                # ranking window: 30 = :00/:30 each minute, 60 = old
+        rw = int(_num("MH_RANK_WINDOW_SECONDS", 15))
+        if rw not in (15, 30, 60):
+            logger.warning("MH_RANK_WINDOW_SECONDS=%s is not 15, 30 or 60: using 15", rw)
+            rw = 15
+        self.rank_window = rw                                                # ranking window: 15 = :00/:15/:30/:45 UTC, 30, 60 = old minute
         rm = str(_cfg("MH_RANK_MODE", "snapshot")).strip().lower()
         self.rank_mode = rm if rm in ("snapshot", "bar") else "snapshot"
         self.minute_top_n = max(1, int(_num("MH_WINDOW_TOP_N", _num("MH_MINUTE_TOP_N", 1))))   # contracts bought per WINDOW
         self.rank_delay = min(max(0.0, _num("MH_RANK_DELAY_SECONDS", 1.0)), 0.5 * rw)          # always < the window length
+        # pick timing (contract section 6): early trigger / fallback. 60 s windows keep the old minute (first admissible pick).
+        self.early_trigger = bool(int(_num("MH_EARLY_TRIGGER", 1)))
+        self.early_pool_min = max(1, int(_num("MH_EARLY_POOL_MIN", 5)))
+        ff = float(_num("MH_FALLBACK_FRAC", 0.7))
+        if not (0.0 < ff < 1.0):
+            logger.warning("MH_FALLBACK_FRAC=%s is not inside (0, 1): using 0.7", ff)
+            ff = 0.7
+        self.fallback_frac = ff
+        self.fallback_at = max(self.rank_delay, ff * rw)                     # seconds after the window start
+        self.legacy_pick = (rw == 60)                                        # old minute: pick at the first admissible scan after rank_delay
+        self.board_max_age = max(1.0, float(_num("MH_BOARD_MAX_AGE_SECONDS", 30.0)))
         self._bar_pool: Dict[str, "Cand"] = {}
         self._rnd_rej: Dict[str, str] = {}
         self._rnd_snap = 0
         self._rnd_seen = False
         self._rnd_c0 = (0, 0, 0, 0)
         self._rnd_minute = -1                                                # id of the current ranking window
-        self._rnd_best: Dict[str, "Cand"] = {}                               # level 1: best contract per symbol (this minute)
-        self._rnd_n = 0                                                      # contracts picked in this minute
+        self._board: Dict[str, "Cand"] = {}                                  # ROLLING BOARD: best contract per symbol from its newest signal
+        self._win_picks: Dict[int, int] = {}                                 # window id -> contracts picked (a failed buy gives its slot back)
+        self._trig = collections.Counter()                                   # per session: pick rounds by trigger (early / fallback / legacy)
+        self._win_seen = 0                                                   # per session: windows that had at least one scan
+        self._win_none = 0                                                   # per session: windows that ended without a pick
+        self._lead_stale: set = set()                                        # symbols whose model has not been swapped / resynced in this lead yet
+        self._lead_stage_secs: Dict[str, float] = {}                         # last lead: seconds per stage (also logged + ledger 'lead' event)
         self._brk: Dict[str, collections.deque] = {}
         self._muted: set = set()
         self._hs_n = collections.Counter()
@@ -289,13 +315,19 @@ class MHEngine(SetEngine):
                            "+0.02 of edge at payout 1.9); use ONE of them", mp.WILSON_Z, self.min_edge)
         logger.info("MH RANK: window=%ds mode=%s key=%s top_n=%d delay=%.1fs", self.rank_window, self.rank_mode, self.rank_key,
                     self.minute_top_n, self.rank_delay)
-        logger.info("MH CONFIG effective: MH_DEADLINE_RTT=%s MH_HMAX_TRADE=%d MH_BUY_TIMEOUT_SECONDS=%.1f REDEPLOY_DRAIN=%s "
+        logger.info("MH PICK: %s | board max age %.0fs | max quote age %.0fs (pre-buy refetch bound %.1fs)",
+                    "legacy (60 s = old minute: first admissible pick after rank_delay)" if self.legacy_pick else
+                    f"early={'on' if self.early_trigger else 'off'} pool>={self.early_pool_min}, fallback at {self.fallback_at:.1f}s "
+                    f"({self.fallback_frac:.2f} x window)", self.board_max_age, self.max_quote_age, self.quote_timeout)
+        logger.info("MH CONFIG effective: MH_DEADLINE_RTT=%s MH_HMAX_TRADE=%d MH_BUY_TIMEOUT_SECONDS=%.1f "
                     "MH_MIN_EDGE=%.3f WILSON_Z=%.2f MH_GATE_Z=%.2f", str(_cfg("MH_DEADLINE_RTT", "p50")).lower(), self.hmax,
-                    self.buy_timeout, _cfg("REDEPLOY_DRAIN", 1), self.min_edge, mp.WILSON_Z, float(_cfg("MH_GATE_Z", 1.96)))
+                    self.buy_timeout, self.min_edge, mp.WILSON_Z, float(_cfg("MH_GATE_Z", 1.96)))
         await BotEngine.run(self)
 
     def _extra_tasks(self) -> list:
-        t = [self._scanner_loop(), self._report_loop(), account_history.run(self.client), self._adopt_orphans()]
+        t = [self._scanner_loop(), self._report_loop(), account_history.run(self.client)]   # orphans are adopted inside the lead now
+        if self.minute_rank and not self.test_mode:
+            t.append(self._window_clock_loop())
         if self._ledger_on:
             t.append(self._exp_loop())
         if self.inproc_refit > 0:
@@ -310,8 +342,8 @@ class MHEngine(SetEngine):
             pass
 
     def _blocked(self) -> bool:
-        if super()._blocked() or restart_scheduler.buys_blocked():
-            return True                                    # includes the last REDEPLOY_BUY_BLOCK_SECONDS before a redeploy
+        if super()._blocked():
+            return True                                    # not connected / session over / outside the buy window / target / resync
         try:
             import kill_switch
             if kill_switch.is_paused():
@@ -325,9 +357,11 @@ class MHEngine(SetEngine):
 
     # ── boot: concurrent init, probe first ───────────────────────────────────
     async def _init_symbols(self) -> list:
+        """Boot fit: the first session after a process start (later sessions run _lead_prepare instead)."""
         self._boot_t0 = time.time()
         if self._ledger_on:
             await self._exp_boot()
+        await self._adopt_orphans()                         # contracts a previous process left open on Deriv (own errors handled)
         sem = asyncio.Semaphore(max(1, int(_cfg("MH_BOOT_CONCURRENCY", 5))))
 
         async def one(sym: str) -> Optional[str]:
@@ -353,10 +387,7 @@ class MHEngine(SetEngine):
         self._rtt_ready = True
         logger.info("MH BOOT done in %.1fs, rtt estimate %.3fs", time.time() - self._boot_t0, self._rtt or 0.0)
         if self._ledger_on:
-            await self._exp_ready()                         # also marks the engine ready for the redeploy guard
-        else:
-            import redeploy_guard
-            redeploy_guard.mark_engine_ready()              # without this the 7-minute redeploy preflight refuses forever
+            await self._exp_ready()                         # boot report (ledger "ready" event)
         return [s for s in res if s]
 
     async def _init_symbol(self, sym: str, sem: Optional[asyncio.Semaphore] = None):
@@ -439,9 +470,8 @@ class MHEngine(SetEngine):
         return float(statistics.median(gaps)) if gaps else 2.0
 
     # ── ticks ────────────────────────────────────────────────────────────────
-    def _ingest(self, sym: str, mhs: mp.MHSymbol, ep: float, digit: int) -> bool:
-        if not mhs.on_tick(digit, ep):
-            return False
+    def _book(self, sym: str, ep: float) -> int:
+        """Tick bookkeeping (index counter, epoch -> index map, recent epochs, tick gap) without touching a model."""
         i = self._idx[sym] + 1
         self._idx[sym] = i
         e = int(ep)
@@ -456,6 +486,12 @@ class MHEngine(SetEngine):
         self._last_epoch[sym] = ep
         if i % 50 == 0:
             self._T[sym] = self._median_gap(list(q))
+        return i
+
+    def _ingest(self, sym: str, mhs: mp.MHSymbol, ep: float, digit: int) -> bool:
+        if not mhs.on_tick(digit, ep):
+            return False
+        i = self._book(sym, ep)
         if self.test_mode:
             self._exp_on_digit(sym, i, digit)
         return True
@@ -772,6 +808,7 @@ class MHEngine(SetEngine):
                 self._last_decision = "skip: balance cannot pay the stake"
                 break
             self._tcount[tk] = self._tcount.get(tk, 0) + 1
+            c.win = self._win_id()                          # window id at pick time (no window slot in this legacy path)
             picks.append((c, stake))
         if picks:
             self._rank_shadow(cands, picks, f"scan {self._scans}")
@@ -792,8 +829,9 @@ class MHEngine(SetEngine):
     def _cand_key(self, c: "Cand"):
         return self._key_edge(c) if (self.rank_key == "edge" and self.cluster) else self._key_mass(c)
 
-    def _rank_shadow(self, pool: List["Cand"], picks: List[Tuple["Cand", float]], where: str) -> None:
-        """Both orderings over the SAME pool, logged for offline comparison. No API calls; c.score is never touched."""
+    def _rank_shadow(self, pool: List["Cand"], picks: List[Tuple["Cand", float]], where: str, trigger: str = "") -> None:
+        """Both orderings over the SAME pool, logged for offline comparison. No API calls; c.score is never touched.
+        `trigger` = which pick trigger fired this round: early | fallback | legacy ('' outside the window ranking)."""
         if not pool:
             return
         tag = lambda x: f"{x.sig.sym}:{mp.COVERS[x.ci][0]}{mp.COVERS[x.ci][1]}:h{x.h}"
@@ -802,41 +840,124 @@ class MHEngine(SetEngine):
         bought = [{"c": tag(c), "mass": round(c.score, 4), "edge": round(c.edge, 4), "lb": round(c.lb, 4)} for c, _ in picks]
         rm = tag(bm[1]) if len(bm) > 1 else "-"
         re_ = tag(be[1]) if len(be) > 1 else "-"
-        logger.info("RANK SHADOW %s pool=%d key=%s mass_top=%s edge_top=%s agree=%d bought=%s runner_mass=%s runner_edge=%s",
+        logger.info("RANK SHADOW %s pool=%d key=%s mass_top=%s edge_top=%s agree=%d bought=%s runner_mass=%s runner_edge=%s%s",
                     where, len(pool), self.rank_key, tag(bm[0]), tag(be[0]), agree,
-                    [(b["c"], b["mass"], b["edge"]) for b in bought], rm, re_)
+                    [(b["c"], b["mass"], b["edge"]) for b in bought], rm, re_, f" trigger={trigger}" if trigger else "")
         if self.ledger is not None:
+            extra = {"trigger": trigger, "win": picks[0][0].win} if trigger and picks else {}
             self.ledger.event("rank_shadow", where=where, pool=len(pool), key=self.rank_key,
                               mass_order=[tag(x) for x in bm[:5]], edge_order=[tag(x) for x in be[:5]],
                               mass_top=tag(bm[0]), edge_top=tag(be[0]), agree=agree, bought=bought,
-                              runner_mass=rm, runner_edge=re_)
+                              runner_mass=rm, runner_edge=re_, **extra)
+
+    def _now(self) -> float:
+        """Deriv-server time (ws.now()): the ranking windows sit on the same clock as the session schedule."""
+        return ws.now()
 
     def _win_id(self, now: Optional[float] = None) -> int:
-        return int((time.time() if now is None else now) // self.rank_window)
+        return int((self._now() if now is None else now) // self.rank_window)
 
     def _win_label(self, win: int) -> str:
         t = win * self.rank_window
         return f"{int(t % 86400 // 3600):02d}:{int(t % 3600 // 60):02d}:{int(t % 60):02d}"
 
+    def _slot_n(self, win: int) -> int:
+        return self._win_picks.get(win, 0)
+
+    def _release_slot(self, win: int) -> bool:
+        """A pick of window `win` did NOT become a position: give its slot back (any window, not just the current one)."""
+        n = self._win_picks.get(win, 0)
+        if n <= 0:
+            return False
+        self._win_picks[win] = n - 1
+        return True
+
     def _roll_window(self, win: int) -> None:
         """A new ranking window starts: log how the old one went, then reset the bookkeeping.
-        (_rnd_minute / _rnd_n / _rnd_best now hold the WINDOW id / picks / per-symbol bests; 60 s = the old minute.)"""
+        _rnd_minute holds the WINDOW id; picks per window live in _win_picks; the rolling board is NOT cleared
+        (60 s = the old minute)."""
         prev = self._rnd_minute
         if prev >= 0 and self._rnd_seen:
-            bar = len(self._rnd_best)
+            n = self._slot_n(prev)
+            self._win_seen += 1
+            bar = len(self._board)
             rej = collections.Counter(self._rnd_rej.values())
             rej.update({"min_ratio": self._cl_floor - self._rnd_c0[0], "edge": self._cl_edge - self._rnd_c0[1],
                         "gate/mute": self._cl_gate - self._rnd_c0[2], "oos": self._cl_oos - self._rnd_c0[3]})
             rej = {k: v for k, v in rej.items() if v > 0}
-            if self._rnd_n == 0:
+            if n == 0:
+                self._win_none += 1
                 logger.info("WINDOW RANK %s: no admissible candidate | pool snapshot=%d bar=%d | rejected: %s",
                             self._win_label(prev), self._rnd_snap, bar, ", ".join(f"{k}={v}" for k, v in sorted(rej.items(), key=lambda x: -x[1])) or "-")
             else:
-                logger.info("WINDOW RANK %s: bought %d | pool snapshot=%d bar=%d", self._win_label(prev), self._rnd_n, self._rnd_snap, bar)
-        self._bar_pool = dict(self._rnd_best) if self.rank_mode == "bar" else {}   # bar mode: the window that just closed
-        self._rnd_minute, self._rnd_best, self._rnd_n = win, {}, 0
+                logger.info("WINDOW RANK %s: bought %d | pool snapshot=%d bar=%d", self._win_label(prev), n, self._rnd_snap, bar)
+        if self.rank_mode == "bar":                         # bar mode: the bests of the window that just closed
+            lo, hi = (win - 1) * self.rank_window, win * self.rank_window
+            self._bar_pool = {s: c for s, c in self._board.items() if lo <= c.sig.recv < hi}
+        else:
+            self._bar_pool = {}
+        self._rnd_minute = win
         self._rnd_rej, self._rnd_snap, self._rnd_seen = {}, 0, False
         self._rnd_c0 = (self._cl_floor, self._cl_edge, self._cl_gate, self._cl_oos)
+        for w in [w for w in self._win_picks if w < win - 16]:      # keep the bookkeeping of the last windows only
+            self._win_picks.pop(w, None)
+
+    def _rank_roll(self, now: float) -> int:
+        win = self._win_id(now)
+        if win != self._rnd_minute:
+            self._roll_window(win)
+        return win
+
+    def _board_prune(self, now: float) -> None:
+        """Rolling board hygiene: drop entries that are too old or whose symbol is muted / held. In snapshot mode also
+        entries superseded by a newer tick (stale) or past the deadline gate (late). Bar mode keeps older entries on
+        purpose (the buy re-derives them at the current state)."""
+        for sym, c in list(self._board.items()):
+            why = None
+            if now - c.sig.recv > self.board_max_age:
+                why = "age"
+            elif sym in self._muted or sym in self._hold:
+                why = "muted/held"
+            elif self.rank_mode != "bar":
+                if self._idx.get(sym) != c.sig.idx:
+                    why = "stale"
+                elif self._late(c.sig):
+                    why = "late"
+            if why:
+                self._board.pop(sym, None)
+                if why != "age":
+                    self._rnd_rej[sym] = why
+
+    def _rank_pool(self, now: float) -> Tuple[List["Cand"], int]:
+        """The ADMISSIBLE pool of this instant, best first, and the number of live board entries (snapshot shadow stat)."""
+        self._board_prune(now)
+        live = sum(1 for c in self._board.values() if self._idx.get(c.sig.sym) == c.sig.idx)
+        if self.rank_mode == "bar":
+            ranked = sorted(self._bar_pool.values(), key=self._cand_key)     # information of the bar that just closed
+            cand = [fc for fc in (self._bar_refresh(c) for c in ranked) if fc is not None]
+        else:
+            cand = list(self._board.values())
+        pool = []
+        for c in cand:
+            tk = (c.sig.sym, c.sig.idx + c.h)
+            if tk in self._doubt_targets or self._tcount.get(tk, 0) >= self.max_per_target:
+                self._rnd_rej[c.sig.sym] = "target_closed"                   # an in-doubt buy keeps its target closed
+                continue
+            pool.append(c)
+        pool.sort(key=self._cand_key)                       # level 2
+        return pool, live
+
+    def _rank_trigger(self, elapsed: float, n: int) -> Optional[str]:
+        """Which trigger fires the window's pick now (None = keep waiting). Never before rank_delay (checked by the caller)."""
+        if n < 1:
+            return None
+        if self.legacy_pick:
+            return "legacy"                                 # 60 s: the old minute, first admissible pool after rank_delay
+        if self.early_trigger and n >= self.early_pool_min:
+            return "early"
+        if elapsed >= self.fallback_at:
+            return "fallback"
+        return None
 
     def _bar_refresh(self, c: Cand) -> Optional[Cand]:
         """Bar mode: the ranking used the closed window's information; the BUY uses the symbol's current state.
@@ -878,15 +999,16 @@ class MHEngine(SetEngine):
         return None
 
     def _rank_minute(self, sigs: List[MHSignal], cands: List[Cand]) -> None:
-        """Two-level ranking, fresh every window (MH_RANK_WINDOW_SECONDS: 30 = :00/:30 of each UTC minute, 60 = old minute).
-        Level 1: each symbol keeps its single best contract (over/under, any horizon) from its newest signal.
-        Level 2: those per-symbol bests are ranked against each other; the top MH_WINDOW_TOP_N is bought, once per window.
+        """Two-level ranking over the ROLLING BOARD, one pick round per window (MH_RANK_WINDOW_SECONDS: 15 / 30 / 60,
+        UTC grid on the server clock; 60 = the old minute).
+        Level 1: each symbol keeps its single best contract (over/under, any horizon) from its newest signal (_board);
+                 a newer signal supersedes it; the board is NOT cleared at a window boundary.
+        Level 2: the admissible board entries are ranked against each other (_rank_pick); the top MH_WINDOW_TOP_N is
+                 bought once per window, fired by the early trigger or the fallback.
         snapshot mode: only candidates whose symbol has not ticked since the signal.  bar mode: rank the closed window's
         bests, buy against the current state (see _bar_refresh)."""
-        now = time.time()
-        win = self._win_id(now)
-        if win != self._rnd_minute:                         # new window: old ranking is discarded
-            self._roll_window(win)
+        now = self._now()
+        self._rank_roll(now)
         self._rnd_seen = True
         by_sym: Dict[str, Cand] = {}
         for c in cands:                                     # level 1
@@ -895,43 +1017,41 @@ class MHEngine(SetEngine):
                 by_sym[c.sig.sym] = c
         for sym in {sg.sym for sg in sigs}:                 # a newer signal supersedes the symbol's older candidate
             if sym in by_sym:
-                self._rnd_best[sym] = by_sym[sym]
+                self._board[sym] = by_sym[sym]
             else:
-                self._rnd_best.pop(sym, None)
-        live = [c for c in self._rnd_best.values() if self._idx.get(c.sig.sym) == c.sig.idx]
-        self._rnd_snap = max(self._rnd_snap, len(live))     # shadow: pool size a snapshot ranking would see
-        if self._rnd_n >= self.minute_top_n:
-            return
+                self._board.pop(sym, None)
+        self._rank_pick("scan")
+
+    def _rank_pick(self, where: str = "scan") -> Optional[str]:
+        """Evaluate the current window's pick (level 2). Synchronous and non-blocking: money and slots are reserved here,
+        the buys (and any quote refetch) run in the spawned _buy_one tasks. Called after every scan and by the window
+        clock at the window start / rank_delay / fallback instants. Returns the trigger that fired, else None."""
+        if not self.minute_rank or self.test_mode:
+            return None
+        now = self._now()
+        win = self._rank_roll(now)
         label = self._win_label(win)
-        if now < win * self.rank_window + self.rank_delay:
-            self._last_decision = f"window {label}: collecting ({len(self._rnd_best)} symbols ranked)"
-            return
-        if self.rank_mode == "bar":
-            ranked = sorted(self._bar_pool.values(), key=self._cand_key)     # information of the bar that just closed
-            pool = [fc for fc in (self._bar_refresh(c) for c in ranked) if fc is not None]
-        else:
-            pool = []
-            for c in self._rnd_best.values():               # only live candidates: no newer tick, not late, not muted
-                s_ = c.sig.sym
-                why = ("stale" if self._idx.get(s_) != c.sig.idx else "muted/held" if (s_ in self._muted or s_ in self._hold)
-                       else "late" if self._late(c.sig) else None)
-                if why:
-                    self._rnd_rej[s_] = why
-                else:
-                    pool.append(c)
-            pool.sort(key=self._cand_key)                   # level 2
-        if not pool:
-            return
+        if self._slot_n(win) >= self.minute_top_n or self._blocked():
+            return None
+        elapsed = now - win * self.rank_window
+        if elapsed < self.rank_delay:                       # never before rank_delay
+            self._last_decision = f"window {label}: collecting ({len(self._board)} symbols on the board)"
+            return None
+        pool, live = self._rank_pool(now)
+        self._rnd_snap = max(self._rnd_snap, live)          # shadow: pool size a snapshot ranking would see
+        trigger = self._rank_trigger(elapsed, len(pool))
+        if trigger is None:
+            if pool:
+                self._last_decision = (f"window {label}: waiting ({len(pool)} admissible, early at {self.early_pool_min}, "
+                                       f"fallback at +{self.fallback_at:.1f}s)")
+            return None
         picks: List[Tuple[Cand, float]] = []
         for c in pool:
-            if self._rnd_n + len(picks) >= self.minute_top_n or self._blocked():
+            if self._slot_n(win) + len(picks) >= self.minute_top_n or self._blocked():
                 break
             if self.max_open and len(self._open) + self._inflight + len(picks) >= self.max_open:
                 break
             tk = (c.sig.sym, c.sig.idx + c.h)
-            if tk in self._doubt_targets or self._tcount.get(tk, 0) >= self.max_per_target:
-                self._rnd_rej[c.sig.sym] = "target_closed"
-                continue                                    # an in-doubt buy keeps its target closed
             stake = self._next_stake()
             if stake is None:
                 self._last_decision = "skip: no stake available"
@@ -940,21 +1060,136 @@ class MHEngine(SetEngine):
                 self._last_decision = "skip: balance cannot pay the stake"
                 break
             self._tcount[tk] = self._tcount.get(tk, 0) + 1
+            c.win = self._win_id(now)                       # window id AT PICK TIME: carried to the buy, ledger and logs
             picks.append((c, stake))
         if not picks:
-            return
-        self._rnd_n += len(picks)
-        self._rank_shadow(pool, picks, f"window {label}")
+            return None
+        self._win_picks[win] = self._slot_n(win) + len(picks)
+        self._trig[trigger] += 1
+        self._rank_shadow(pool, picks, f"window {label}", trigger)
         runner = [f"{x.sig.sym} {mp.COVERS[x.ci][0]}{mp.COVERS[x.ci][1]}" for x in pool[len(picks):len(picks) + 2]]
         head = (f"MINUTE RANK {label[:5]} UTC" if self.rank_window == 60 else f"WINDOW RANK {label} UTC") + f" [{self.rank_mode}]"
-        logger.info("%s: %d symbols ranked -> BUY %s (runners-up: %s)", head, len(pool),
+        logger.info("%s: %d symbols ranked -> BUY %s (runners-up: %s) trigger=%s +%.1fs", head, len(pool),
                     ", ".join(f"{c.sig.sym} {mp.COVERS[c.ci][0]}{mp.COVERS[c.ci][1]} h={c.h} score={c.score:.3f} p={c.p:.3f}"
-                              for c, _ in picks), ", ".join(runner) or "-")
+                              for c, _ in picks), ", ".join(runner) or "-", trigger, elapsed)
         for c, stake in picks:
             self._inflight += 1
             t = asyncio.create_task(self._buy_one(c, stake))
             self._tasks.add(t)
             t.add_done_callback(self._tasks.discard)
+        return trigger
+
+    async def _window_clock_loop(self):
+        """Wakes at every window start (roll + log), at start + rank_delay and at start + fallback and evaluates the pick,
+        so a pick no longer waits for the next scan. 60 s windows (old minute): wakes at the window start only (roll + log)."""
+        while True:
+            try:
+                now = self._now()
+                start = self._win_id(now) * self.rank_window
+                marks = [start]
+                if not self.legacy_pick:
+                    marks += [start + self.rank_delay, start + self.fallback_at]
+                nxt = min((m for m in marks if m > now + 1e-6), default=start + self.rank_window)
+                await asyncio.sleep(max(0.005, nxt - now) + 0.002)
+                if self.legacy_pick:
+                    self._rank_roll(self._now())
+                elif not self._blocked():
+                    self._rank_pick("clock")
+                else:
+                    self._rank_roll(self._now())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("window clock error: %s", exc, exc_info=True)
+                await asyncio.sleep(1.0)
+
+    # ── quote refresh right before the buy ───────────────────────────────────
+    def _quote_reject(self, c: Cand, r: float) -> Optional[str]:
+        """Min ratio / edge check of a (re)quoted ratio with the same floors the scan applies. None = still passes."""
+        if r < self.min_ratio:
+            return "min_ratio"
+        thr = (self.rank_min_edge if self.rank_key == "edge" else self.min_edge) if self.cluster else self.min_edge
+        if c.lb * r - 1.0 <= thr:
+            return "edge"
+        return None
+
+    async def _quote_refetch(self, sym: str, ci: int, h: int, timeout: float) -> Optional[Tuple[float, float]]:
+        """One proposal for (sym, cover, h) inside `timeout` seconds in total (pacing + API permit + request).
+        Returns (ratio, wall time) and stores it in the quote cache; None = nothing usable (cooldown, timeout, error)."""
+        t_end = time.monotonic() + timeout
+        if time.monotonic() < self._rl_cool_until:
+            return None                                     # cooling down after a rate limit: send nothing
+        try:
+            await asyncio.wait_for(self._pace(), max(0.01, t_end - time.monotonic()))
+            await asyncio.wait_for(self._sem.acquire(), max(0.01, t_end - time.monotonic()))
+        except asyncio.TimeoutError:
+            return None
+        try:
+            left = t_end - time.monotonic()
+            if left < 0.15 or time.monotonic() < self._rl_cool_until:
+                return None
+            t0 = time.perf_counter()
+            try:
+                resp = await self.client._send({"proposal": 1, **self._contract_params(sym, mp.COVERS[ci], self.stake, h)}, timeout=left)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._on_api_error("proposal", exc)
+                return None
+            self._note_rtt(time.perf_counter() - t0, sym)
+            prop = (resp or {}).get("proposal") or None
+        finally:
+            self._sem.release()
+        if not prop or not prop.get("payout"):
+            return None
+        v = (float(prop["payout"]) / self.stake, time.time())
+        self._ratio_cache[(sym, ci, h)] = v
+        return v
+
+    async def _refresh_quote(self, c: Cand) -> Optional[str]:
+        """Called inside the buy task BEFORE the buy frame (the synchronous pick never blocks). A quote older than
+        MH_MAX_QUOTE_AGE_SECONDS is replaced - by a fresher cached one, else by one bounded refetch - and min ratio / edge
+        are re-checked. None = go on and buy; else the reason to abort (the caller releases money and slot)."""
+        if self.max_quote_age <= 0 or c.arm is not None or c.qts is None:
+            return None
+        now = time.time()
+        age = now - c.qts
+        if age <= self.max_quote_age:
+            return None
+        sym, ci, h = c.sig.sym, c.ci, c.h
+        tag = f"{sym} {mp.COVERS[ci][0]}{mp.COVERS[ci][1]} h={h}"
+        v = self._ratio_cache.get((sym, ci, h))
+        src = "cache"
+        if v is None or v[1] <= c.qts or now - v[1] > self.max_quote_age:
+            T = self._T.get(sym, 2.0)                       # the quote must come back inside what the deadline gate still allows
+            room = self.deadline_frac * T - (now - c.sig.recv) - self._rtt_for(sym)
+            if room <= 0.1:
+                self._qr["late"] += 1
+                logger.info("MH QUOTE REFRESH %s: quote %.0fs old, no time left to refetch (deadline gate)", tag, age)
+                self._skip_late(c.sig, "refresh")
+                return "late"
+            v = await self._quote_refetch(sym, ci, h, min(self.quote_timeout, room))
+            src = "refetch"
+        if v is None or v[1] <= c.qts or time.time() - v[1] > self.max_quote_age:
+            self._qr["failed"] += 1
+            logger.warning("MH QUOTE REFRESH FAILED %s: quote %.0fs old (> %.0fs) and no fresh one within %.1fs: NOT buying",
+                           tag, age, self.max_quote_age, self.quote_timeout)
+            if self.ledger is not None:
+                self.ledger.event("quote_refresh", sym=sym, h=h, contract=f"{mp.COVERS[ci][0]}{mp.COVERS[ci][1]}",
+                                  win=c.win, age=round(age, 1), result="failed")
+            return "refresh_failed"
+        old_r = c.r
+        c.r, c.qts = v[0], v[1]
+        c.edge = c.lb * c.r - 1.0
+        why = self._quote_reject(c, c.r)
+        self._qr["ok" if why is None else why] += 1
+        logger.info("MH QUOTE REFRESH %s: %s ratio %.3f -> %.3f (was %.0fs old)%s", tag, src, old_r or 0.0, c.r, age,
+                    "" if why is None else f" -> {why} no longer passes: NOT buying")
+        if self.ledger is not None:
+            self.ledger.event("quote_refresh", sym=sym, h=h, contract=f"{mp.COVERS[ci][0]}{mp.COVERS[ci][1]}", win=c.win,
+                              age=round(age, 1), old_ratio=None if old_r is None else round(old_r, 4), ratio=round(c.r, 4),
+                              src=src, result="ok" if why is None else why)
+        return why
 
     async def _buy_one(self, c: Cand, stake: float) -> None:
         sig, h, cand = c.sig, c.h, mp.COVERS[c.ci]
@@ -967,6 +1202,9 @@ class MHEngine(SetEngine):
             err: Optional[Exception] = None
             resp = None
             t_sent = time.time()
+            why = await self._refresh_quote(c)              # stale quote: refetch + re-check BEFORE any buy frame
+            if why is not None:
+                return                                      # nothing was sent: finally frees money, in-flight count and c.win's slot
             async with self._sem:
                 if self._late(sig):                         # waited too long for a permit
                     self._skip_late(sig, "buy")
@@ -980,8 +1218,14 @@ class MHEngine(SetEngine):
                     raise
                 except Exception as exc:
                     err = exc
-                self._note_rtt(time.perf_counter() - t0, sym)
+                if not isinstance(err, ws.SessionClosed):   # a gate refusal never reached the wire: not an RTT sample
+                    self._note_rtt(time.perf_counter() - t0, sym)
             if err is not None:
+                if isinstance(err, ws.SessionClosed):       # definitely NOT sent (engine or client send-time gate)
+                    self._last_decision = "buy blocked at session close"
+                    logger.warning("MH BUY BLOCKED AT CLOSE %s %s%s h=%d win=%s: %s (money and slot released)", sym, cand[0], cand[1],
+                                   h, self._win_label(c.win) if c.win is not None else "-", str(err)[:80])
+                    return                                  # finally: _buy_finish(ok=False) frees reservation, count and c.win's slot
                 if self._buy_in_doubt(err):                 # frame went out, outcome unknown: do NOT free anything yet
                     handed = True
                     self._start_reconcile(c, stake, tk, t_sent, err)
@@ -1007,7 +1251,8 @@ class MHEngine(SetEngine):
         return isinstance(exc, TimeoutError) or bool(getattr(exc, "sent", False))
 
     def _buy_finish(self, c: Cand, stake: float, tk: tuple, released: bool, ok: bool, win: Optional[int] = None) -> None:
-        """Release the reservation, the in-flight count and (when the buy did not happen) the slot."""
+        """Release the reservation, the in-flight count and (when the buy did not happen) the slot of the window the
+        pick was made in (c.win), whether or not that window is still the current one. An in-doubt buy keeps its slot closed."""
         if not released:
             self.money.release(stake)
         self._inflight -= 1
@@ -1017,9 +1262,11 @@ class MHEngine(SetEngine):
             self._test_pending = max(0.0, self._test_pending - stake)
         if not ok:
             self._tcount[tk] = max(0, self._tcount.get(tk, 1) - 1)
-            same = (self._win_id() == self._rnd_minute) if win is None else (win == self._rnd_minute)
-            if self.minute_rank and c.arm is None and same:
-                self._rnd_n = max(0, self._rnd_n - 1)      # the minute's pick failed: another candidate may be tried
+            w = c.win if c.win is not None else win
+            if self.minute_rank and c.arm is None and w is not None and self._release_slot(w):
+                logger.info("WINDOW %s: pick %s %s%s h=%d did not become a position: slot released%s", self._win_label(w), c.sig.sym,
+                            mp.COVERS[c.ci][0], mp.COVERS[c.ci][1], c.h,
+                            "" if w == self._rnd_minute else " (that window is already over)")
 
     def _remember_cid(self, cid: str) -> None:
         self._known_cids[cid] = None
@@ -1051,7 +1298,7 @@ class MHEngine(SetEngine):
                            "opened_at": float(buy.get("purchase_time") or time.time()),
                            "decision_epoch": sig.epoch, "t0": time.time(), "h": h, "sig_idx": sig.idx,
                            "p_cal": c.p, "p_lb": c.lb, "score": c.score, "pred_digits": (), "pred_ranked": (),
-                           "arm": c.arm or ("test" if self.test_mode else "mh"), "buy_ts": time.time(),
+                           "arm": c.arm or ("test" if self.test_mode else "mh"), "buy_ts": time.time(), "win": c.win,
                            **(c.extra or {})}
         if recovered:
             self._open[cid]["recovered"] = source
@@ -1059,7 +1306,7 @@ class MHEngine(SetEngine):
             extra = {"recovered": 1} if recovered else {}
             self.ledger.event("buy", cid=cid, sym=sym, idx=sig.idx, h=h, arm=c.arm or "mh", contract=f"{cand[0]}{cand[1]}",
                               stake=price_paid, ratio=round(ratio, 4), rtt=round(self._rtt_for(sym), 4),
-                              age=round(time.time() - sig.recv, 4),
+                              age=round(time.time() - sig.recv, 4), win=c.win,
                               payout_slip=None if slip is None else round(slip, 4), **extra)
         tg = f"{cand[0]}{cand[1]}"
         cl_s = ""
@@ -1067,6 +1314,8 @@ class MHEngine(SetEngine):
             self._cl_cover[tg] += 1
             self._cl_width[c.cl[2]] += 1
             cl_s = " cluster=%s mass=%.2f width=%d pick=%s" % (list(c.cl[0]), c.cl[1], c.cl[2], self.pick)
+        if c.win is not None:
+            cl_s += " win=%s" % self._win_label(c.win)
         self._last_decision = f"BUY {sym} {tg} h={h} p={c.p:.3f} lb={c.lb:.3f} r={ratio:.3f} edge_lb={c.edge:+.3f}"
         logger.info("MH TRADE %s %s %s h=%d p_cal=%.3f p_lb=%.3f paid=%.2f payout=%.2f ratio=%.3f edge_lb=%+.3f "
                     "score=%.4f q=%.2f shortcode=%s", cid, sym, tg, h, c.p, c.lb, price_paid, payout, ratio, c.edge,
@@ -1085,8 +1334,9 @@ class MHEngine(SetEngine):
     def _start_reconcile(self, c: Cand, stake: float, tk: tuple, t_sent: float, err: BaseException) -> None:
         req_id = getattr(err, "req_id", None)
         self._doubt_targets.add(tk)                         # no second candidate for this (symbol, target tick)
-        logger.warning("MH BUY IN DOUBT %s %s%s h=%d req_id=%s (%s: %s): reservation and slot held, reconciling",
-                       c.sig.sym, mp.COVERS[c.ci][0], mp.COVERS[c.ci][1], c.h, req_id, type(err).__name__, str(err)[:80])
+        logger.warning("MH BUY IN DOUBT %s %s%s h=%d win=%s req_id=%s (%s: %s): reservation and slot held, reconciling",
+                       c.sig.sym, mp.COVERS[c.ci][0], mp.COVERS[c.ci][1], c.h, self._win_label(c.win) if c.win is not None else "-",
+                       req_id, type(err).__name__, str(err)[:80])
         t = asyncio.create_task(self._reconcile_in_doubt(c, stake, tk, req_id, t_sent))
         self._reconciles.add(t)
         self._doubt_open.add(t)
@@ -1120,7 +1370,7 @@ class MHEngine(SetEngine):
 
     async def _reconcile_in_doubt(self, c: Cand, stake: float, tk: tuple, req_id, t_sent: float) -> None:
         sym, h, cand = c.sig.sym, c.h, mp.COVERS[c.ci]
-        win = self._rnd_minute
+        win = c.win                                         # the window the pick was made in (not whatever window is current later)
         st = {"ok": False}
         released = False
         me_task = asyncio.current_task()
@@ -1173,7 +1423,7 @@ class MHEngine(SetEngine):
             logger.error("MH BUY IN DOUBT UNRESOLVED %s %s%s h=%d req_id=%s: slot stays closed", sym, cand[0], cand[1], h, req_id)
             if self.ledger is not None:
                 self.ledger.event("buy_in_doubt_unresolved", **ident)
-            st["ok"] = True                                 # ok=True keeps _tcount / _rnd_n counted (slot closed)
+            st["ok"] = True                                 # ok=True keeps _tcount / the window slot counted (slot closed)
             await asyncio.sleep(self.reconcile_safety)
             buy = late_reply()
             if buy is not None:
@@ -1195,8 +1445,10 @@ class MHEngine(SetEngine):
             self._doubt_open.discard(me_task)
             self._buy_finish(c, stake, tk, released, st["ok"], win)
 
-    # ── boot: adopt contracts Deriv still holds for us ───────────────────────
+    # ── lead / boot: adopt contracts Deriv still holds for us ────────────────
     async def _adopt_orphans(self) -> None:
+        """Contracts open on Deriv that this process does not track (left by a previous process, or open at a session's
+        disconnect and then forgotten): tracked and subscribed again. Runs at boot (first session) and inside every lead."""
         if not self.adopt_orphans:
             return
         try:
@@ -1204,7 +1456,7 @@ class MHEngine(SetEngine):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("MH ADOPT: portfolio unavailable at boot (%s)", exc)
+            logger.warning("MH ADOPT: portfolio unavailable (%s)", exc)
             return
         n = 0
         for r in rows:
@@ -1237,7 +1489,37 @@ class MHEngine(SetEngine):
                 self.ledger.event("orphan_adopted", cid=cid, sym=sym, contract=f"{cand[0]}{cand[1]}", stake=bp)
             logger.warning("MH ADOPT ORPHAN %s %s %s%d stake=%.2f (open on Deriv, not tracked here)", cid, sym, cand[0], cand[1], bp)
             n += 1
-        logger.info("MH ADOPT: %d orphan contract(s) adopted at boot", n)
+        logger.info("MH ADOPT: %d orphan contract(s) adopted", n)
+
+    async def _settle_leftovers(self) -> int:
+        """Contracts this process still tracks from the previous session (open at the disconnect): their subscriptions died
+        with the socket, they settled on Deriv's side in the gap. Ask Deriv once each; settled ones go through the normal
+        settlement path, the others are subscribed again. Returns the number settled."""
+        n = 0
+        for cid in list(self._open):
+            info = self._open.get(cid)
+            if info is None:
+                continue
+            try:
+                poc = await asyncio.wait_for(self.client.force_check_contract(cid), timeout=8.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("MH LEFTOVER %s: check failed (%s)", cid, exc)
+                continue
+            if poc and (poc.get("is_sold") or poc.get("is_expired") or poc.get("status") in ("sold", "won", "lost")):
+                await self._on_contract_result(cid, {"proposal_open_contract": poc})
+                n += 1
+                continue
+            try:
+                self.client._contract_symbol_map[cid] = info.get("sym")
+                await self.client.subscribe_contract(
+                    cid, lambda msg, _c=cid: asyncio.create_task(self._on_contract_result(_c, msg)), symbol=info.get("sym"))
+            except Exception as exc:
+                logger.warning("MH LEFTOVER %s: subscribe failed (settle loop will poll): %s", cid, exc)
+        if n or self._open:
+            logger.info("MH LEFTOVERS: %d settled from the previous session, %d still open", n, len(self._open))
+        return n
 
     # ── TEST MODE: frozen zone rule, shadow scoring, control arm ─────────────
     def _test_step(self, sym: str, mhs: mp.MHSymbol) -> None:
@@ -1439,52 +1721,246 @@ class MHEngine(SetEngine):
                     n, EXP.n_test(), len(EXP.ctl), sorted(self._muted) or "-", bool(EXP.final), EXP.shadow.get("ticks", 0))
 
     async def _exp_ready(self) -> None:
-        """Boot finished: log how long this redeploy cycle cost (uptime of the previous instance vs downtime)."""
-        import redeploy_guard
+        """Boot finished: the boot report (ledger 'ready' event): process start -> ready, and the history + fit part of it."""
         now = time.time()
         led = self.ledger
-        prev_ready, trig = led.last_event("ready"), led.last_event("deploy_triggered")
-        boot_s = now - getattr(restart_scheduler, "_process_start_time", self._boot_t0)
+        boot_s = now - _PROCESS_T0
         fit_s = now - self._boot_t0
         data = {"boot_seconds": round(boot_s, 1), "fit_seconds": round(fit_s, 1)}
-        if trig and (not prev_ready or trig["ts"] > prev_ready["ts"]):
-            down = now - trig["ts"]
-            up = (trig["ts"] - prev_ready["ts"]) if prev_ready else None
-            Tm = [self._T.get(s, 2.0) for s in self.symbols]
-            lost = sum(down / max(t, 0.5) for t in Tm)
-            data.update(downtime_seconds=round(down, 1), prev_uptime_seconds=None if up is None else round(up, 1),
-                        trading_fraction=None if up is None else round(up / (up + down), 4), ticks_lost_est=int(lost))
-            logger.warning("REDEPLOY CYCLE: previous instance uptime %s | downtime %.0fs (process boot %.0fs of which "
-                           "history+model fit %.0fs) | trading fraction %s | ~%d symbol-ticks not evaluated",
-                           "n/a" if up is None else f"{up:.0f}s", down, boot_s, fit_s,
-                           "n/a" if up is None else f"{100 * up / (up + down):.1f}%", int(lost))
-        else:
-            logger.info("BOOT: process %.0fs, history+fit %.0fs (no earlier deploy_triggered event in the ledger)", boot_s, fit_s)
+        logger.info("BOOT: process %.0fs, history+fit %.0fs", boot_s, fit_s)
         led.event("ready", **data)
         EXP.cycle = data
-        redeploy_guard.mark_engine_ready()
 
-    async def _before_redeploy(self) -> None:
-        if self._doubt_open:                                # in-doubt buys still being reconciled: bounded wait
-            limit = self.reconcile_wait + self.reconcile_retry + 6.0
-            logger.warning("REDEPLOY: waiting up to %.0fs for %d in-doubt buy reconcile(s)", limit, len(self._doubt_open))
-            await asyncio.wait(list(self._doubt_open), timeout=limit)
-        led = self.ledger
-        if led is not None:
-            for _t in list(self._doubt_open):               # still unknown after the wait
-                led.event("abandoned_at_redeploy", cid=None, in_doubt=1)
-        if led is None:
-            return
-        for cid, info in list(self._open.items()):
-            led.event("abandoned_at_redeploy", cid=cid, sym=info.get("sym"), arm=info.get("arm"), h=info.get("h"))
-        led.event("shadow_snapshot", **EXP.shadow_snapshot())
+    # ── session hooks (contract section 4) ───────────────────────────────────
+    def _pub_stage(self, stage: str) -> None:
+        """session_lead_stage for the dashboard (local only, never Deriv; never raises)."""
+        self._lead_stage = stage
         try:
-            from donkey_guard import get_guard
-            led.event("donkey_guard_state", state=get_guard().export_state())
+            import keep_alive
+            keep_alive.update_status(session_lead_stage=stage)
         except Exception:
             pass
-        led.event("deploy_triggered", open_contracts=len(self._open))
-        await asyncio.to_thread(led.flush, 10.0)
+
+    def _lead_left(self, sess: "ws.Session", reserve: float = 3.0) -> float:
+        """Seconds of lead still usable: everything slow must be finished before open_ts."""
+        return sess.open_ts - ws.now() - reserve
+
+    async def _lead_stage_run(self, name: str, make, budget: float, secs: dict, note: dict):
+        """Run one lead stage: publish it, bound it by `budget` seconds, time it, never let its failure kill the lead."""
+        self._pub_stage(name)
+        t0 = time.time()
+        res = None
+        try:
+            res = await asyncio.wait_for(make(), timeout=max(1.0, budget))
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            note[name] = "TIMED OUT"
+            logger.error("MH LEAD stage '%s' did not finish in %.0fs: carrying on (what is missing is resynced / fetched later)", name, budget)
+        except Exception as exc:
+            note[name] = f"failed: {exc}"
+            logger.error("MH LEAD stage '%s' failed: %s", name, exc, exc_info=True)
+        secs[name] = time.time() - t0
+        return res
+
+    async def _lead_prepare(self, sess: "ws.Session") -> None:
+        """Runs connected, inside the lead, before open_ts (not for the first session after a process start: that one runs the
+        boot fit). Order: (0) adopt orphans, (1) clear board + quote cache, (2) refit every symbol from fresh history through
+        the background-refit path (atomic swap while the symbol is in _hold; muted horizons stay muted), (3) gap resync of
+        whatever the refit did not cover, (4) fetch quotes. Every stage is bounded and timed (log line + ledger 'lead' event)."""
+        t_lead = time.time()
+        conn0 = self._conn_count()
+        secs: Dict[str, float] = {}
+        note: Dict[str, str] = {}
+        # the models are stale (no ticks while disconnected): no ingestion, no signal until each is swapped / resynced
+        self._lead_stale = set(self.symbols)
+        for sym in self.symbols:
+            self._hold.add(sym)
+            self._sig.pop(sym, None)
+        # (0) adopt orphans (+ own contracts that were still open at the last disconnect)
+        async def adopt():
+            await self._adopt_orphans()
+            await self._settle_leftovers()
+        await self._lead_stage_run("adopt", adopt, min(25.0, max(3.0, 0.2 * self._lead_left(sess))), secs, note)
+        # (1) clear board + quote cache (+ window bookkeeping)
+        self._board.clear()
+        self._bar_pool = {}
+        self._ratio_cache.clear()
+        self._rnd_minute, self._rnd_rej, self._rnd_snap, self._rnd_seen = -1, {}, 0, False
+        self._win_picks.clear()
+        # (2) refit every symbol (the old model stays when a refit fails: never no model)
+        swapped = [0]
+
+        async def refit():
+            sem = asyncio.Semaphore(max(1, int(_cfg("MH_BOOT_CONCURRENCY", 5))))
+
+            async def one(sym: str) -> None:
+                async with sem:
+                    try:
+                        if await self._refit_symbol_bg(sym, lead=True):
+                            self._lead_stale.discard(sym)
+                            swapped[0] += 1
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.error("MH LEAD REFIT %s failed (old model kept, gap resync follows): %s", sym, exc)
+            await asyncio.gather(*(one(s) for s in list(self.symbols)))
+        await self._lead_stage_run("refit", refit, max(5.0, 0.6 * self._lead_left(sess)), secs, note)
+        # (3) gap resync: every symbol the refit did not swap (stale model + gap) is brought up to date; then the connection counts as synced
+        stale = sorted(self._lead_stale)
+        await self._lead_stage_run("gap resync", lambda: self._gap_resync(only=stale, conn_ref=conn0),
+                                   max(5.0, 0.8 * self._lead_left(sess)), secs, note)
+        # (4) quotes: warm the payout-ratio cache for the covers the scan will ask for first
+        got = [0]
+
+        async def quotes():
+            got[0] = await self._lead_quotes(sess, min(float(_cfg("MH_LEAD_QUOTE_SECONDS", 20.0)), max(0.0, self._lead_left(sess) - 1.0)))
+        if self._lead_left(sess) > 2.0:
+            await self._lead_stage_run("quotes", quotes, max(2.0, self._lead_left(sess)), secs, note)
+        else:
+            note["quotes"] = "skipped: no lead time left"
+        total = time.time() - t_lead
+        self._lead_stage_secs = dict(secs)
+        stages = " | ".join(f"{k} {v:.1f}s" for k, v in secs.items())
+        logger.info("MH LEAD %s: %s | refit swapped %d/%d, resynced %d, quotes %d | total %.1fs, %.1fs before open%s",
+                    sess.name, stages, swapped[0], len(self.symbols), len(stale), got[0], total, self._lead_left(sess, 0.0),
+                    (" | " + "; ".join(f"{k}: {v}" for k, v in note.items())) if note else "")
+        if self.ledger is not None:
+            self.ledger.event("lead", session=sess.name, stages={k: round(v, 2) for k, v in secs.items()}, swapped=swapped[0],
+                              resynced=len(stale), quotes=got[0], total=round(total, 2), notes=note)
+
+    async def _lead_quotes(self, sess: "ws.Session", budget: float) -> int:
+        """Warm the quote cache: the covers the cluster scan asks for first, h = 1 first, tradable and unmuted horizons only,
+        paced like every proposal, stopped by the time budget or by a rate-limit cooldown. Returns the number of quotes stored."""
+        if budget <= 0:
+            return 0
+        covers = [ci for ci, cd in enumerate(mp.COVERS)
+                  if not self.cluster or (cover_width(cd) in self.widths and cover_width(cd) <= self.max_width)]
+        covers.sort(key=lambda ci: cover_width(mp.COVERS[ci]), reverse=(self.pick != "tightest"))
+        todo = []
+        for h in range(1, self.hmax + 1):
+            for sym in self.symbols:
+                mhs = self.mh.get(sym)
+                hs = mhs.hs.get(h) if mhs is not None else None
+                if hs is None or not hs.tradable or sym in self._muted or hs.muted():
+                    continue
+                todo.extend((sym, ci, h) for ci in covers)
+        t0 = time.time()
+        step = max(1, self.api_n)
+        for i in range(0, len(todo), step):
+            if time.time() - t0 >= budget or time.monotonic() < self._rl_cool_until or not self.client.is_connected \
+                    or ws.now() >= sess.open_ts - 2.0:
+                break
+            await asyncio.gather(*(self._ratio_fetch(*k) for k in todo[i:i + step]), return_exceptions=True)
+        return sum(1 for v in self._ratio_cache.values() if v[1] >= t0)
+
+    async def _gap_resync(self, only=None, conn_ref: Optional[int] = None) -> bool:
+        """Bring symbols whose model is stale up to date (gap filled from history, or a full refit when the gap is too long), then
+        mark the connection as synced - only when every symbol worked and the connection did not drop meanwhile."""
+        conn_ref = self._conn_count() if conn_ref is None else conn_ref
+        ok_all = True
+        for sym in (list(self.symbols) if only is None else list(only)):
+            try:
+                await self._resync_symbol(sym)
+                self._lead_stale.discard(sym)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                ok_all = False
+                logger.error("MH GAP RESYNC %s failed: %s (trading stays blocked until the resync loop succeeds)", sym, exc)
+        if ok_all and self._conn_count() == conn_ref:
+            self._seen_conn = conn_ref
+        return ok_all
+
+    async def _resync_in_lead(self):
+        """BotEngine's fallback resync would refit its own predictors: MH resyncs its own models."""
+        self._pub_stage("gap resync")
+        await self._gap_resync()
+
+    async def _before_disconnect(self, sess: "ws.Session") -> None:
+        """After the drain, right before the socket is dropped: bounded wait for in-doubt reconciles, final portfolio check,
+        'abandoned_at_close' for anything unknown, ledger snapshots + flush. Whatever happens, every model is then put in
+        _hold: it goes stale while we are disconnected and the next lead swaps / resyncs it."""
+        try:
+            await self._close_out(sess)
+        finally:
+            for sym in list(self.symbols):
+                self._hold.add(sym)
+                self._sig.pop(sym, None)
+
+    async def _close_out(self, sess: "ws.Session") -> None:
+        led = self.ledger
+        if self._doubt_open:                                # in-doubt buys still being reconciled: bounded wait
+            limit = self.reconcile_wait + self.reconcile_retry + 6.0
+            logger.warning("MH CLOSE %s: waiting up to %.0fs for %d in-doubt buy reconcile(s)", sess.name, limit, len(self._doubt_open))
+            await asyncio.wait(list(self._doubt_open), timeout=limit)
+        unresolved = len(self._doubt_open)                  # still unknown after the wait
+        if led is not None:
+            for _t in list(self._doubt_open):
+                led.event("abandoned_at_close", cid=None, in_doubt=1, session=sess.name)
+        rows = None                                         # final portfolio check: what does Deriv still hold open?
+        try:
+            rows = await self.client.get_portfolio(strict=True, timeout=5.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("MH CLOSE %s: final portfolio check failed (%s): open contracts are 'unknown'", sess.name, exc)
+        open_ids = None if rows is None else {str(r.get("contract_id", "")) for r in rows}
+        settled = still_open = unknown = 0
+        for cid, info in list(self._open.items()):
+            if open_ids is not None and cid not in open_ids:    # Deriv no longer holds it: settled, result not seen yet
+                try:
+                    poc = await asyncio.wait_for(self.client.force_check_contract(cid), timeout=5.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    poc = None
+                if poc and (poc.get("is_sold") or poc.get("is_expired") or poc.get("status") in ("sold", "won", "lost")):
+                    await self._on_contract_result(cid, {"proposal_open_contract": poc})
+                    settled += 1
+                    continue
+            if open_ids is not None and cid in open_ids:
+                still_open += 1
+                if led is not None:
+                    led.event("open_at_close", cid=cid, sym=info.get("sym"), arm=info.get("arm"), h=info.get("h"), session=sess.name)
+            else:
+                unknown += 1
+                if led is not None:
+                    led.event("abandoned_at_close", cid=cid, sym=info.get("sym"), arm=info.get("arm"), h=info.get("h"), session=sess.name)
+        logger.info("MH CLOSE %s: portfolio %s | settled now %d, still open on Deriv %d (settle there, re-checked at the next lead), "
+                    "unknown %d, in-doubt unresolved %d", sess.name, "n/a" if rows is None else f"{len(rows)} open", settled,
+                    still_open, unknown, unresolved)
+        if led is not None:
+            led.event("shadow_snapshot", **EXP.shadow_snapshot())
+            try:
+                from donkey_guard import get_guard
+                led.event("donkey_guard_state", state=get_guard().export_state())
+            except Exception:
+                pass
+            await asyncio.to_thread(led.flush, 10.0)
+
+    def _on_session_open(self, sess: "ws.Session") -> None:
+        """At open_ts, before the workers start: reset the per-session bookkeeping (models, ledger state, mutes persist)."""
+        self._rnd_minute, self._rnd_rej, self._rnd_snap, self._rnd_seen = -1, {}, 0, False
+        self._win_picks.clear()
+        self._board.clear()
+        self._bar_pool = {}
+        self._sig.clear()
+        self._trig = collections.Counter()
+        self._win_seen = self._win_none = 0
+        self._qr = collections.Counter()
+        self._rl_cool_until, self._rl_strikes, self._rl_next = 0.0, 0, 0.0      # a cooldown of the lead must not leak into the session
+        logger.info("MH SESSION %s OPEN: %d symbols, window %ds (%s), %d muted", sess.name, len(self.symbols), self.rank_window,
+                    "legacy pick" if self.legacy_pick else f"early>={self.early_pool_min}" if self.early_trigger else "fallback only",
+                    len(self._muted))
+
+    def _on_session_close(self, sess: "ws.Session") -> None:
+        """At close_ts, before the drain: finish the last window's log, one summary line for the session."""
+        if self._rnd_minute >= 0:
+            self._roll_window(self._rnd_minute + 1)
+            self._rnd_minute = -1
+        logger.info("MH SESSION %s SUMMARY: windows with a scan %d (no pick %d) | pick rounds %s | quote refresh %s | board %d",
+                    sess.name, self._win_seen, self._win_none, dict(self._trig) or "-", dict(self._qr) or "-", len(self._board))
 
     def _rtt_report(self) -> dict:
         out = {}
@@ -1521,8 +1997,7 @@ class MHEngine(SetEngine):
         EXP.epoch = self._epoch_report()
         EXP.ledger_stats = self.ledger.stats() if self.ledger else {}
         EXP.engine = {"balance": round(self.client.balance, 2), "open": len(self._open), "symbols": len(self.symbols),
-                      "muted": sorted(self._muted), "stop": EXP.stop_reason(self._open_test()),
-                      "redeploy_in": None if not restart_scheduler._due_at else round(restart_scheduler._due_at - time.time())}
+                      "muted": sorted(self._muted), "stop": EXP.stop_reason(self._open_test())}
         EXP.publish()
 
     async def _exp_loop(self) -> None:
@@ -1661,7 +2136,7 @@ class MHEngine(SetEngine):
             if ok_all and self._conn_count() == conn_now:
                 self._seen_conn = conn_now
 
-    # ── optional in-process refit (MH_INPROC_REFIT_SECONDS > 0): what the 7-minute redeploy did implicitly ──
+    # ── optional extra in-session refit (MH_INPROC_REFIT_SECONDS > 0, default off; the lead refit is separate and always on) ──
     async def _inproc_refit_loop(self):
         while True:
             await asyncio.sleep(self.inproc_refit)
@@ -1676,11 +2151,30 @@ class MHEngine(SetEngine):
                     logger.error("MH REFIT %s failed (old model kept): %s", sym, exc)
                 await asyncio.sleep(1.0)                  # spread the history downloads
 
-    async def _refit_symbol_bg(self, sym: str) -> bool:
+    @staticmethod
+    def _carry_mutes(old: "mp.MHSymbol", new: "mp.MHSymbol") -> List[int]:
+        """ASSUMED (author to confirm): a refit never un-mutes a horizon. A horizon that is muted in the old model but would
+        not be in the freshly fitted one keeps the OLD rolling loss window (same deque), so it lifts only the way the old
+        model's mute would have lifted: through new ticks. Returns the horizons that were carried over."""
+        kept: List[int] = []
+        for h, ohs in old.hs.items():
+            nhs = new.hs.get(h)
+            try:
+                if nhs is not None and ohs.muted() and not nhs.muted():
+                    nhs.roll = ohs.roll
+                    kept.append(h)
+            except Exception:
+                pass
+        return kept
+
+    async def _refit_symbol_bg(self, sym: str, lead: bool = False) -> bool:
         """Build a NEW MHSymbol from fresh history off the event loop, replay the ticks buffered meanwhile, swap atomically
-        (symbol in _hold; no await between replay and publish). Any failure or gap keeps the old model: never no model."""
+        (symbol in _hold; no await between replay and publish). Any failure or gap keeps the old model: never no model.
+        lead=True (session lead): the symbol has been in _hold since the disconnect and its model is stale (no ticks in the gap),
+        so the old model's tick position is not compared; instead the gap ticks are booked (idx / epoch maps continue), the live
+        ticks buffered since the request are ingested, and the hold is released at the swap."""
         old = self.mh.get(sym)
-        if old is None or sym in self._hold or not old.ready():
+        if old is None or not old.ready() or (sym in self._hold and not lead):
             return False
         t0 = time.time()
         self._bg_buf[sym] = collections.deque(maxlen=20000)       # record BEFORE the history request goes out
@@ -1695,24 +2189,37 @@ class MHEngine(SetEngine):
             if not new.hs or not set(old.hs) <= set(new.hs):
                 raise RuntimeError("new model has fewer horizons than the old one (time budget)")
             old = self.mh.get(sym)                                 # may have been replaced by a resync meanwhile
-            if old is None or sym in self._hold:
+            if old is None or (sym in self._hold and not lead):
                 return False
             self._hold.add(sym)                                    # from here to the publish there is no await
             try:
                 self._sig.pop(sym, None)
-                seen, n = set(), 0
+                kept = self._carry_mutes(old, new)                 # before the replay, so replayed ticks update the carried window
+                seen, n, gap = set(), 0, 0
+                if lead:
+                    book_from = self._last_epoch.get(sym)
+                    for t in ticks:                                # the gap: already inside `new`, only the bookkeeping continues
+                        if book_from is None or t["epoch"] > book_from:
+                            self._book(sym, t["epoch"])
+                            gap += 1
                 for ep, qt in sorted(self._bg_buf.get(sym, ())):
                     if ep > new.last_epoch and ep not in seen:
                         seen.add(ep)
-                        new.on_tick(pred.last_digit(qt, dec), ep)
+                        if lead:
+                            self._ingest(sym, new, ep, pred.last_digit(qt, dec))
+                        else:
+                            new.on_tick(pred.last_digit(qt, dec), ep)
                         n += 1
-                if old.last_epoch is not None and new.last_epoch != old.last_epoch:
+                if not lead and old.last_epoch is not None and new.last_epoch != old.last_epoch:
                     raise RuntimeError(f"replay gap (new {new.last_epoch} vs live {old.last_epoch})")
                 self.mh[sym] = new
+                if lead:
+                    self._pre[sym].clear()                         # held ticks are inside _bg_buf's replay already
             finally:
                 self._hold.discard(sym)
-            logger.info("MH REFIT %s: swapped, %d ticks replayed, %.1fs, tradable_h=%s", sym, n, time.time() - t0,
-                        [h for h, hs in new.hs.items() if hs.tradable])
+            logger.info("MH REFIT %s: swapped%s, %d ticks replayed%s, %.1fs, tradable_h=%s%s", sym, " (lead)" if lead else "", n,
+                        f", {gap} gap ticks booked" if lead else "", time.time() - t0,
+                        [h for h, hs in new.hs.items() if hs.tradable], f", muted h kept {kept}" if kept else "")
             return True
         finally:
             self._bg_buf.pop(sym, None)
