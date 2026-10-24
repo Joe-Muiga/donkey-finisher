@@ -6,7 +6,7 @@ mh_engine.py - MH MODE engine (subclass of SetEngine; flat stake, client, watchd
   * Signal: every tick, horizons 1..MH_HMAX_TRADE, all 18 Over/Under covers from the calibrated blended
     distribution; admitted when p_lb * payout/stake - 1 > MH_MIN_EDGE (lag-mixed P_eff, deadline gate).
   * Execution (MH_MINUTE_RANK=1, default): every symbol is scanned in parallel (own task per symbol) and ranked
-    TWICE inside each ranking window (MH_RANK_WINDOW_SECONDS = 15 / 30 / 60, UTC grid, server clock): (1) the best
+    TWICE inside each ranking window (MH_RANK_WINDOW_SECONDS = 30 / 60, UTC grid, server clock): (1) the best
     contract (cover/horizon) of each symbol (the ROLLING BOARD: newest signal per symbol, not cleared at a window
     boundary), (2) the admissible board entries ranked against each other; only the overall top MH_WINDOW_TOP_N
     (default 1) is bought per window. ONE pick round per window: EARLY trigger (admissible pool >= MH_EARLY_POOL_MIN,
@@ -216,11 +216,11 @@ class MHEngine(SetEngine):
         self._tcount: Dict[tuple, int] = {}
         # minute ranking: per-symbol best contract, then best overall, once per UTC minute
         self.minute_rank = bool(int(_num("MH_MINUTE_RANK", 1)))
-        rw = int(_num("MH_RANK_WINDOW_SECONDS", 15))
-        if rw not in (15, 30, 60):
-            logger.warning("MH_RANK_WINDOW_SECONDS=%s is not 15, 30 or 60: using 15", rw)
-            rw = 15
-        self.rank_window = rw                                                # ranking window: 15 = :00/:15/:30/:45 UTC, 30, 60 = old minute
+        rw = int(_num("MH_RANK_WINDOW_SECONDS", 30))
+        if rw not in (30, 60):
+            logger.warning("MH_RANK_WINDOW_SECONDS=%s is not 30 or 60: using 30", rw)
+            rw = 30
+        self.rank_window = rw                                                # ranking window: 30 = :00/:30 UTC (max 2 picks/minute at top_n=1), 60 = old minute
         rm = str(_cfg("MH_RANK_MODE", "snapshot")).strip().lower()
         self.rank_mode = rm if rm in ("snapshot", "bar") else "snapshot"
         self.minute_top_n = max(1, int(_num("MH_WINDOW_TOP_N", _num("MH_MINUTE_TOP_N", 1))))   # contracts bought per WINDOW
@@ -999,7 +999,7 @@ class MHEngine(SetEngine):
         return None
 
     def _rank_minute(self, sigs: List[MHSignal], cands: List[Cand]) -> None:
-        """Two-level ranking over the ROLLING BOARD, one pick round per window (MH_RANK_WINDOW_SECONDS: 15 / 30 / 60,
+        """Two-level ranking over the ROLLING BOARD, one pick round per window (MH_RANK_WINDOW_SECONDS: 30 / 60,
         UTC grid on the server clock; 60 = the old minute).
         Level 1: each symbol keeps its single best contract (over/under, any horizon) from its newest signal (_board);
                  a newer signal supersedes it; the board is NOT cleared at a window boundary.
