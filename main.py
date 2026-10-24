@@ -2,24 +2,25 @@
 main.py – entry point (Render web service).
 
   • Main thread  : Flask (dashboard + /health) – always running.
-  • bot-engine   : asyncio thread running the digit predictor. Starts on EVERY boot
-                   and is restarted if it crashes – there is no cycle, cooldown or idle phase.
+  • bot-engine   : thread running the engine (asyncio). The engine itself owns the hourly session clock
+                   (Session A / Session B, connect leads, disconnect, drain); this file only builds it and
+                   rebuilds it if it ever crashes or returns. There is no cooldown / cycle / restart timer here.
   • keep-alive   : self-ping of /health.
-  • restart sched: ALWAYS ON (REDEPLOY_INTERVAL_SECONDS=0 in the Render env is the only off switch); the
-                   interval is config.AUTO_REDEPLOY_SECONDS (bottom of config.py, 420 = 7 min). It sets
-                   the "redeploy pending" flag every N seconds; bot_engine then stops opening
-                   trades, drains open contracts, flushes stats and triggers a Render redeploy.
+  • redeploy     : ONE redeploy per hour, fired by the redeploy-watcher thread (redeploy_guard.maybe_fire, polled
+                   once a second) while the instance is idle after Session B, so the fresh instance is live
+                   before the Session A connect lead. clearCache is always "do_not_clear".
+  • SIGTERM      : disconnects from Deriv, flushes stats / ledger and follower DB buffers, then exits.
 
 Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (redeploy + stats persistence),
 optional DERIV_APP_ID, DERIV_ACCOUNT_MODE ("demo" default / "real" picks which
 account the token's OTP is minted for), DASHBOARD_PIN, PREDICTOR_SYMBOLS, ...
-(see CHANGES.md).
 
 Follower accounts (optional): DATABASE_URL, ADMIN_PASSWORD, ENCRYPTION_KEY - see render.yaml.
 """
 import asyncio
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -37,9 +38,17 @@ logger = logging.getLogger("main")
 if not config.DERIV_API_TOKEN:
     logger.critical("DERIV_API_TOKEN is not set! Add it in the Render service environment.")
 
+_live = {"engine": None, "loop": None}      # the running engine + its event loop (read by the SIGTERM handler)
+_followers_started = False
+
+
+async def _run_engine(eng):
+    _live["loop"] = asyncio.get_running_loop()
+    await eng.run()
+
 
 def _run_bot():
-    """Run the engine; if it ever exits or crashes, start it again (never sit idle)."""
+    """Run the engine; if it ever exits or crashes, build a NEW one and start it again (never sit idle)."""
     import target_guard
     if config.MH_MODE:
         from mh_engine import MHEngine as Engine
@@ -56,38 +65,93 @@ def _run_bot():
             return                                   # no restart loop: this needs a config change
     else:
         from bot_engine import BotEngine as Engine
-    import window_scheduler as ws
-    import keep_alive
     while True:
-        now = time.time()
-        if not ws.should_be_connected(now):              # outside the window: NOT connected to Deriv
-            wait = ws.seconds_until_open(now)
-            keep_alive.update_status(session=f"IDLE - disconnected, next window in {int(wait // 60)} min")
-            time.sleep(min(15.0, max(1.0, wait - ws._preconnect())))
-            continue
-        eng = Engine()
-        try:
-            asyncio.run(eng.run())
-        except Exception as exc:
-            logger.error(f"Bot crashed: {exc}", exc_info=True)
         if target_guard.is_reached():
             logger.warning("Balance target reached - bot stays stopped (no restart)")
             return
-        if getattr(eng, "_session_over", False):
-            # the window ran and closed: redeploy with a cleared build cache BEFORE the next connect
-            keep_alive.update_status(session="IDLE - redeploying (build cache cleared)")
-            if ws.redeploy_clear_cache():
-                time.sleep(900)                          # Render replaces this instance; just wait
-            else:
-                time.sleep(60)                           # no redeploy possible: reconnect at next window anyway
-            continue
-        logger.warning("Bot engine returned inside the window; restarting in 5 s")
+        eng = Engine()
+        _live["engine"] = eng
+        try:
+            asyncio.run(_run_engine(eng))            # the engine owns the session clock: it idles / connects / disconnects itself
+        except Exception as exc:
+            logger.error(f"Bot crashed: {exc}", exc_info=True)
+        finally:
+            _live["engine"], _live["loop"] = None, None
+        if target_guard.is_reached():
+            logger.warning("Balance target reached - bot stays stopped (no restart)")
+            return
+        logger.warning("Bot engine returned or crashed; building a new engine in 5 s")
         time.sleep(5)
 
 
-if __name__ == "__main__":
-    from keep_alive import app, start_keep_alive
+def _redeploy_watcher():
+    """Polls redeploy_guard.maybe_fire() once a second (it is blocking when it talks to Render, hence its own thread)."""
+    import redeploy_guard
+    while True:
+        try:
+            redeploy_guard.maybe_fire()
+        except Exception as exc:                     # maybe_fire never raises; belt and braces
+            logger.error(f"redeploy watcher error: {exc}", exc_info=True)
+        time.sleep(1.0)
 
+
+async def _graceful_engine_stop(eng):
+    """SIGTERM path: no new buys, no reconnect, Deriv socket closed, stats + ledger flushed. Sends nothing to Deriv."""
+    eng._session_over = True                         # BotEngine._blocked() -> no new buys
+    client = getattr(eng, "client", None)
+    if client is not None:
+        stop = getattr(client, "set_reconnect_enabled", None)
+        if stop is not None:
+            try:
+                stop(False)
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(client.shutdown("SIGTERM"), timeout=4)
+        except Exception as exc:
+            logger.warning("SIGTERM: Deriv shutdown skipped: %s", exc)
+    stats = getattr(eng, "stats", None)
+    if stats is not None:
+        try:
+            await asyncio.wait_for(stats.flush(force=True), timeout=3)
+        except Exception as exc:
+            logger.warning("SIGTERM: stats flush skipped: %s", exc)
+    ledger = getattr(eng, "ledger", None)
+    if ledger is not None:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(ledger.flush, 3.0), timeout=4)
+        except Exception as exc:
+            logger.warning("SIGTERM: ledger flush skipped: %s", exc)
+
+
+def _shutdown_engine_blocking(timeout: float = 8.0) -> None:
+    eng, loop = _live.get("engine"), _live.get("loop")
+    if eng is None or loop is None or loop.is_closed():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_graceful_engine_stop(eng), loop).result(timeout)
+    except Exception as exc:
+        logger.warning("SIGTERM: engine did not stop cleanly: %s", exc)
+
+
+def _on_sigterm(signum, frame):
+    logger.warning("SIGTERM - disconnecting from Deriv, flushing stats / ledger and follower DB buffers")
+    _shutdown_engine_blocking(8.0)
+    if _followers_started:
+        try:
+            import follower_manager
+            follower_manager.shutdown_blocking(8.0)
+        except Exception as exc:
+            logger.warning("SIGTERM: follower flush skipped: %s", exc)
+    raise SystemExit(0)
+
+
+def _mmss(sec: float) -> str:
+    m = int(sec // 60)
+    return f"{m:02d}:{sec - 60 * m:06.3f}"
+
+
+def _log_startup() -> None:
     logger.info("Starting digit predictor bot … (%s)",
                 "MH MODE: multi-horizon digit model, h<=%d, all 18 Over/Under covers, admitted on calibrated edge" % config.MH_HMAX_TRADE
                 if config.MH_MODE else "SET MODE: top-%d digit set -> covering Over/Under, all symbols in parallel" % config.SET_SIZE
@@ -100,23 +164,41 @@ if __name__ == "__main__":
     if config.TEST_MODE:
         import exp_mode
         logger.warning("  TEST MODE ON : frozen config hash %s | demo only | flat stake %s | followers OFF", exp_mode.config_hash(), config.TEST_STAKE)
-    logger.info("  Trade window : %s" % (f"minutes {config.TRADE_WINDOW_START_MINUTE}-{config.TRADE_WINDOW_END_MINUTE} of every hour (UTC), strict"
-                                         if config.TRADE_WINDOW_ENABLED else "OFF (SESSION_WINDOW_ENABLED=0) - trading all hours, no hourly redeploy"))
-    if not (os.environ.get("PREDICTOR_STAKE") or "").strip():
-        logger.warning("PREDICTOR_STAKE is not set on Render - using the default minimum stake %s", config.PREDICTOR_STAKE)
-    if config.REDEPLOY_INTERVAL_SECONDS > 0:
-        logger.info(f"  Redeploy     : ON (always) - every {config.REDEPLOY_INTERVAL_SECONDS:.0f}s "
-                    f"({config.REDEPLOY_INTERVAL_SECONDS / 60:.1f} min); hourly trade window forced OFF")
+    legacy = list(getattr(config, "LEGACY_REDEPLOY_ENV_SET", []) or [])
+    if legacy:
+        logger.warning("  Legacy redeploy env vars are set on Render and IGNORED: %s - delete them", ", ".join(legacy))
+    if not config.SESSION_SCHEDULE_ENABLED:
+        logger.critical("  SESSION SCHEDULE IS OFF (SESSION_SCHEDULE_ENABLED=0): the session clock and the pre-A redeploy are disabled")
     else:
-        logger.info("  Redeploy     : OFF (REDEPLOY_INTERVAL_SECONDS=0 is set on Render)")
+        close_x = config.SESSION_CLOSE_EXTRA_SECONDS
+        logger.info("  Sessions     : A %s-%s | B %s-%s (mm:ss.mmm past each hour, UTC, drain/close incl. +%.0fs); "
+                    "connect lead %.0fs, disconnect after drain",
+                    _mmss(config.SESSION_A_OPEN_SECOND), _mmss(config.SESSION_A_END_SECOND + close_x),
+                    _mmss(config.SESSION_B_OPEN_SECOND), _mmss(config.SESSION_B_END_SECOND + close_x),
+                    close_x, config.SESSION_CONNECT_LEAD_SECONDS)
+    if config.PRE_A_REDEPLOY_ENABLED and config.SESSION_SCHEDULE_ENABLED:
+        import render_api
+        has_api = render_api.api_configured()
+        has_hook = bool((os.environ.get("RENDER_DEPLOY_HOOK_URL") or getattr(config, "RENDER_DEPLOY_HOOK_URL", "") or "").strip())
+        logger.info("  Redeploy     : ON - ONE per hour, idle gap after Session B, finishing %.0fs before the Session A connect lead "
+                    "(expected duration = P95 of Render deploys, default %.0fs), clearCache=do_not_clear",
+                    config.PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS, config.PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS)
+        if not (has_api or has_hook):
+            logger.critical("  Redeploy     : ENABLED but neither RENDER_API_KEY(+RENDER_SERVICE_ID) nor RENDER_DEPLOY_HOOK_URL is set - NO redeploy will happen")
+    else:
+        logger.info("  Redeploy     : OFF (PRE_A_REDEPLOY_ENABLED=0 or schedule off)")
     import target_guard as _tg
     logger.info(f"  Balance target: {_tg.target() if _tg.target() else 'OFF (TARGET_BALANCE not set)'}")
     logger.info(f"  Port         : {config.PORT}")
 
+
+if __name__ == "__main__":
+    from keep_alive import app, start_keep_alive
+
+    _log_startup()
     start_keep_alive()
-    if config.REDEPLOY_INTERVAL_SECONDS > 0:
-        import restart_scheduler
-        restart_scheduler.start_restart_scheduler()      # rolling timer + watchdog (own thread)
+    signal.signal(signal.SIGTERM, _on_sigterm)       # always: disconnect from Deriv + flush, even without followers
+    threading.Thread(target=_redeploy_watcher, name="redeploy-watcher", daemon=True).start()
 
     # Follower accounts: own thread + own event loop + Flask Blueprint. Fully optional:
     # any failure here is logged and the main account below starts regardless.
@@ -126,14 +208,7 @@ if __name__ == "__main__":
         import follower_manager
         import follower_web
         follower_web.register(app)
-        follower_manager.start()
-
-        def _on_sigterm(signum, frame):
-            logger.warning("SIGTERM - flushing follower DB buffers")
-            follower_manager.shutdown_blocking(8.0)
-            raise SystemExit(0)
-        import signal
-        signal.signal(signal.SIGTERM, _on_sigterm)
+        _followers_started = bool(follower_manager.start())
     except Exception as exc:
         logger.error(f"Follower system not started: {exc}", exc_info=not config.TEST_MODE)
     threading.Thread(target=_run_bot, name="bot-engine", daemon=True).start()
