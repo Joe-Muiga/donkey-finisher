@@ -1698,7 +1698,7 @@ MH_BUY_TIMEOUT_SECONDS = _env_f("MH_BUY_TIMEOUT_SECONDS", 3.0)    # MH buy reply
 MH_RECONCILE_WAIT_SECONDS  = _env_f("MH_RECONCILE_WAIT_SECONDS", 2.0)    # in-doubt buy: wait for the late reply this long
 MH_RECONCILE_RETRY_SECONDS = _env_f("MH_RECONCILE_RETRY_SECONDS", 3.0)   # in-doubt buy: retry the portfolio query after this
 MH_RECONCILE_SAFETY_SECONDS = _env_f("MH_RECONCILE_SAFETY_SECONDS", 30.0)  # unresolved buy: hold the reservation this much longer
-MH_RANK_KEY            = os.environ.get("MH_RANK_KEY", "edge").strip().lower()   # edge (default: calibrated lb*r-1, best-edge cover) | mass (raw top-cluster mass, old)
+MH_RANK_KEY            = os.environ.get("MH_RANK_KEY", "mass").strip().lower()   # mass (default: raw top-cluster mass) | edge (calibrated lb*r-1, best-edge cover)
 MH_RANK_MIN_EDGE       = _env_f("MH_RANK_MIN_EDGE", _env_f("MH_MIN_EDGE", 0.0))  # edge floor when MH_RANK_KEY=edge (replaces SET_MIN_SET_PROB)
 MH_RANK_WINDOW_SECONDS = _env_i("MH_RANK_WINDOW_SECONDS", 30)     # ranking window: 30 (default, :00/:30 UTC = max 2 trades/minute at top_n=1) or 60 (60 = the old per-minute behaviour)
 MH_EARLY_TRIGGER           = _env_b("MH_EARLY_TRIGGER", 1)        # 1 = pick as soon as the admissible pool has >= MH_EARLY_POOL_MIN candidates (never before rank_delay)
