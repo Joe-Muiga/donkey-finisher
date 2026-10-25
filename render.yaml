@@ -15,10 +15,10 @@
 #
 #     Session | buying open (inclusive) | buying closed (exclusive) | connected from (lead) | disconnected after (drain)
 #     A       | HH:06:00.000            | HH:16:01.000              | HH:04:00              | about HH:16:11
-#     B       | HH:21:00.000            | HH:29:01.000              | HH:19:00              | about HH:29:11
+#     B       | HH:26:00.000            | HH:36:01.000              | HH:24:00              | about HH:36:11
 #
 #   The session times are plain constants in config.py (SESSION_A_*/SESSION_B_*/SESSION_CLOSE_EXTRA_SECONDS), NOT env vars,
-#   so a stale value here can never widen a session. Between sessions (including the ~2 min 50 s between A and B) the bot has
+#   so a stale value here can never widen a session. Between sessions (including the ~7 min 50 s between A and B) the bot has
 #   no websocket, no authorise/OTP, no polling and no background Deriv requests. Session B is reached by an in-process
 #   disconnect/reconnect, never a redeploy. Models refit in-process inside every lead except the first one after a fresh
 #   process start (that one runs the normal boot fit). A process that BOOTS inside a session waits for the next open
@@ -38,7 +38,7 @@
 #
 # ── THE SINGLE PRE-SESSION-A REDEPLOY ────────────────────────────────────────────────────────────────────────
 #   Exactly ONE redeploy per hour. The running instance fires it while it is idle in the long gap after Session B
-#   (about HH:29:11 to HH:04:00, ~35 min), timed so the new instance is up just BEFORE the Session A connect lead:
+#   (about HH:36:11 to HH:04:00, ~28 min), timed so the new instance is up just BEFORE the Session A connect lead:
 #       fire time = (next HH:04:00) - (expected deploy duration + safety margin)
 #   With the defaults that is about HH:57:00 (180 s + 240 s = 7 min before HH:04:00); the expected duration becomes the
 #   rolling P95 of recent Render deploy durations once at least 3 are known. NEVER between A and B, never inside a session or
