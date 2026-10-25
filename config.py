@@ -1748,9 +1748,10 @@ STATS_PERSIST_TO_RENDER       = os.environ.get("STATS_PERSIST_TO_RENDER", "0").s
 #    B       | HH:24:00.000      | HH:29:01.000      | open - lead         | close + 10 s = HH:29:11
 #
 #  The bot is connected to Deriv ONLY from the connect lead before a session until the bounded drain after it, and is
-#  fully disconnected in between (no websocket, no authorise/OTP, no polling). The periodic auto-redeploy is gone; exactly
-#  ONE redeploy per hour remains (PRE_A_REDEPLOY_*): fired while idle in the long gap after Session B, timed to FINISH
-#  just before the Session A connect lead, always clearCache="do_not_clear". Needs RENDER_API_KEY.
+#  fully disconnected in between (no websocket, no authorise/OTP, no polling). The periodic auto-redeploy is gone; one
+#  redeploy runs before EACH session (two per hour, PRE_A_REDEPLOY_* names kept): fired while idle in the gap after the
+#  previous session (after B -> before A, after A -> before B), timed to FINISH just before the next connect lead, with
+#  the build cache CLEARED (clearCache="clear"). Needs RENDER_API_KEY + RENDER_SERVICE_ID (a deploy hook cannot clear).
 SESSION_SCHEDULE_ENABLED     = _env_b("SESSION_SCHEDULE_ENABLED", 1)   # dev override only; 0 is logged CRITICAL at boot; default ON
 SESSION_A_OPEN_SECOND, SESSION_A_END_SECOND = 300, 720                 # plain constants
 SESSION_B_OPEN_SECOND, SESSION_B_END_SECOND = 1440, 1740
@@ -1764,7 +1765,8 @@ SESSION_CLOCK_FLIP_SECONDS   = _env_f("SESSION_CLOCK_FLIP_SECONDS", 4.0)  # rapi
 SESSION_CLOCK_RESYNC_SECONDS = _env_f("SESSION_CLOCK_RESYNC_SECONDS", 300.0)
 RESUME_TRADING_MID_SESSION_AFTER_BOOT = _env_b("RESUME_TRADING_MID_SESSION_AFTER_BOOT", 0)
 PRE_A_REDEPLOY_ENABLED                  = _env_b("PRE_A_REDEPLOY_ENABLED", 1)
-PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS = _env_f("PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS", 180.0)  # until deploy history exists
+PRE_SESSION_REDEPLOY_CLEAR_CACHE        = _env_b("PRE_SESSION_REDEPLOY_CLEAR_CACHE", 1)   # 1 = clearCache="clear" on every pre-session deploy
+PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS = _env_f("PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS", 240.0)  # until deploy history exists (a cache-clearing build is slower)
 PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS    = _env_f("PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS", 240.0)
 PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS = _env_f("PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS", 15.0)
 PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS   = _env_f("PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS", 180.0)  # deploy older than expected+this = stalled
