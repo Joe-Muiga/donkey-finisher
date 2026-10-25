@@ -1744,16 +1744,16 @@ STATS_PERSIST_TO_RENDER       = os.environ.get("STATS_PERSIST_TO_RENDER", "0").s
 #  Two sessions every hour, every day, UTC, judged on Deriv's SERVER clock. Buying is allowed when open <= t < close.
 #
 #    Session | open (inclusive)  | close (exclusive) | connect lead starts | drain ends (about)
-#    A       | HH:06:00.000      | HH:16:01.000      | open - lead         | close + 10 s = HH:16:11
-#    B       | HH:26:00.000      | HH:29:01.000      | open - lead         | close + 10 s = HH:29:11
+#    A       | HH:05:00.000      | HH:12:01.000      | open - lead         | close + 10 s = HH:12:11
+#    B       | HH:24:00.000      | HH:29:01.000      | open - lead         | close + 10 s = HH:29:11
 #
 #  The bot is connected to Deriv ONLY from the connect lead before a session until the bounded drain after it, and is
 #  fully disconnected in between (no websocket, no authorise/OTP, no polling). The periodic auto-redeploy is gone; exactly
 #  ONE redeploy per hour remains (PRE_A_REDEPLOY_*): fired while idle in the long gap after Session B, timed to FINISH
 #  just before the Session A connect lead, always clearCache="do_not_clear". Needs RENDER_API_KEY.
 SESSION_SCHEDULE_ENABLED     = _env_b("SESSION_SCHEDULE_ENABLED", 1)   # dev override only; 0 is logged CRITICAL at boot; default ON
-SESSION_A_OPEN_SECOND, SESSION_A_END_SECOND = 360, 960                 # plain constants
-SESSION_B_OPEN_SECOND, SESSION_B_END_SECOND = 1560, 1740
+SESSION_A_OPEN_SECOND, SESSION_A_END_SECOND = 300, 720                 # plain constants
+SESSION_B_OPEN_SECOND, SESSION_B_END_SECOND = 1440, 1740
 SESSION_CLOSE_EXTRA_SECONDS  = 1.0                                     # close = END + this (own constant, flip it as needed)
 WINDOW_PRECONNECT_SECONDS    = _env_f("WINDOW_PRECONNECT_SECONDS", 120.0)  # the connect lead
 SESSION_DRAIN_SECONDS        = _env_f("SESSION_DRAIN_SECONDS", 10.0)   # the ONLY connected time after a close
