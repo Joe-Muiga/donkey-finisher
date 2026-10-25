@@ -127,6 +127,27 @@ def oos_admissible(cal, p: float, break_even: float, min_n: int, margin: float =
     return n >= min_n and lbo > break_even + margin
 
 
+def oos_admissible_mix(parts, break_even: float, min_n: int, margin: float = 0.0) -> bool:
+    """Held-out gate for a lag-mixed cover. parts = [(weight, calibrator, raw_p)], weights sum to 1; each raw_p is looked up
+    in ITS OWN horizon's calibrator (the bins were fitted on that horizon's raw P). Every part with a held-out slice needs
+    >= min_n held-out samples; the weight-mixed held-out Wilson lower bound must beat break-even (+margin).
+    One part -> identical to oos_admissible. Parts without a held-out slice (tests / fakes) are skipped."""
+    got = []
+    for w, cal, p in parts:
+        fn = getattr(cal, "oos_at", None)
+        r = fn(p) if fn is not None else None
+        if r is None:
+            continue
+        n, _hits, _wr, lbo = r
+        if n < min_n:
+            return False
+        got.append((w, lbo))
+    if not got:
+        return True
+    tw = sum(w for w, _ in got)
+    return sum(w * lbo for w, lbo in got) / tw > break_even + margin
+
+
 # ── batch walk-forward for one horizon ───────────────────────────────────────
 def walk_batch(D: np.ndarray, h: int, lam: float) -> dict:
     """All predictions for t=2..n-1 (target t+h) plus final online state. Pure numpy."""
