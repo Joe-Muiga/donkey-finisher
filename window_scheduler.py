@@ -2,14 +2,15 @@
 window_scheduler.py - the two-sessions-per-hour clock (pure functions: no network, no Render calls, no sleeping).
 
   * Two sessions every hour, every day, UTC, judged on Deriv's SERVER clock (now() = local time + measured offset):
-        A  opens HH:06:00.000  closes HH:16:01.000        B  opens HH:21:00.000  closes HH:29:01.000
+        A  opens HH:05:00.000  closes HH:12:01.000        B  opens HH:24:00.000  closes HH:29:01.000
     Open is inclusive, close is exclusive: a buy is allowed when  open <= t < close.  The "+1 s" is
     config.SESSION_CLOSE_EXTRA_SECONDS.  Every session is its own session: no weekday logic, no JSON, no tiers,
     no cluster / keep-open-through-the-gap logic.
   * The bot is connected only from config.WINDOW_PRECONNECT_SECONDS (the connect lead) before a session opens until
     config.SESSION_DRAIN_SECONDS after it closes, and is fully disconnected otherwise.
-  * Exactly one redeploy per hour may fire: in the long idle gap after Session B, timed to FINISH just before the
-    Session A connect lead.  This module only holds the (pure) math; the decision to fire lives in redeploy_guard.
+  * Exactly one redeploy may fire before EACH session (two per hour): in the idle gap after the previous session's
+    drain, timed to FINISH just before the next session's connect lead (before A: after B; before B: after A).
+    This module only holds the (pure) math; the decision to fire lives in redeploy_guard.
   * Fail closed: if the constants are inconsistent, schedule_ok() is False, should_be_connected() and
     buy_allowed_at() are False and no redeploy is allowed.  (Callers must check schedule_ok() before calling
     upcoming_session(), which raises RuntimeError on an inconsistent schedule.)
@@ -51,8 +52,9 @@ class Session:
 
 @dataclass(frozen=True)
 class RedeployPlan:
-    connect_ts: float          # next Session A connect lead
-    earliest_ts: float         # previous B drain_end_ts + PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS
+    session: str               # the session this redeploy prepares: "A" or "B"
+    connect_ts: float          # that session's connect lead
+    earliest_ts: float         # previous session's drain_end_ts + PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS
     fire_ts: float             # connect_ts - (expected_s + margin_s)
     fits: bool                 # fire_ts >= earliest_ts
     available_s: float         # connect_ts - earliest_ts
@@ -292,39 +294,40 @@ def next_connect_in(ts: float = None) -> float:
     return seconds_until_connect(ts)
 
 
-# ── the single pre-A redeploy window (pure math; the decision to fire lives in redeploy_guard) ──────
-def _post_b_pair(ts: float) -> Optional[Tuple[Session, Session]]:
-    """(B, next A) when B.drain_end_ts <= ts < A.connect_ts, else None. None if disabled / not schedule_ok()."""
+# ── the pre-session redeploy windows (pure math; the decision to fire lives in redeploy_guard) ──────
+def _gap_pair(ts: float) -> Optional[Tuple[Session, Session]]:
+    """(previous session, next session) when prev.drain_end_ts <= ts < next.connect_ts, else None.
+    The gap before A is after B; the gap before B is after A. None if disabled / not schedule_ok()."""
     if not _enabled() or not schedule_ok():
         return None
     ss = _sessions_around(ts)
     for prev, nxt in zip(ss, ss[1:]):
-        if prev.name == "B" and nxt.name == "A" and prev.drain_end_ts <= ts < nxt.connect_ts:
+        if prev.drain_end_ts <= ts < nxt.connect_ts:
             return prev, nxt
     return None
 
 
-def in_post_b_gap(ts: float = None) -> bool:
-    """B.drain_end_ts <= ts < next A connect_ts (the only gap where the redeploy may fire)."""
-    return _post_b_pair(_ts(ts)) is not None
+def in_pre_session_gap(ts: float = None) -> bool:
+    """prev.drain_end_ts <= ts < next connect_ts (the only gaps where a redeploy may fire: before A and before B)."""
+    return _gap_pair(_ts(ts)) is not None
 
 
 def redeploy_plan(ts: float, expected_s: float, margin_s: float) -> Optional[RedeployPlan]:
-    """None unless in_post_b_gap(ts). fire_ts = connect_ts - (expected_s + margin_s); fits = fire_ts >= earliest_ts."""
+    """None unless in_pre_session_gap(ts). fire_ts = connect_ts - (expected_s + margin_s); fits = fire_ts >= earliest_ts."""
     ts = _ts(ts)
-    pair = _post_b_pair(ts)
+    pair = _gap_pair(ts)
     if pair is None:
         return None
-    b, a = pair
-    earliest = b.drain_end_ts + float(config.PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS)
-    fire = a.connect_ts - (float(expected_s) + float(margin_s))
-    return RedeployPlan(connect_ts=a.connect_ts, earliest_ts=earliest, fire_ts=fire,
-                        fits=bool(fire >= earliest), available_s=a.connect_ts - earliest)
+    prev, nxt = pair
+    earliest = prev.drain_end_ts + float(config.PRE_A_REDEPLOY_AFTER_DRAIN_BUFFER_SECONDS)
+    fire = nxt.connect_ts - (float(expected_s) + float(margin_s))
+    return RedeployPlan(session=nxt.name, connect_ts=nxt.connect_ts, earliest_ts=earliest, fire_ts=fire,
+                        fits=bool(fire >= earliest), available_s=nxt.connect_ts - earliest)
 
 
 def redeploy_allowed(ts: float, expected_s: float, margin_s: float) -> bool:
-    """True ONLY if the plan exists (post-B gap) and fits and plan.fire_ts <= ts < plan.connect_ts.
-    Structurally impossible between A and B, inside a session, in a lead or in a drain."""
+    """True ONLY if the plan exists (idle gap before A or before B) and fits and plan.fire_ts <= ts < plan.connect_ts.
+    Structurally impossible inside a session, in a lead or in a drain."""
     ts = _ts(ts)
     plan = redeploy_plan(ts, expected_s, margin_s)
     return bool(plan is not None and plan.fits and plan.fire_ts <= ts < plan.connect_ts)
