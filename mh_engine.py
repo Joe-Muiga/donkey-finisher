@@ -203,10 +203,10 @@ class MHEngine(SetEngine):
         self._rtt_warned: set = set()
         self.inproc_refit = float(_cfg("MH_INPROC_REFIT_SECONDS", 0.0))      # 0 = off; else background refit period per symbol
         self._bg_buf: Dict[str, collections.deque] = {}                      # raw ticks seen while a background refit builds
-        rk = str(_cfg("MH_RANK_KEY", "mass")).strip().lower()
-        self.rank_key = rk if rk in ("mass", "edge") else "mass"      # mass = raw top-cluster mass (old); edge = calibrated lb*r-1
+        rk = str(_cfg("MH_RANK_KEY", "edge")).strip().lower()
+        self.rank_key = rk if rk in ("mass", "edge") else "edge"      # edge (default) = calibrated lb*r-1; mass = raw top-cluster mass (old)
         self.rank_min_edge = float(_cfg("MH_RANK_MIN_EDGE", self.min_edge))   # admission edge floor when MH_RANK_KEY=edge
-        self.oos_check = bool(int(_cfg("MH_OOS_CHECK", 0)))
+        self.oos_check = bool(int(_cfg("MH_OOS_CHECK", 1)))              # held-out check enforced by default (0 = log only)
         self.oos_min_n = int(_cfg("MH_OOS_MIN_N", 30))
         self.oos_margin = float(_cfg("MH_OOS_MARGIN", 0.0))
         self._cl_oos = 0                                  # covers refused by the held-out check
@@ -245,6 +245,8 @@ class MHEngine(SetEngine):
         self._board: Dict[str, "Cand"] = {}                                  # ROLLING BOARD: best contract per symbol from its newest signal
         self._win_picks: Dict[int, int] = {}                                 # window id -> contracts picked (a failed buy gives its slot back)
         self._trig = collections.Counter()                                   # per session: pick rounds by trigger (early / fallback / legacy)
+        self._board_drop = collections.Counter()                             # per session: board entries removed, by reason (observability only)
+        self._pool_hist = collections.Counter()                              # per session: admissible pool size at each pick round
         self._win_seen = 0                                                   # per session: windows that had at least one scan
         self._win_none = 0                                                   # per session: windows that ended without a pick
         self._lead_stale: set = set()                                        # symbols whose model has not been swapped / resynced in this lead yet
@@ -583,12 +585,24 @@ class MHEngine(SetEngine):
         if not fits:
             self._cl_spread += 1
             return None
+        # Calibrate FIRST, mix AFTER (same as MHSymbol.screen): each calibrator was fitted on its own horizon's raw P, so it
+        # only ever sees P_h resp. P_(h+1); the lag mix is applied to the calibrated p / Wilson lb. The cluster itself
+        # (and its mass) still comes from the mixed distribution above.
+        ph, pn = hs.cur[1], None
+        if q > 0 and nxt is not None and nxt.cur is not None and nxt.cal:
+            pn = nxt.cur[1]
         out = []
         for cand, _w in fits:
             ci = mp.COVERS.index(cand)
-            pc = float(p @ mp.W[:, ci])
-            pcal, plb = hs.cal[ci](pc)                       # calibrated p and its Wilson lower bound
-            if self.oos_check and not mp.oos_admissible(hs.cal[ci], pc, 1.0 / self.min_ratio, self.oos_min_n, self.oos_margin):
+            pc_h = float(ph @ mp.W[:, ci])
+            pcal, plb = hs.cal[ci](pc_h)                     # calibrated p and its Wilson lower bound (horizon h)
+            parts = [(1.0 - q if pn is not None else 1.0, hs.cal[ci], pc_h)]
+            if pn is not None:
+                pc_n = float(pn @ mp.W[:, ci])
+                pcal_n, plb_n = nxt.cal[ci](pc_n)            # horizon h+1 on ITS calibrator
+                pcal, plb = (1.0 - q) * pcal + q * pcal_n, (1.0 - q) * plb + q * plb_n
+                parts.append((q, nxt.cal[ci], pc_n))
+            if self.oos_check and not mp.oos_admissible_mix(parts, 1.0 / self.min_ratio, self.oos_min_n, self.oos_margin):
                 self._cl_oos += 1                            # bin does not beat break-even on the held-out slice
                 continue
             out.append((ci, float(pcal), float(plb), mass))
@@ -746,8 +760,10 @@ class MHEngine(SetEngine):
             await asyncio.gather(*(self._ratio_fetch(*k) for k in need), return_exceptions=True)
         cands: List[Cand] = []
         for sig in sigs:
-            if self.cluster:                                # first cover (pick order) whose real quote passes the floor
+            if self.cluster:                                # rank_key=edge: BEST-edge cover that passes; mass: first in pick order
+                edge_pick = self.rank_key == "edge"
                 for h, sc in sig.cands.items():
+                    best = None
                     for ci, p, lb, mass in sc:
                         r = self._ratio_get(sig.sym, ci, h)
                         if r is None:
@@ -755,15 +771,20 @@ class MHEngine(SetEngine):
                         if r < self.min_ratio:
                             self._cl_floor += 1
                             continue
-                        if lb * r - 1.0 <= (self.rank_min_edge if self.rank_key == "edge" else self.min_edge):   # real Wilson lb x real quote must beat the edge floor
+                        if lb * r - 1.0 <= (self.rank_min_edge if edge_pick else self.min_edge):   # real Wilson lb x real quote must beat the edge floor
                             self._cl_edge += 1
                             continue
                         c = Cand(sig, h, ci, p, lb, r, lb * r - 1.0)
                         c.qts = self._ratio_ts(sig.sym, ci, h)
                         c.score = mass
                         c.cl = (sig.info.get(h, ((), mass))[0], mass, cover_width(mp.COVERS[ci]))
-                        cands.append(c)
-                        break
+                        if not edge_pick:
+                            best = c                        # legacy: the first (widest) passing cover wins
+                            break
+                        if best is None or self._key_edge(c) < self._key_edge(best):
+                            best = c                        # ties keep the earlier cover in pick order
+                    if best is not None:
+                        cands.append(best)
                 continue
             for h, sc in sig.cands.items():
                 best = None
@@ -925,6 +946,7 @@ class MHEngine(SetEngine):
                     why = "late"
             if why:
                 self._board.pop(sym, None)
+                self._board_drop[why] += 1
                 if why != "age":
                     self._rnd_rej[sym] = why
 
@@ -980,7 +1002,9 @@ class MHEngine(SetEngine):
         if self._late(sig):
             self._rnd_rej[sym] = "late"
             return None
-        thr = self.rank_min_edge if self.rank_key == "edge" else self.min_edge
+        edge_pick = self.rank_key == "edge"
+        thr = self.rank_min_edge if edge_pick else self.min_edge
+        best = None
         for ci, p, lb, mass in sc:
             r = self._ratio_get(sym, ci, c.h)
             if r is None:
@@ -994,9 +1018,14 @@ class MHEngine(SetEngine):
             fc.cl = (info[0], mass, cover_width(mp.COVERS[ci]))
             fc.extra = {"rank_mode": "bar", "stale_ticks": idx - c.sig.idx, "rank_sig_idx": c.sig.idx,
                         "rank_p": round(c.p, 4), "rank_lb": round(c.lb, 4)}
+            if not edge_pick:
+                self._rnd_rej.pop(sym, None)
+                return fc                                   # legacy: first passing cover in pick order
+            if best is None or self._key_edge(fc) < self._key_edge(best):
+                best = fc                                   # best-edge cover; ties keep the earlier one
+        if best is not None:
             self._rnd_rej.pop(sym, None)
-            return fc
-        return None
+        return best
 
     def _rank_minute(self, sigs: List[MHSignal], cands: List[Cand]) -> None:
         """Two-level ranking over the ROLLING BOARD, one pick round per window (MH_RANK_WINDOW_SECONDS: 30 / 60,
@@ -1018,8 +1047,8 @@ class MHEngine(SetEngine):
         for sym in {sg.sym for sg in sigs}:                 # a newer signal supersedes the symbol's older candidate
             if sym in by_sym:
                 self._board[sym] = by_sym[sym]
-            else:
-                self._board.pop(sym, None)
+            elif self._board.pop(sym, None) is not None:
+                self._board_drop["no_cand"] += 1            # newer signal with no admissible cover (no cached quote, floor, edge) pops the entry
         self._rank_pick("scan")
 
     def _rank_pick(self, where: str = "scan") -> Optional[str]:
@@ -1066,6 +1095,7 @@ class MHEngine(SetEngine):
             return None
         self._win_picks[win] = self._slot_n(win) + len(picks)
         self._trig[trigger] += 1
+        self._pool_hist[min(len(pool), 10)] += 1
         self._rank_shadow(pool, picks, f"window {label}", trigger)
         runner = [f"{x.sig.sym} {mp.COVERS[x.ci][0]}{mp.COVERS[x.ci][1]}" for x in pool[len(picks):len(picks) + 2]]
         head = (f"MINUTE RANK {label[:5]} UTC" if self.rank_window == 60 else f"WINDOW RANK {label} UTC") + f" [{self.rank_mode}]"
@@ -1947,6 +1977,7 @@ class MHEngine(SetEngine):
         self._bar_pool = {}
         self._sig.clear()
         self._trig = collections.Counter()
+        self._board_drop, self._pool_hist = collections.Counter(), collections.Counter()
         self._win_seen = self._win_none = 0
         self._qr = collections.Counter()
         self._rl_cool_until, self._rl_strikes, self._rl_next = 0.0, 0, 0.0      # a cooldown of the lead must not leak into the session
@@ -1959,8 +1990,10 @@ class MHEngine(SetEngine):
         if self._rnd_minute >= 0:
             self._roll_window(self._rnd_minute + 1)
             self._rnd_minute = -1
-        logger.info("MH SESSION %s SUMMARY: windows with a scan %d (no pick %d) | pick rounds %s | quote refresh %s | board %d",
-                    sess.name, self._win_seen, self._win_none, dict(self._trig) or "-", dict(self._qr) or "-", len(self._board))
+        logger.info("MH SESSION %s SUMMARY: windows with a scan %d (no pick %d) | pick rounds %s | quote refresh %s | board %d | "
+                    "board drops %s | pool at pick (size:rounds, 10=10+) %s",
+                    sess.name, self._win_seen, self._win_none, dict(self._trig) or "-", dict(self._qr) or "-", len(self._board),
+                    dict(self._board_drop) or "-", dict(sorted(self._pool_hist.items())) or "-")
 
     def _rtt_report(self) -> dict:
         out = {}
