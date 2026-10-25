@@ -203,8 +203,8 @@ class MHEngine(SetEngine):
         self._rtt_warned: set = set()
         self.inproc_refit = float(_cfg("MH_INPROC_REFIT_SECONDS", 0.0))      # 0 = off; else background refit period per symbol
         self._bg_buf: Dict[str, collections.deque] = {}                      # raw ticks seen while a background refit builds
-        rk = str(_cfg("MH_RANK_KEY", "edge")).strip().lower()
-        self.rank_key = rk if rk in ("mass", "edge") else "edge"      # edge (default) = calibrated lb*r-1; mass = raw top-cluster mass (old)
+        rk = str(_cfg("MH_RANK_KEY", "mass")).strip().lower()
+        self.rank_key = rk if rk in ("mass", "edge") else "mass"      # mass (default) = raw top-cluster mass; edge = calibrated lb*r-1, best-edge cover
         self.rank_min_edge = float(_cfg("MH_RANK_MIN_EDGE", self.min_edge))   # admission edge floor when MH_RANK_KEY=edge
         self.oos_check = bool(int(_cfg("MH_OOS_CHECK", 1)))              # held-out check enforced by default (0 = log only)
         self.oos_min_n = int(_cfg("MH_OOS_MIN_N", 30))
