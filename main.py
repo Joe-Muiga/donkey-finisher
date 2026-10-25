@@ -6,9 +6,9 @@ main.py – entry point (Render web service).
                    (Session A / Session B, connect leads, disconnect, drain); this file only builds it and
                    rebuilds it if it ever crashes or returns. There is no cooldown / cycle / restart timer here.
   • keep-alive   : self-ping of /health.
-  • redeploy     : ONE redeploy per hour, fired by the redeploy-watcher thread (redeploy_guard.maybe_fire, polled
-                   once a second) while the instance is idle after Session B, so the fresh instance is live
-                   before the Session A connect lead. clearCache is always "do_not_clear".
+  • redeploy     : one redeploy before EACH session (two per hour), fired by the redeploy-watcher thread
+                   (redeploy_guard.maybe_fire, polled once a second) while the instance is idle after the previous
+                   session, so the fresh instance is live before the next connect lead. clearCache is "clear".
   • SIGTERM      : disconnects from Deriv, flushes stats / ledger and follower DB buffers, then exits.
 
 Env vars: DERIV_API_TOKEN (required), RENDER_API_KEY (redeploy + stats persistence),
@@ -180,10 +180,15 @@ def _log_startup() -> None:
         import render_api
         has_api = render_api.api_configured()
         has_hook = bool((os.environ.get("RENDER_DEPLOY_HOOK_URL") or getattr(config, "RENDER_DEPLOY_HOOK_URL", "") or "").strip())
-        logger.info("  Redeploy     : ON - ONE per hour, idle gap after Session B, finishing %.0fs before the Session A connect lead "
-                    "(expected duration = P95 of Render deploys, default %.0fs), clearCache=do_not_clear",
-                    config.PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS, config.PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS)
-        if not (has_api or has_hook):
+        clear = bool(getattr(config, "PRE_SESSION_REDEPLOY_CLEAR_CACHE", True))
+        logger.info("  Redeploy     : ON - before EACH session (A and B), idle gap after the previous one, finishing %.0fs before the "
+                    "connect lead (expected duration = P95 of Render deploys, default %.0fs), clearCache=%s",
+                    config.PRE_A_REDEPLOY_SAFETY_MARGIN_SECONDS, config.PRE_A_REDEPLOY_DEFAULT_DURATION_SECONDS,
+                    "clear" if clear else "do_not_clear")
+        if clear and not has_api:
+            logger.critical("  Redeploy     : ENABLED with cache clearing but RENDER_API_KEY / RENDER_SERVICE_ID is not set - NO redeploy will happen "
+                            "(a deploy hook cannot clear the build cache)")
+        elif not (has_api or has_hook):
             logger.critical("  Redeploy     : ENABLED but neither RENDER_API_KEY(+RENDER_SERVICE_ID) nor RENDER_DEPLOY_HOOK_URL is set - NO redeploy will happen")
     else:
         logger.info("  Redeploy     : OFF (PRE_A_REDEPLOY_ENABLED=0 or schedule off)")
