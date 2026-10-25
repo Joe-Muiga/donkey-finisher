@@ -1,22 +1,24 @@
 """
-redeploy_guard.py - the ONE redeploy per hour: fired by the running instance while it is idle in the long gap
-after Session B, timed to FINISH just before the Session A connect lead.
+redeploy_guard.py - the pre-session redeploy: fired by the running instance while it is idle in the gap before
+EACH session (after B for Session A, after A for Session B), timed to FINISH just before that session's connect
+lead.  Two redeploys per hour, each with the build cache CLEARED.
 
   * maybe_fire(): called about once a second by a watcher thread in main.py. It fires AT MOST once per upcoming
-    Session A (one fire per hour), only while keep_alive session_state == "IDLE" and
-    window_scheduler.redeploy_allowed(now, expected, margin) is True, i.e. only inside the post-B gap and never
-    between A and B or inside a session. fire_ts = A connect lead - (expected deploy duration + safety margin).
+    session (key = that session's connect_ts), only while keep_alive session_state == "IDLE" and
+    window_scheduler.redeploy_allowed(now, expected, margin) is True, i.e. only inside an idle gap before a session,
+    never inside a session, lead or drain. fire_ts = connect lead - (expected deploy duration + safety margin).
   * expected_duration_seconds(): rolling P95 of Render's own deploy durations (createdAt -> finishedAt), read from
     GET /v1/services/{id}/deploys (cached in memory only). Nothing is persisted in a Render env var:
     changing an env var can restart the service.
-  * deploy_request(): POST /v1/services/{id}/deploys {"clearCache": "do_not_clear"} (no commitId = LATEST commit).
-    A deploy hook cannot clear the cache either; any "clear" query parameter on a hook URL is stripped.
-    NOTHING in this module ever sends clearCache="clear".
+  * deploy_request(): POST /v1/services/{id}/deploys {"clearCache": "clear"} (no commitId = LATEST commit).
+    A deploy hook cannot clear the cache, so with config.PRE_SESSION_REDEPLOY_CLEAR_CACHE on (default) the API key
+    (RENDER_API_KEY + RENDER_SERVICE_ID) is REQUIRED and a hook is never used as a silent no-clear fallback.
+    With it off the old behaviour applies: {"clearCache": "do_not_clear"}, hook allowed.
   * preflight(): refuse (and back off) when the kill switch is on, the balance target / test is finished, this
     instance does not answer /health, or the latest Render deploys failed / are still building.
   * hold_preconnect(): True after a deploy was fired, until the old instance is replaced; False again if the deploy
     failed or stalled past its deadline, so the old instance then runs the session normally.
-  * A skipped hour (does not fit, preflight refused, kill switch, target reached) logs a WARNING and shows on the
+  * A skipped session (does not fit, preflight refused, kill switch, target reached) logs a WARNING and shows on the
     dashboard; nothing is retried. Crash-loop memory comes from Render itself (status of the latest deploys).
 """
 import logging
@@ -37,6 +39,7 @@ import window_scheduler as ws
 logger = logging.getLogger("redeploy")
 
 NO_CLEAR = {"clearCache": "do_not_clear"}
+CLEAR = {"clearCache": "clear"}
 FAILED = {"build_failed", "update_failed", "pre_deploy_failed", "canceled"}
 IN_PROGRESS = {"created", "queued", "build_in_progress", "update_in_progress", "pre_deploy_in_progress"}
 FINISHED_OK = {"live", "deactivated"}              # deploys that ran to completion (used for duration samples)
@@ -49,8 +52,8 @@ _MIN_SAMPLES = 3                                   # deploy durations needed bef
 _lock = threading.Lock()
 _state = {
     "fails": 0, "next_ok": 0.0, "last_reason": "", "last_deploy_id": "", "last_trigger": 0.0,
-    "armed_key": None,        # connect_ts (int) of the Session A this process saw coming BEFORE its fire time
-    "fired_key": None,        # connect_ts (int) of the Session A a deploy was fired for (never fired twice per key)
+    "armed_key": None,        # connect_ts (int) of the session this process saw coming BEFORE its fire time
+    "fired_key": None,        # connect_ts (int) of the session a deploy was fired for (never fired twice per key)
     "skipped_key": None,
     "fired_at": 0.0, "fired_expected": 0.0, "fired_connect": 0.0, "resolved": False, "last_poll": 0.0,
     "pub": None, "redeploy_state": "", "redeploy_fire_ts": 0.0, "redeploy_note": "",
@@ -142,7 +145,7 @@ def note_skip(reason: str) -> float:
     _state["last_reason"] = reason
     wait = backoff_seconds(_state["fails"])
     _state["next_ok"] = time.time() + wait
-    logger.error("PRE-A REDEPLOY FAILURE (%s) - backing off %.0fs (consecutive failures: %d)", reason, wait, _state["fails"])
+    logger.error("PRE-SESSION REDEPLOY FAILURE (%s) - backing off %.0fs (consecutive failures: %d)", reason, wait, _state["fails"])
     return wait
 
 
@@ -208,7 +211,7 @@ def expected_duration_seconds() -> float:
     try:
         durs = _durations(recent_deploys(20))
     except Exception as exc:
-        logger.warning("PRE-A REDEPLOY: could not read deploy history (%s) - using %s", exc,
+        logger.warning("PRE-SESSION REDEPLOY: could not read deploy history (%s) - using %s", exc,
                        "the last value" if _exp["value"] is not None else "the default duration")
         _exp["next_refresh"] = now + _EXPECTED_RETRY_SECONDS
         if _exp["value"] is None:
@@ -269,27 +272,35 @@ def preflight() -> Tuple[bool, str]:
     return True, ""
 
 
+def clear_cache_wanted() -> bool:
+    return bool(getattr(config, "PRE_SESSION_REDEPLOY_CLEAR_CACHE", True))
+
+
 def deploy_request() -> Tuple[bool, str]:
-    """Blocking. Ask Render for a deploy of the latest commit WITHOUT clearing the build cache."""
+    """Blocking. Ask Render for a deploy of the latest commit, clearing the build cache (default)."""
+    clear = clear_cache_wanted()
+    body = CLEAR if clear else NO_CLEAR
     hook = (os.environ.get("RENDER_DEPLOY_HOOK_URL") or getattr(config, "RENDER_DEPLOY_HOOK_URL", "") or "").strip()
     try:
         if render_api.api_configured():
             r = requests.post(f"{render_api.API_BASE}/services/{render_api.service_id()}/deploys",
-                              headers=_headers(), json=NO_CLEAR, timeout=20)
+                              headers=_headers(), json=body, timeout=20)
             ok = r.status_code in (200, 201, 202)
             if ok:
                 try:
                     _state["last_deploy_id"] = (r.json() or {}).get("id", "") or ""
                 except Exception:
                     _state["last_deploy_id"] = ""
-            logger.warning("PRE-A REDEPLOY via API (clearCache=do_not_clear, latest commit): HTTP %s %s", r.status_code,
-                           "" if ok else r.text[:200])
+            logger.warning("PRE-SESSION REDEPLOY via API (clearCache=%s, latest commit): HTTP %s %s", body["clearCache"],
+                           r.status_code, "" if ok else r.text[:200])
+        elif clear:
+            return False, "clearing the build cache needs RENDER_API_KEY + RENDER_SERVICE_ID (a deploy hook cannot clear it)"
         elif hook:
             hook = re.sub(r"([?&])clear[^&]*&?", r"\1", hook).rstrip("?&")
             r = requests.post(hook, timeout=20)
             ok = r.status_code in (200, 201, 202)
             _state["last_deploy_id"] = ""
-            logger.warning("PRE-A REDEPLOY via deploy hook (hooks never clear the cache): HTTP %s", r.status_code)
+            logger.warning("PRE-SESSION REDEPLOY via deploy hook (hooks never clear the cache): HTTP %s", r.status_code)
         else:
             return False, "no RENDER_API_KEY/RENDER_SERVICE_ID or RENDER_DEPLOY_HOOK_URL"
         if ok:
@@ -300,10 +311,10 @@ def deploy_request() -> Tuple[bool, str]:
         return False, str(exc)
 
 
-# ── the single pre-A redeploy ────────────────────────────────────────────────
+# ── the pre-session redeploys (before A and before B) ────────────────────────
 def _skip(key: int, fire_ts: float, reason: str, failure: bool = False) -> str:
     _state["skipped_key"] = key
-    logger.warning("PRE-A REDEPLOY SKIPPED for this hour (%s); no retry - the next Session A connect proceeds normally", reason)
+    logger.warning("PRE-SESSION REDEPLOY SKIPPED for the next session (%s); no retry - its connect proceeds normally", reason)
     if failure:
         note_skip(reason)
     _set_dash("skipped", fire_ts, reason)
@@ -314,7 +325,7 @@ def _resolve_failed(why: str) -> None:
     with _lock:
         _state["resolved"] = True
     note_skip(why)
-    logger.error("PRE-A REDEPLOY %s - the old instance runs the session normally", why)
+    logger.error("PRE-SESSION REDEPLOY %s - the old instance runs the session normally", why)
     _set_dash("failed", _state["fired_at"], why)
     if _session_state() == "REDEPLOYING":
         _publish(session_state="IDLE")
@@ -340,7 +351,7 @@ def _poll_fired(ts: float) -> str:
             if mine and mine.get("status") == "live":
                 note_ok()
         except Exception as exc:
-            logger.debug("PRE-A REDEPLOY: status poll failed: %s", exc)
+            logger.debug("PRE-SESSION REDEPLOY: status poll failed: %s", exc)
     if _session_state() == "IDLE":                    # the engine's idle loop may have rewritten the badge
         _publish(session_state="REDEPLOYING")
     return "awaiting replacement"
@@ -354,8 +365,8 @@ def _maybe_fire(ts: Optional[float]) -> str:
         return "disabled"
     if not getattr(config, "SESSION_SCHEDULE_ENABLED", True):
         return "schedule disabled"
-    if not ws.in_post_b_gap(ts):
-        return "idle: outside the post-B gap"
+    if not ws.in_pre_session_gap(ts):
+        return "idle: outside the gaps before a session"
     state = _session_state()
     if state != "IDLE":
         return f"not idle ({state})"
@@ -366,8 +377,8 @@ def _maybe_fire(ts: Optional[float]) -> str:
         return "no plan"
     key = int(plan.connect_ts)
     if key in (_state["fired_key"], _state["skipped_key"]):
-        return "done for this hour"
-    note = f"expected {expected:.0f}s + margin {margin:.0f}s"
+        return "done for this session"
+    note = f"before session {plan.session}: expected {expected:.0f}s + margin {margin:.0f}s"
     if not plan.fits:
         return _skip(key, plan.fire_ts,
                      f"does not fit: gap {plan.available_s:.0f}s < expected {expected:.0f}s + margin {margin:.0f}s")
@@ -377,7 +388,7 @@ def _maybe_fire(ts: Optional[float]) -> str:
         return f"scheduled for {_hhmmss(plan.fire_ts)} UTC"
     if _state["armed_key"] != key:
         # Booted after the fire time (e.g. the instance a deploy just created): never redeploy again at once.
-        return "not armed (process started after this hour's fire time)"
+        return "not armed (process started after this session's fire time)"
     if ts - plan.fire_ts > margin / 2.0:
         return _skip(key, plan.fire_ts, f"too late: {ts - plan.fire_ts:.0f}s after the planned fire time")
     if not ws.redeploy_allowed(ts, expected, margin):
@@ -391,25 +402,27 @@ def _maybe_fire(ts: Optional[float]) -> str:
     with _lock:
         _state.update(fired_key=key, fired_at=ts, fired_expected=expected, fired_connect=plan.connect_ts,
                       resolved=False, last_poll=ts)
-    logger.warning("PRE-A REDEPLOY FIRED at %s UTC (planned %s): expected %.0fs, margin %.0fs, A connect lead %s UTC, deploy %s",
-                   _hhmmss(ts), _hhmmss(plan.fire_ts), expected, margin, _hhmmss(plan.connect_ts), info or "?")
+    logger.warning("PRE-SESSION REDEPLOY FIRED at %s UTC (planned %s, cache %s): expected %.0fs, margin %.0fs, "
+                   "session %s connect lead %s UTC, deploy %s",
+                   _hhmmss(ts), _hhmmss(plan.fire_ts), "CLEARED" if clear_cache_wanted() else "kept", expected, margin,
+                   plan.session, _hhmmss(plan.connect_ts), info or "?")
     _set_dash("fired", ts, f"{note}; deploy {info or '?'}", session_state="REDEPLOYING")
     return "fired"
 
 
 def maybe_fire(ts: float = None) -> str:
-    """Called about once a second. Fires AT MOST once per upcoming Session A, only while session_state is IDLE and
+    """Called about once a second. Fires AT MOST once per upcoming session (A and B), only while session_state is IDLE and
     ws.redeploy_allowed(...). Returns a short status string. Blocking when it talks to Render: call from a thread."""
     try:
         return _maybe_fire(ts)
     except Exception as exc:
-        logger.error("PRE-A REDEPLOY check error: %s", exc, exc_info=True)
+        logger.error("PRE-SESSION REDEPLOY check error: %s", exc, exc_info=True)
         return f"error: {exc}"
 
 
 def hold_preconnect() -> bool:
     """True after a deploy was fired and until the old instance is replaced; False when the deploy failed, or is
-    stalled past fired_at + expected + PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS, or the Session A connect lead has
+    stalled past fired_at + expected + PRE_A_REDEPLOY_HEALTH_TIMEOUT_SECONDS, or the next session's connect lead has
     arrived (the hold never outlives the lead). No network: safe to call from the engine's wait loop."""
     with _lock:
         if _state["fired_key"] is None or _state["resolved"]:
