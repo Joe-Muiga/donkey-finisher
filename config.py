@@ -1714,6 +1714,19 @@ MH_OOS_MIN_N           = _env_i("MH_OOS_MIN_N", 30)               # min held-out
 MH_OOS_MARGIN          = _env_f("MH_OOS_MARGIN", 0.0)             # held-out Wilson lb must exceed break-even + margin (enforce)
 MH_MAX_QUOTE_AGE_SECONDS = _env_f("MH_MAX_QUOTE_AGE_SECONDS", 45.0)   # a quote older than this is refetched (bounded timeout) and min ratio / edge re-checked before the buy; 0 = off
 MH_ADOPT_ORPHANS_ON_BOOT = _env_b("MH_ADOPT_ORPHANS_ON_BOOT", 1)   # adopt open digit contracts found on Deriv at boot
+# ─── Prediction quality / ranking / pick timing (none of these adds a filter: they only reorder, move the pick earlier, or improve p) ───
+MH_RANK_ADAPTIVE           = _env_b("MH_RANK_ADAPTIVE", 1)         # 1 = adaptive pick timing (triggers 'adaptive' / 'adaptive_deadline', see AdaptiveStop in mh_engine.py); 0 = early + fallback only
+MH_RANK_ADAPTIVE_HIST      = _env_i("MH_RANK_ADAPTIVE_HIST", 60)   # windows kept in the rolling history of the best rank-edge seen per window
+MH_RANK_ADAPTIVE_MIN_WINDOWS = _env_i("MH_RANK_ADAPTIVE_MIN_WINDOWS", 10)   # history needed before the adaptive triggers are used (until then: today's early rule)
+MH_RANK_ADAPTIVE_Q         = _env_f("MH_RANK_ADAPTIVE_Q", 0.6)     # threshold theta = this quantile of the history; 'adaptive' fires when the pool's best rank-edge >= theta
+MH_RANK_ADAPTIVE_DEADLINE_FRAC = _env_f("MH_RANK_ADAPTIVE_DEADLINE_FRAC", 0.5)   # 'adaptive_deadline': pick the best available at this fraction of the window if the pool is non-empty
+MH_RANK_ADAPTIVE_KEEP_EARLY = _env_b("MH_RANK_ADAPTIVE_KEEP_EARLY", 1)   # 1 = the early rule (pool >= MH_EARLY_POOL_MIN) stays active next to the adaptive triggers, so no pick is ever later than today; 0 = adaptive replaces it (waits for theta / the deadline, still never past the fallback)
+MH_RANK_SHRINK             = _env_b("MH_RANK_SHRINK", 1)           # 1 = rank by the pooled (in-sample + held-out + live) lower bound (redge = pooled_lb*r-1); admission still uses lb*r-1. 0 = old ranking key
+MH_RANK_FALLTHROUGH        = _env_i("MH_RANK_FALLTHROUGH", 3)      # a pick whose buy did not become a position (quote rejected / late / refused) tries the next-ranked candidate of the same window, at most this many times per window; 0 = off
+MH_EXPERT_DELTA_CTX        = _env_b("MH_EXPERT_DELTA_CTX", 1)      # 4th expert in the blend: delta (y-a) given the previous deltas; 0 = the original 3-expert blend (bit-identical)
+MH_CAL_LIVE                = _env_b("MH_CAL_LIVE", 1)              # 1 = every scored prediction of a trading horizon bumps live per-bin counts on the calibrators (feeds the ranking value only)
+MH_CAL_LIVE_CAP            = _env_f("MH_CAL_LIVE_CAP", 3000)       # a bin whose live count exceeds this has its live counts halved
+MH_RANK_OUTCOME_TOPN       = _env_i("MH_RANK_OUTCOME_TOPN", 5)     # shadow outcome tracking of the top-N pool entries of every pick round (no orders; 'RANK OUTCOME' log lines); 0 = off
 PREDICTOR_STATS_FLUSH_SECONDS = _env_f("PREDICTOR_STATS_FLUSH_SECONDS", 30)
 MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
 WINDOW_MINUTES           = _env_i("WINDOW_MINUTES", 10)
