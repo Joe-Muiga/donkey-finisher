@@ -1,10 +1,12 @@
 """
 mh_predictor.py - multi-horizon digit model (in-memory only, rebuilt from tick history each boot).
 
-Per symbol and horizon h: predict D[t+h] from D[..t] with three models
+Per symbol and horizon h: predict D[t+h] from D[..t] with three models (four with MH_EXPERT_DELTA_CTX=1)
   M1 diff   : decayed histogram of (d(j)-d(j-h)) mod 10, P(d) = pmf[(d-d_t) mod 10]
   M2 ctx    : decayed counts on d_t and (d_{t-1},d_t), Dirichlet back-off toward M1
   M3 legacy : k<=3 back-off (as set_predictor), horizon h, no decay
+  M4 delta  : (MH_EXPERT_DELTA_CTX) decayed counts of the delta (y-a) mod 10 given the previous deltas d1=(a-b), d2=(b-c),
+              back-off M1 -> d1 -> (d1,d2), shifted by a like M1
 blended by exp(-eta * L_m), L_m = decayed log-loss, floored at 1e-4. Calibration = binned PAV per cover.
 The batch walk-forward (numpy, no per-tick loop) and the online update are the same maths (see test_mh.py).
 """
@@ -32,6 +34,9 @@ RHO = 1.0 - 1.0 / 300.0   # model-loss decay (~300 scored predictions)
 ETA = 1.0
 ROLL = 300
 WILSON_Z = float(getattr(config, "MH_WILSON_Z", 1.64))   # Wilson z of the per-bin lower bound (env MH_WILSON_Z)
+EXPERT_DELTA_CTX = bool(int(getattr(config, "MH_EXPERT_DELTA_CTX", 1)))   # 4th expert (delta context); 0 = the original 3-expert blend, bit-identical
+CAL_LIVE = bool(int(getattr(config, "MH_CAL_LIVE", 1)))                   # live per-bin hit counts on the calibrators (ranking-only, see Calibrator.pooled_at)
+CAL_LIVE_CAP = float(getattr(config, "MH_CAL_LIVE_CAP", 3000))            # live_n of a bin above this -> both live counts are halved
 logger = logging.getLogger(__name__)
 
 COVERS: List[P.Candidate] = [("OVER", b) for b in range(0, 9)] + [("UNDER", b) for b in range(1, 10)]
@@ -69,6 +74,11 @@ def _safe_log(p) -> np.ndarray:
     return np.log(np.maximum(p, 1e-9))
 
 
+def n_experts() -> int:
+    """Number of blended experts: 3 (diff, ctx, legacy) or 4 with the delta-context expert (MH_EXPERT_DELTA_CTX)."""
+    return 4 if EXPERT_DELTA_CTX else 3
+
+
 # ── calibration (binned PAV, numpy only) ─────────────────────────────────────
 class Calibrator:
     """Monotone map raw p -> calibrated p with per-block sample count and Wilson lower bound."""
@@ -93,10 +103,43 @@ class Calibrator:
         self.n = np.array([m[1] for m in merged])
         self.p = np.array([m[0] / m[1] for m in merged])
         self.lb = np.array([P.wilson_lower(m[0], m[1], z) for m in merged])
+        self.live_n = np.zeros(len(self.hi))            # live (post-fit) per-bin counts, see observe(); never read by lb / the OOS check
+        self.live_hits = np.zeros(len(self.hi))
 
     def __call__(self, p: float) -> Tuple[float, float]:
         k = min(int(np.searchsorted(self.hi, p, side="left")), len(self.hi) - 1)
         return float(self.p[k]), float(self.lb[k])
+
+    # ── live counts + pooled estimate (ranking only: lb / p / the OOS check above never read these) ──
+    def _bin(self, p: float) -> int:
+        return min(int(np.searchsorted(self.hi, p, side="left")), len(self.hi) - 1)
+
+    def observe(self, p: float, hit) -> None:
+        """One scored prediction (raw p, 1/0 outcome) lands in the bin of p; a bin whose live_n exceeds the cap
+        (MH_CAL_LIVE_CAP) has both live counts halved. A refit builds fresh Calibrators, so live counts start again."""
+        k = self._bin(p)
+        self.live_n[k] += 1.0
+        self.live_hits[k] += 1.0 if hit else 0.0
+        if self.live_n[k] > CAL_LIVE_CAP:
+            self.live_n[k] *= 0.5
+            self.live_hits[k] *= 0.5
+
+    def pooled_at(self, p: float) -> Tuple[float, float]:
+        """(hits, n) of the bin of p over everything seen: in-sample fit + held-out slice (when set_oos was called) + live counts."""
+        k = self._bin(p)
+        hits, n = float(self.p[k] * self.n[k]), float(self.n[k])
+        n_oos = getattr(self, "n_oos", None)
+        if n_oos is not None:
+            hits += float(self.hits_oos[k])
+            n += float(n_oos[k])
+        hits += float(self.live_hits[k])
+        n += float(self.live_n[k])
+        return hits, n
+
+    def pooled_lb_at(self, p: float, z: float = WILSON_Z) -> float:
+        """Wilson lower bound of the pooled counts of p's bin (the less noisy ranking value; NOT an admission bound)."""
+        hits, n = self.pooled_at(p)
+        return P.wilson_lower(hits, n, z)
 
     # ── held-out check: same bins, NEWER slice that the bins were not fitted on ──
     def set_oos(self, p: np.ndarray, y: np.ndarray, z: float = WILSON_Z) -> None:
@@ -174,14 +217,25 @@ def walk_batch(D: np.ndarray, h: int, lam: float) -> dict:
     for ce, cq in ((a, qa), (b * 10 + a, qb * 10 + qa), (c3 * 100 + b * 10 + a, qc * 100 + qb * 10 + qa)):
         row = ctx_counts(ce, j, y, cq, t, 1.0)
         p3 = (row + B0 * p3) / (row.sum(1, keepdims=True) + B0)
-    PM = np.stack([P1, P2, p3])                       # (3, nq, 10)
+    if EXPERT_DELTA_CTX:                              # M4 delta context: digit pmf = delta pmf shifted by a (same shift as M1)
+        ed1, ed2 = (a - b) % 10, (b - c3) % 10        # event contexts: previous deltas seen at index j-h
+        qd1, qd2 = (qa - qb) % 10, (qb - qc) % 10     # query contexts at t
+        k1 = ctx_counts(ed1, j, delta, qd1, t, mu)
+        k2 = ctx_counts(ed1 * 10 + ed2, j, delta, qd1 * 10 + qd2, t, mu)
+        pd1 = (k1 + S2 * pm) / (k1.sum(1, keepdims=True) + S2)
+        pd2 = (k2 + S2 * pd1) / (k2.sum(1, keepdims=True) + S2)
+        P4 = pd2[np.arange(nq)[:, None], (np.arange(10)[None, :] - qa[:, None]) % 10]
+        PM = np.stack([P1, P2, p3, P4])               # (4, nq, 10)
+    else:
+        PM = np.stack([P1, P2, p3])                   # (3, nq, 10)
+    NE = len(PM)
     # model losses scored at time s = t+h (prediction at t, target D[t+h])
     ok = t + h <= n - 1
     s_idx = (t + h)[ok]
     tgt = D[s_idx]
-    lossS = np.zeros((3, n))
+    lossS = np.zeros((NE, n))
     qi = np.nonzero(ok)[0]
-    for m in range(3):
+    for m in range(NE):
         lossS[m, s_idx] = -_safe_log(PM[m, qi, tgt])
     wgt = RHO ** (-np.arange(n, dtype=np.float64))
     Lcum = np.cumsum(lossS * wgt[None, :], axis=1) * (RHO ** np.arange(n, dtype=np.float64))[None, :]   # L_m(t)
@@ -202,20 +256,26 @@ def walk_batch(D: np.ndarray, h: int, lam: float) -> dict:
         l1=_final_counts(a, y, j, 10, 1.0, tend), l2=_final_counts(b * 10 + a, y, j, 100, 1.0, tend),
         l3=_final_counts(c3 * 100 + b * 10 + a, y, j, 1000, 1.0, tend),
         L=Lcum[:, n - 1].copy())
+    if EXPERT_DELTA_CTX:
+        st["dc1"] = _final_counts(ed1, delta, j, 10, mu, tend)
+        st["dc2"] = _final_counts(ed1 * 10 + ed2, delta, j, 100, mu, tend)
     return dict(PM=PM, PB=PB, t=t, ok=qi, blend_loss=blend_loss, state=st)
 
 
 class HState:
     """Online state of one (symbol, horizon); loaded from walk_batch, then updated tick by tick."""
 
-    def __init__(self, h: int, lam: float):
+    def __init__(self, h: int, lam: float, hmax_trade: Optional[int] = None):
         self.h, self.lam, self.mu = h, lam, lam ** 0.25
+        self.hmax_trade = hmax_trade                      # live calibration counts only for trading horizons (None = all)
         self.c1 = np.zeros(10)
         self.r1, self.r2 = np.zeros((10, 10)), np.zeros((100, 10))
         self.l0 = np.zeros(10)
         self.l1, self.l2, self.l3 = np.zeros((10, 10)), np.zeros((100, 10)), np.zeros((1000, 10))
-        self.L = np.zeros(3)
-        self.pending: Deque[Tuple[int, np.ndarray, np.ndarray]] = deque()   # (target idx, PM(3,10), PB(10))
+        self.dc1, self.dc2 = np.zeros((10, 10)), np.zeros((100, 10))   # M4 delta-context counts (unused when MH_EXPERT_DELTA_CTX=0)
+        self.L = np.zeros(n_experts())
+        self._live: Optional[tuple] = None                # (cal list, hi_pad, nb, live_n matrix, live_hits matrix), see _live_observe
+        self.pending: Deque[Tuple[int, np.ndarray, np.ndarray]] = deque()   # (target idx, PM(3 or 4,10), PB(10))
         self.cur: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.roll: Deque[float] = deque(maxlen=ROLL)
         self.cal: Optional[List[Calibrator]] = None       # one per cover
@@ -237,6 +297,13 @@ class HState:
         for arr, i in ((self.l1, a), (self.l2, b * 10 + a), (self.l3, c * 100 + b * 10 + a)):
             x = arr[i]
             p3 = (x + B0 * p3) / (x.sum() + B0)
+        if EXPERT_DELTA_CTX:
+            d1 = (a - b) % 10
+            x = self.dc1[d1]
+            pd = (x + S2 * pm) / (x.sum() + S2)
+            x = self.dc2[d1 * 10 + (b - c) % 10]
+            pd = (x + S2 * pd) / (x.sum() + S2)
+            return np.stack([P1, P2, p3, pd[(np.arange(10) - a) % 10]])
         return np.stack([P1, P2, p3])
 
     def load(self, res: dict, D: np.ndarray, n_total: int) -> None:
@@ -261,6 +328,11 @@ class HState:
             self.c1 *= self.lam
             self.r1 *= self.mu
             self.r2 *= self.mu
+            if EXPERT_DELTA_CTX:
+                self.dc1 *= self.mu
+                self.dc2 *= self.mu
+                self.dc1[(a - b) % 10, (d - a) % 10] += 1.0
+                self.dc2[((a - b) % 10) * 10 + (b - c) % 10, (d - a) % 10] += 1.0
             self.c1[(d - a) % 10] += 1.0
             self.r1[a, d] += 1.0
             self.r2[b * 10 + a, d] += 1.0
@@ -273,6 +345,8 @@ class HState:
                 self.L += -_safe_log(pm[:, d])
                 self.roll.append(float(-math.log(max(pb[d], 1e-9))))
                 self.n_scored += 1
+                if CAL_LIVE and self.cal is not None and (self.hmax_trade is None or h <= self.hmax_trade):
+                    self._live_observe(pb, d)
         if j >= 2:
             pm = self._dists(buf[-1], buf[-2], buf[-3])
             wt = np.exp(-ETA * (self.L - self.L.min()))
@@ -281,6 +355,33 @@ class HState:
             pb /= pb.sum()
             self.pending.append((j + h, pm, pb))
             self.cur = (pm, pb)
+
+    def _live_observe(self, pb: np.ndarray, d: int) -> None:
+        """A scored prediction (blended raw PB made h ticks ago, outcome digit d): bump the live count of its bin in all
+        covers' calibrators. Vectorised over the covers: one bin lookup on a padded edge matrix, then fancy-indexed
+        increments on matrices whose rows are the calibrators' live_n / live_hits (views, so Calibrator.pooled_at sees them)."""
+        cal = self.cal
+        lv = self._live
+        if lv is None or lv[0] is not cal:
+            nb = np.array([len(c.hi) for c in cal])
+            hi_pad = np.full((len(cal), int(nb.max())), np.inf)
+            ln, lh = np.zeros(hi_pad.shape), np.zeros(hi_pad.shape)
+            for c, cc in enumerate(cal):
+                hi_pad[c, :nb[c]] = cc.hi
+                ln[c, :nb[c]], lh[c, :nb[c]] = cc.live_n, cc.live_hits    # carry anything observed before the matrices were built
+                cc.live_n, cc.live_hits = ln[c, :nb[c]], lh[c, :nb[c]]    # views into the shared matrices
+            lv = self._live = (cal, hi_pad, nb, ln, lh)
+        _, hi_pad, nb, ln, lh = lv
+        pc = pb @ W
+        k = np.minimum((hi_pad < pc[:, None]).sum(axis=1), nb - 1)         # == searchsorted(hi, p, 'left') per cover
+        rows = np.arange(len(cal))
+        ln[rows, k] += 1.0
+        lh[rows, k] += W[d]
+        big = ln[rows, k] > CAL_LIVE_CAP
+        if big.any():
+            r, kk = rows[big], k[big]
+            ln[r, kk] *= 0.5
+            lh[r, kk] *= 0.5
 
     def roll_mean(self) -> Optional[float]:
         return sum(self.roll) / len(self.roll) if len(self.roll) >= 100 else None
@@ -312,7 +413,7 @@ class MHSymbol:
         for h in range(1, self.hmax_paper + 1):
             if h > 1 and deadline and time.time() > deadline:
                 break
-            hs = HState(h, self.decay)
+            hs = HState(h, self.decay, self.hmax_trade)
             if offload:                                # background refit: numpy off the event loop (objects are not shared yet)
                 res = await asyncio.to_thread(walk_batch, D, h, self.decay)
                 await asyncio.to_thread(self._load_cal, hs, res, D, n)
