@@ -99,10 +99,12 @@ class MHSignal:
 
 
 class Cand:
-    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score", "cl", "arm", "extra", "qts", "win")
+    __slots__ = ("sig", "h", "ci", "p", "lb", "r", "edge", "score", "cl", "arm", "extra", "qts", "win", "redge", "plb")
 
-    def __init__(self, sig, h, ci, p, lb, r, edge):
+    def __init__(self, sig, h, ci, p, lb, r, edge, plb=None):
         self.sig, self.h, self.ci, self.p, self.lb, self.r, self.edge = sig, h, ci, p, lb, r, edge
+        self.plb = plb                                   # pooled (in-sample + held-out + live) Wilson lower bound: RANKING only, never an admission bound
+        self.redge = (plb * r - 1.0) if plb is not None else edge   # rank edge (pooled_lb*r-1); falls back to edge when there is no pooled bound
         self.score = edge / h
         self.cl = None                                   # cluster mode: (cluster, mass, width)
         self.arm = None                                  # test mode: "test" | "ctl"
@@ -147,6 +149,55 @@ def pick_fits(cluster, max_width: int, widths, pick: str):
     fits = [(c, w) for c, w in sp.covering_contracts(cluster, max_width) if w in widths]
     fits.sort(key=lambda x: x[1], reverse=(pick != "tightest"))
     return fits
+
+
+def _pooled_lb(cal, p: float, fallback: float) -> float:
+    """Pooled (in-sample + held-out + live) Wilson lower bound of the bin of p; calibrators without it (test fakes) -> fallback."""
+    fn = getattr(cal, "pooled_lb_at", None)
+    return float(fn(p)) if fn is not None else float(fallback)
+
+
+class AdaptiveStop:
+    """Pick-timing threshold (pure, no clock, no engine state). Keeps the best rank-edge seen in each completed window; once
+    `min_windows` of them exist, theta = their `q` quantile. decide() fires 'adaptive' when the pool's best rank-edge >= theta
+    and 'adaptive_deadline' once the deadline mark is reached with a non-empty pool. It can only ever pull a pick EARLIER than
+    the early / fallback rules (the engine still applies those), and returns None until enough history exists."""
+
+    def __init__(self, hist: int = 60, min_windows: int = 10, q: float = 0.6, deadline_frac: float = 0.5):
+        self.min_windows = max(1, int(min_windows))
+        self.hist: "collections.deque" = collections.deque(maxlen=max(int(hist), self.min_windows))
+        self.q = min(1.0, max(0.0, float(q)))
+        self.deadline_frac = min(1.0, max(0.0, float(deadline_frac)))
+
+    def push(self, best: Optional[float]) -> None:
+        if best is not None and best == best:
+            self.hist.append(float(best))
+
+    def ready(self) -> bool:
+        return len(self.hist) >= self.min_windows
+
+    def theta(self) -> Optional[float]:
+        if not self.ready():
+            return None
+        s = sorted(self.hist)
+        k = (len(s) - 1) * self.q                        # linear-interpolated quantile (numpy default)
+        lo = int(k)
+        hi = min(lo + 1, len(s) - 1)
+        return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+    def deadline_at(self, window: float, rank_delay: float, fallback_at: float) -> float:
+        """Seconds after the window start: never before rank_delay, never after the fallback."""
+        return min(max(rank_delay, self.deadline_frac * window), fallback_at)
+
+    def decide(self, elapsed: float, n: int, best: Optional[float], rank_delay: float, deadline_at: float) -> Optional[str]:
+        th = self.theta()
+        if th is None or best is None or n < 1 or elapsed < rank_delay:
+            return None
+        if best >= th:
+            return "adaptive"
+        if elapsed >= deadline_at:
+            return "adaptive_deadline"
+        return None
 
 
 class MHEngine(SetEngine):
@@ -235,6 +286,23 @@ class MHEngine(SetEngine):
         self.fallback_frac = ff
         self.fallback_at = max(self.rank_delay, ff * rw)                     # seconds after the window start
         self.legacy_pick = (rw == 60)                                        # old minute: pick at the first admissible scan after rank_delay
+        self.rank_shrink = bool(int(_num("MH_RANK_SHRINK", 1)))              # rank by redge (pooled lower bound) instead of edge; admission is unchanged
+        self.adaptive = bool(int(_num("MH_RANK_ADAPTIVE", 1))) and not self.legacy_pick   # adaptive pick timing (30 s windows only)
+        self.adaptive_keep_early = bool(int(_num("MH_RANK_ADAPTIVE_KEEP_EARLY", 1)))
+        self.astop = AdaptiveStop(int(_num("MH_RANK_ADAPTIVE_HIST", 60)), int(_num("MH_RANK_ADAPTIVE_MIN_WINDOWS", 10)),
+                                  _num("MH_RANK_ADAPTIVE_Q", 0.6), _num("MH_RANK_ADAPTIVE_DEADLINE_FRAC", 0.5))
+        self.adaptive_deadline_at = self.astop.deadline_at(rw, self.rank_delay, self.fallback_at)
+        self._rnd_best: Optional[float] = None                               # best rank-edge seen in the current window (None = pool never non-empty)
+        self.fallthrough_n = max(0, int(_num("MH_RANK_FALLTHROUGH", 3)))     # next-ranked candidates tried per window after a pick that did not become a position
+        self._ft_failed: Dict[int, set] = {}                                 # window id -> {(sym, signal idx)} of picks whose buy did not happen
+        self._ft_used: Dict[int, int] = {}                                   # window id -> fall-through picks made
+        self.outcome_topn = max(0, int(_num("MH_RANK_OUTCOME_TOPN", 5)))     # shadow outcome tracking of the top-N pool entries per pick round (0 = off)
+        self._rank_book: Dict[tuple, list] = {}                              # (sym, target tick idx) -> [entry dicts] awaiting their digit
+        self._rank_ent: Dict[tuple, dict] = {}                               # (win, sym, signal idx, cover, h) -> entry (one per candidate, even over several pick rounds)
+        self._rk_n = collections.Counter()                                   # per rank: resolved outcomes / hits / theoretical profit (win r-1, loss -1) / sum of predicted p
+        self._rk_hit = collections.Counter()
+        self._rk_roi = collections.defaultdict(float)
+        self._rk_p = collections.defaultdict(float)
         self.board_max_age = max(1.0, float(_num("MH_BOARD_MAX_AGE_SECONDS", 30.0)))
         self._bar_pool: Dict[str, "Cand"] = {}
         self._rnd_rej: Dict[str, str] = {}
@@ -494,6 +562,11 @@ class MHEngine(SetEngine):
         if not mhs.on_tick(digit, ep):
             return False
         i = self._book(sym, ep)
+        if self._rank_book:
+            try:
+                self._rank_resolve(sym, i, digit)
+            except Exception as exc:
+                logger.error("rank outcome %s: %s", sym, exc, exc_info=True)
         if self.test_mode:
             self._exp_on_digit(sym, i, digit)
         return True
@@ -596,16 +669,18 @@ class MHEngine(SetEngine):
             ci = mp.COVERS.index(cand)
             pc_h = float(ph @ mp.W[:, ci])
             pcal, plb = hs.cal[ci](pc_h)                     # calibrated p and its Wilson lower bound (horizon h)
+            ppl = _pooled_lb(hs.cal[ci], pc_h, plb)          # ranking-only pooled lower bound, mixed exactly like plb below
             parts = [(1.0 - q if pn is not None else 1.0, hs.cal[ci], pc_h)]
             if pn is not None:
                 pc_n = float(pn @ mp.W[:, ci])
                 pcal_n, plb_n = nxt.cal[ci](pc_n)            # horizon h+1 on ITS calibrator
                 pcal, plb = (1.0 - q) * pcal + q * pcal_n, (1.0 - q) * plb + q * plb_n
+                ppl = (1.0 - q) * ppl + q * _pooled_lb(nxt.cal[ci], pc_n, plb_n)
                 parts.append((q, nxt.cal[ci], pc_n))
             if self.oos_check and not mp.oos_admissible_mix(parts, 1.0 / self.min_ratio, self.oos_min_n, self.oos_margin):
                 self._cl_oos += 1                            # bin does not beat break-even on the held-out slice
                 continue
-            out.append((ci, float(pcal), float(plb), mass))
+            out.append((ci, float(pcal), float(plb), mass, float(ppl)))      # (cover, p, lb, mass, pooled lb); MHSymbol.screen keeps its own 4-tuple
         if not out:
             return None                                      # every cover refused by the held-out check
         return out, (cl, mass)
@@ -764,7 +839,9 @@ class MHEngine(SetEngine):
                 edge_pick = self.rank_key == "edge"
                 for h, sc in sig.cands.items():
                     best = None
-                    for ci, p, lb, mass in sc:
+                    for ent in sc:
+                        ci, p, lb, mass = ent[:4]
+                        plb = ent[4] if len(ent) > 4 else None       # pooled lower bound (ranking only)
                         r = self._ratio_get(sig.sym, ci, h)
                         if r is None:
                             continue
@@ -774,7 +851,7 @@ class MHEngine(SetEngine):
                         if lb * r - 1.0 <= (self.rank_min_edge if edge_pick else self.min_edge):   # real Wilson lb x real quote must beat the edge floor
                             self._cl_edge += 1
                             continue
-                        c = Cand(sig, h, ci, p, lb, r, lb * r - 1.0)
+                        c = Cand(sig, h, ci, p, lb, r, lb * r - 1.0, plb)
                         c.qts = self._ratio_ts(sig.sym, ci, h)
                         c.score = mass
                         c.cl = (sig.info.get(h, ((), mass))[0], mass, cover_width(mp.COVERS[ci]))
@@ -843,27 +920,33 @@ class MHEngine(SetEngine):
     def _key_mass(c: "Cand"):
         return (-c.score, -c.p)                             # old order: raw top-cluster mass, then calibrated p
 
-    @staticmethod
-    def _key_edge(c: "Cand"):
+    def _key_edge(self, c: "Cand"):
+        if self.rank_shrink:
+            return (-c.redge, -c.lb, -c.p)                  # ranking value: pooled lb x real quote - 1 (admission still uses lb x quote - 1 = c.edge)
         return (-c.edge, -c.lb, -c.p)                       # calibrated cover lb x real quote - 1
+
+    def _rank_edge(self, c: "Cand") -> float:
+        """The edge value the ranking sorts by (adaptive pick timing compares pools / windows on this)."""
+        return c.redge if self.rank_shrink else c.edge
 
     def _cand_key(self, c: "Cand"):
         return self._key_edge(c) if (self.rank_key == "edge" and self.cluster) else self._key_mass(c)
 
     def _rank_shadow(self, pool: List["Cand"], picks: List[Tuple["Cand", float]], where: str, trigger: str = "") -> None:
         """Both orderings over the SAME pool, logged for offline comparison. No API calls; c.score is never touched.
-        `trigger` = which pick trigger fired this round: early | fallback | legacy ('' outside the window ranking)."""
+        `trigger` = which pick trigger fired this round: early | fallback | legacy | adaptive | adaptive_deadline | fallthrough
+        ('' outside the window ranking). Every bought entry is (cover, mass, edge, redge): redge was appended, nothing reordered."""
         if not pool:
             return
         tag = lambda x: f"{x.sig.sym}:{mp.COVERS[x.ci][0]}{mp.COVERS[x.ci][1]}:h{x.h}"
         bm, be = sorted(pool, key=self._key_mass), sorted(pool, key=self._key_edge)
         agree = int(bm[0] is be[0])
-        bought = [{"c": tag(c), "mass": round(c.score, 4), "edge": round(c.edge, 4), "lb": round(c.lb, 4)} for c, _ in picks]
+        bought = [{"c": tag(c), "mass": round(c.score, 4), "edge": round(c.edge, 4), "lb": round(c.lb, 4), "redge": round(c.redge, 4)} for c, _ in picks]
         rm = tag(bm[1]) if len(bm) > 1 else "-"
         re_ = tag(be[1]) if len(be) > 1 else "-"
         logger.info("RANK SHADOW %s pool=%d key=%s mass_top=%s edge_top=%s agree=%d bought=%s runner_mass=%s runner_edge=%s%s",
                     where, len(pool), self.rank_key, tag(bm[0]), tag(be[0]), agree,
-                    [(b["c"], b["mass"], b["edge"]) for b in bought], rm, re_, f" trigger={trigger}" if trigger else "")
+                    [(b["c"], b["mass"], b["edge"], b["redge"]) for b in bought], rm, re_, f" trigger={trigger}" if trigger else "")
         if self.ledger is not None:
             extra = {"trigger": trigger, "win": picks[0][0].win} if trigger and picks else {}
             self.ledger.event("rank_shadow", where=where, pool=len(pool), key=self.rank_key,
@@ -898,6 +981,8 @@ class MHEngine(SetEngine):
         _rnd_minute holds the WINDOW id; picks per window live in _win_picks; the rolling board is NOT cleared
         (60 s = the old minute)."""
         prev = self._rnd_minute
+        if prev >= 0 and self.adaptive and self._rnd_best is not None:
+            self.astop.push(self._rnd_best)                 # best rank-edge of a window whose pool was non-empty at some scan
         if prev >= 0 and self._rnd_seen:
             n = self._slot_n(prev)
             self._win_seen += 1
@@ -919,9 +1004,13 @@ class MHEngine(SetEngine):
             self._bar_pool = {}
         self._rnd_minute = win
         self._rnd_rej, self._rnd_snap, self._rnd_seen = {}, 0, False
+        self._rnd_best = None
         self._rnd_c0 = (self._cl_floor, self._cl_edge, self._cl_gate, self._cl_oos)
         for w in [w for w in self._win_picks if w < win - 16]:      # keep the bookkeeping of the last windows only
             self._win_picks.pop(w, None)
+        for d in (self._ft_failed, self._ft_used):
+            for w in [w for w in d if w < win - 16]:
+                d.pop(w, None)
 
     def _rank_roll(self, now: float) -> int:
         win = self._win_id(now)
@@ -969,17 +1058,40 @@ class MHEngine(SetEngine):
         pool.sort(key=self._cand_key)                       # level 2
         return pool, live
 
-    def _rank_trigger(self, elapsed: float, n: int) -> Optional[str]:
-        """Which trigger fires the window's pick now (None = keep waiting). Never before rank_delay (checked by the caller)."""
+    def _rank_trigger(self, elapsed: float, n: int, best: Optional[float] = None) -> Optional[str]:
+        """Which trigger fires the window's pick now (None = keep waiting). Never before rank_delay (checked by the caller).
+        best = the pool's best rank-edge. Adaptive timing (MH_RANK_ADAPTIVE, once the history holds enough windows) adds
+        'adaptive' (best >= theta) and 'adaptive_deadline' (any non-empty pool at the deadline mark, before the fallback);
+        with MH_RANK_ADAPTIVE_KEEP_EARLY=1 the early rule stays, so no pick is ever later than without it."""
         if n < 1:
             return None
         if self.legacy_pick:
             return "legacy"                                 # 60 s: the old minute, first admissible pool after rank_delay
-        if self.early_trigger and n >= self.early_pool_min:
+        ready = self.adaptive and best is not None and self.astop.ready()
+        if ready:
+            t = self.astop.decide(elapsed, n, best, self.rank_delay, self.adaptive_deadline_at)
+            if t is not None:
+                return t
+        if self.early_trigger and n >= self.early_pool_min and (self.adaptive_keep_early or not ready):
             return "early"
         if elapsed >= self.fallback_at:
             return "fallback"
         return None
+
+    def _rank_note_best(self, now: float) -> None:
+        """After the window's pick the pool is no longer computed; keep the window's best rank-edge honest anyway
+        (otherwise early picks would truncate the history and drag theta down). Read-only pass over the fresh board entries."""
+        if self.rank_mode == "bar":
+            return
+        best = self._rnd_best
+        for sym, c in self._board.items():
+            if (sym in self._muted or sym in self._hold or self._idx.get(sym) != c.sig.idx
+                    or now - c.sig.recv > self.board_max_age or self._late(c.sig)):
+                continue
+            e = self._rank_edge(c)
+            if best is None or e > best:
+                best = e
+        self._rnd_best = best
 
     def _bar_refresh(self, c: Cand) -> Optional[Cand]:
         """Bar mode: the ranking used the closed window's information; the BUY uses the symbol's current state.
@@ -1005,7 +1117,9 @@ class MHEngine(SetEngine):
         edge_pick = self.rank_key == "edge"
         thr = self.rank_min_edge if edge_pick else self.min_edge
         best = None
-        for ci, p, lb, mass in sc:
+        for ent in sc:
+            ci, p, lb, mass = ent[:4]
+            plb = ent[4] if len(ent) > 4 else None
             r = self._ratio_get(sym, ci, c.h)
             if r is None:
                 self._rnd_rej.setdefault(sym, "no_quote")
@@ -1013,7 +1127,7 @@ class MHEngine(SetEngine):
             if r < self.min_ratio or lb * r - 1.0 <= thr:
                 self._rnd_rej[sym] = "min_ratio/edge"
                 continue
-            fc = Cand(sig, c.h, ci, p, lb, r, lb * r - 1.0)
+            fc = Cand(sig, c.h, ci, p, lb, r, lb * r - 1.0, plb)
             fc.score, fc.qts = mass, self._ratio_ts(sym, ci, c.h)
             fc.cl = (info[0], mass, cover_width(mp.COVERS[ci]))
             fc.extra = {"rank_mode": "bar", "stale_ticks": idx - c.sig.idx, "rank_sig_idx": c.sig.idx,
@@ -1051,24 +1165,41 @@ class MHEngine(SetEngine):
                 self._board_drop["no_cand"] += 1            # newer signal with no admissible cover (no cached quote, floor, edge) pops the entry
         self._rank_pick("scan")
 
-    def _rank_pick(self, where: str = "scan") -> Optional[str]:
+    def _rank_pick(self, where: str = "scan", ft_win: Optional[int] = None) -> Optional[str]:
         """Evaluate the current window's pick (level 2). Synchronous and non-blocking: money and slots are reserved here,
         the buys (and any quote refetch) run in the spawned _buy_one tasks. Called after every scan and by the window
-        clock at the window start / rank_delay / fallback instants. Returns the trigger that fired, else None."""
+        clock at the window start / rank_delay / fallback instants. Returns the trigger that fired, else None.
+        ft_win = fall-through call (a pick of that window did not become a position): no trigger needed, candidates whose buy
+        already failed in this window are skipped, the next-ranked one is picked right away."""
         if not self.minute_rank or self.test_mode:
             return None
         now = self._now()
         win = self._rank_roll(now)
         label = self._win_label(win)
-        if self._slot_n(win) >= self.minute_top_n or self._blocked():
+        if ft_win is not None and ft_win != win:
+            return None                                     # the window of the failed pick is over
+        full = self._slot_n(win) >= self.minute_top_n
+        if full or self._blocked():
+            if full and self.adaptive and ft_win is None:
+                self._rank_note_best(now)
             return None
         elapsed = now - win * self.rank_window
-        if elapsed < self.rank_delay:                       # never before rank_delay
+        if elapsed < self.rank_delay and ft_win is None:    # never before rank_delay
             self._last_decision = f"window {label}: collecting ({len(self._board)} symbols on the board)"
             return None
         pool, live = self._rank_pool(now)
         self._rnd_snap = max(self._rnd_snap, live)          # shadow: pool size a snapshot ranking would see
-        trigger = self._rank_trigger(elapsed, len(pool))
+        if ft_win is not None:
+            failed = self._ft_failed.get(win, ())
+            pool = [c for c in pool if (c.sig.sym, c.sig.idx) not in failed]
+            trigger = "fallthrough" if pool else None
+        else:
+            best = None
+            if self.adaptive and pool:
+                best = max(self._rank_edge(c) for c in pool)
+                if self._rnd_best is None or best > self._rnd_best:
+                    self._rnd_best = best                   # best rank-edge of this window so far (pushed to the history at the roll)
+            trigger = self._rank_trigger(elapsed, len(pool), best)
         if trigger is None:
             if pool:
                 self._last_decision = (f"window {label}: waiting ({len(pool)} admissible, early at {self.early_pool_min}, "
@@ -1096,7 +1227,10 @@ class MHEngine(SetEngine):
         self._win_picks[win] = self._slot_n(win) + len(picks)
         self._trig[trigger] += 1
         self._pool_hist[min(len(pool), 10)] += 1
+        if ft_win is not None:
+            self._ft_used[win] = self._ft_used.get(win, 0) + 1
         self._rank_shadow(pool, picks, f"window {label}", trigger)
+        self._rank_record(pool, picks, win, label, trigger)
         runner = [f"{x.sig.sym} {mp.COVERS[x.ci][0]}{mp.COVERS[x.ci][1]}" for x in pool[len(picks):len(picks) + 2]]
         head = (f"MINUTE RANK {label[:5]} UTC" if self.rank_window == 60 else f"WINDOW RANK {label} UTC") + f" [{self.rank_mode}]"
         logger.info("%s: %d symbols ranked -> BUY %s (runners-up: %s) trigger=%s +%.1fs", head, len(pool),
@@ -1110,7 +1244,7 @@ class MHEngine(SetEngine):
         return trigger
 
     async def _window_clock_loop(self):
-        """Wakes at every window start (roll + log), at start + rank_delay and at start + fallback and evaluates the pick,
+        """Wakes at every window start (roll + log), at start + rank_delay, at the adaptive deadline and at start + fallback and evaluates the pick,
         so a pick no longer waits for the next scan. 60 s windows (old minute): wakes at the window start only (roll + log)."""
         while True:
             try:
@@ -1119,6 +1253,8 @@ class MHEngine(SetEngine):
                 marks = [start]
                 if not self.legacy_pick:
                     marks += [start + self.rank_delay, start + self.fallback_at]
+                    if self.adaptive:
+                        marks.append(start + self.adaptive_deadline_at)      # adaptive deadline fires even without a scan
                 nxt = min((m for m in marks if m > now + 1e-6), default=start + self.rank_window)
                 await asyncio.sleep(max(0.005, nxt - now) + 0.002)
                 if self.legacy_pick:
@@ -1132,6 +1268,68 @@ class MHEngine(SetEngine):
             except Exception as exc:
                 logger.error("window clock error: %s", exc, exc_info=True)
                 await asyncio.sleep(1.0)
+
+    def _rank_fallthrough(self, c: Cand, w: int) -> None:
+        """A pick of window `w` did NOT become a position (quote rejected / refresh failed / late / refused; its slot was just
+        released by _buy_finish): while that window is still running, pick the next-ranked candidate right away instead of
+        waiting for the next scan. The failed (symbol, signal) is skipped; at most MH_RANK_FALLTHROUGH such picks per window.
+        Only ever adds a buy (an in-doubt buy keeps its slot closed and never gets here)."""
+        if self.fallthrough_n <= 0 or not self.minute_rank or self.test_mode or c.arm is not None:
+            return
+        if self._win_id() != w:
+            return
+        self._ft_failed.setdefault(w, set()).add((c.sig.sym, c.sig.idx))
+        if self._ft_used.get(w, 0) >= self.fallthrough_n:
+            return
+        self._rank_pick("fallthrough", ft_win=w)
+
+    # ── shadow outcome tracking of the top-N pool entries (no orders, no network) ──
+    def _rank_record(self, pool: List["Cand"], picks: List[Tuple["Cand", float]], win: int, label: str, trigger: str) -> None:
+        """Remember the top MH_RANK_OUTCOME_TOPN pool entries of a pick round (bought ones included) until their target digit
+        arrives (_rank_resolve). bought=1 means 'picked for a buy' (a buy that then fails still counts as picked)."""
+        if self.outcome_topn <= 0 or not pool:
+            return
+        picked = {id(c) for c, _ in picks}
+        for sym in {c.sig.sym for c in pool[:self.outcome_topn]}:
+            cut = self._idx.get(sym, 0) - 50
+            for k in [k for k in self._rank_book if k[0] == sym and k[1] < cut]:
+                for e in self._rank_book.pop(k):
+                    self._rank_ent.pop(e["ek"], None)
+        for k, c in enumerate(pool[:self.outcome_topn], 1):
+            ek = (win, c.sig.sym, c.sig.idx, c.ci, c.h)
+            e = self._rank_ent.get(ek)
+            if e is not None:                               # already tracked by an earlier round of this window (fall-through)
+                if id(c) in picked and not e["bought"]:
+                    e["bought"], e["trigger"] = 1, trigger
+                continue
+            cv = mp.COVERS[c.ci]
+            e = {"ek": ek, "win": label, "rank": k, "trigger": trigger, "bought": int(id(c) in picked), "sym": c.sig.sym,
+                 "ci": c.ci, "cover": f"{cv[0]}{cv[1]}", "h": c.h, "p": c.p, "lb": c.lb, "r": c.r, "redge": c.redge}
+            self._rank_ent[ek] = e
+            self._rank_book.setdefault((c.sig.sym, c.sig.idx + c.h), []).append(e)
+
+    def _rank_resolve(self, sym: str, i: int, digit: int) -> None:
+        """Tick i of `sym` arrived with `digit`: settle the tracked entries whose target tick is i, evict unresolved ones older
+        than 50 ticks. The outcomes are THEORETICAL: they assume an entry on the next tick after the signal (target =
+        signal tick + h), no quote slip, no latency, no stake rules - a hit-rate / edge comparison across ranks, not P&L."""
+        for e in self._rank_book.pop((sym, i), ()):
+            self._rank_ent.pop(e["ek"], None)
+            hit = int(bool(mp.W[digit, e["ci"]]))
+            k = e["rank"]
+            self._rk_n[k] += 1
+            self._rk_hit[k] += hit
+            self._rk_p[k] += e["p"]
+            self._rk_roi[k] += (e["r"] - 1.0) if hit else -1.0
+            logger.info("RANK OUTCOME win=%s rank=%d sym=%s cover=%s h=%d trigger=%s bought=%d p=%.3f lb=%.3f r=%.3f hit=%d",
+                        e["win"], k, sym, e["cover"], e["h"], e["trigger"], e["bought"], e["p"], e["lb"], e["r"], hit)
+            if self.ledger is not None:
+                self.ledger.event("rank_outcome", win=e["win"], rank=k, sym=sym, cover=e["cover"], h=e["h"], trigger=e["trigger"],
+                                  bought=e["bought"], p=round(e["p"], 4), lb=round(e["lb"], 4), r=round(e["r"], 4),
+                                  redge=round(e["redge"], 4), hit=hit)
+        cut = i - 50
+        for k in [k for k in self._rank_book if k[0] == sym and k[1] < cut]:
+            for e in self._rank_book.pop(k):
+                self._rank_ent.pop(e["ek"], None)
 
     # ── quote refresh right before the buy ───────────────────────────────────
     def _quote_reject(self, c: Cand, r: float) -> Optional[str]:
@@ -1211,6 +1409,7 @@ class MHEngine(SetEngine):
         old_r = c.r
         c.r, c.qts = v[0], v[1]
         c.edge = c.lb * c.r - 1.0
+        c.redge = (c.plb * c.r - 1.0) if c.plb is not None else c.edge
         why = self._quote_reject(c, c.r)
         self._qr["ok" if why is None else why] += 1
         logger.info("MH QUOTE REFRESH %s: %s ratio %.3f -> %.3f (was %.0fs old)%s", tag, src, old_r or 0.0, c.r, age,
@@ -1297,6 +1496,10 @@ class MHEngine(SetEngine):
                 logger.info("WINDOW %s: pick %s %s%s h=%d did not become a position: slot released%s", self._win_label(w), c.sig.sym,
                             mp.COVERS[c.ci][0], mp.COVERS[c.ci][1], c.h,
                             "" if w == self._rnd_minute else " (that window is already over)")
+                try:
+                    self._rank_fallthrough(c, w)
+                except Exception as exc:
+                    logger.error("fall-through after a failed buy: %s", exc, exc_info=True)
 
     def _remember_cid(self, cid: str) -> None:
         self._known_cids[cid] = None
@@ -1337,7 +1540,7 @@ class MHEngine(SetEngine):
             self.ledger.event("buy", cid=cid, sym=sym, idx=sig.idx, h=h, arm=c.arm or "mh", contract=f"{cand[0]}{cand[1]}",
                               stake=price_paid, ratio=round(ratio, 4), rtt=round(self._rtt_for(sym), 4),
                               age=round(time.time() - sig.recv, 4), win=c.win,
-                              payout_slip=None if slip is None else round(slip, 4), **extra)
+                              payout_slip=None if slip is None else round(slip, 4), redge=round(c.redge, 4), **extra)
         tg = f"{cand[0]}{cand[1]}"
         cl_s = ""
         if c.cl is not None:
@@ -1348,8 +1551,8 @@ class MHEngine(SetEngine):
             cl_s += " win=%s" % self._win_label(c.win)
         self._last_decision = f"BUY {sym} {tg} h={h} p={c.p:.3f} lb={c.lb:.3f} r={ratio:.3f} edge_lb={c.edge:+.3f}"
         logger.info("MH TRADE %s %s %s h=%d p_cal=%.3f p_lb=%.3f paid=%.2f payout=%.2f ratio=%.3f edge_lb=%+.3f "
-                    "score=%.4f q=%.2f shortcode=%s", cid, sym, tg, h, c.p, c.lb, price_paid, payout, ratio, c.edge,
-                    c.score, self._q.get(sym, 0.0), str(buy.get("shortcode", "?")) + cl_s)
+                    "score=%.4f q=%.2f shortcode=%s redge=%+.3f", cid, sym, tg, h, c.p, c.lb, price_paid, payout, ratio, c.edge,
+                    c.score, self._q.get(sym, 0.0), str(buy.get("shortcode", "?")) + cl_s, c.redge)
         if slip is not None:
             logger.info("MH SLIP %s quote_ratio=%.3f paid_ratio=%.3f slip=%+.3f quote_age=%s", cid, c.r, ratio, slip,
                         "n/a" if q_age is None else f"{q_age:.0f}s")
@@ -2313,9 +2516,13 @@ class MHEngine(SetEngine):
             sl = sorted(self._slips)
             cl += (f"SLIP mean {sum(sl) / len(sl):+.3f} p95 {sl[min(len(sl) - 1, int(0.95 * len(sl)))]:+.3f} "
                    f"n={self._slip_n} paid<{self.min_ratio:.2f}: {self._slip_low} | ")
+        ro = ""
+        if self._rk_n:                                      # theoretical outcomes of the top-N pool entries per rank (n / hit rate / ROI)
+            ro = " | rank-outcome " + " ".join(f"r{k}:{self._rk_n[k]}n/{100.0 * self._rk_hit[k] / self._rk_n[k]:.0f}%/"
+                                               f"{self._rk_roi[k] / self._rk_n[k]:+.2f}" for k in sorted(self._rk_n))
         return (f"SET REPORT | MH {trade} | {cl}per-h {per_h} | tradable (sym,h) {self._n_tradable()}/{total} | "
                 f"q {qs} | muted {sorted(self._muted) or '-'} | open {len(self._open)} | signals {len(self._sig)} | "
-                f"scans {self._scans} | rtt {self._rtt or 0:.3f}s")
+                f"scans {self._scans} | rtt {self._rtt or 0:.3f}s{ro}")
 
     async def _dashboard_loop(self):
         while True:
