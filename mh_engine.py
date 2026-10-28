@@ -501,9 +501,20 @@ class MHEngine(SetEngine):
         budget = float(_cfg("MH_BOOT_BUDGET_SECONDS", 75))
         return (self._boot_t0 if not self._rtt_ready else time.time()) + budget
 
+    def _new_symbol(self, sym: str, dec: int):
+        """MH_PRED_V2=0: the legacy MHSymbol, constructed exactly as before. MH_PRED_V2=1: rng_core V2Symbol (lazy import)."""
+        if bool(_cfg("MH_PRED_V2", 0)):
+            from rng_core.adapter import make_symbol
+            import config as _config_mod
+            return make_symbol(sym, self.hmax, dec, _config_mod)
+        return mp.MHSymbol(sym, self.hmax, 10, float(_cfg("MH_DECAY", 0.998)))
+
     async def _build_symbol(self, sym: str) -> None:
         """Download history, walk-forward, replay ticks that arrived meanwhile, then publish self.mh[sym]."""
-        ticks = await self.client.get_tick_history(sym, int(_cfg("MH_HISTORY_TICKS", 15000)))
+        n_hist = int(_cfg("MH_HISTORY_TICKS", 15000))
+        if bool(_cfg("MH_PRED_V2", 0)):
+            n_hist = max(n_hist, int(_cfg("V2_HISTORY_TICKS", 0)))       # v2: longer history reaches the later diagnostic rungs sooner
+        ticks = await self.client.get_tick_history(sym, n_hist)
         if len(ticks) < 600:
             raise RuntimeError(f"only {len(ticks)} ticks returned")
         quotes = [t["quote"] for t in ticks]
@@ -515,8 +526,11 @@ class MHEngine(SetEngine):
         if self.test_mode and sym not in self.diag.sym:
             self.diag.add_many(sym, digits)
         last_ep = ticks[-1]["epoch"]
-        mhs = mp.MHSymbol(sym, self.hmax, 10, float(_cfg("MH_DECAY", 0.998)))
-        rep = await mhs.fit(digits, last_ep, deadline=self._horizon_deadline())
+        mhs = self._new_symbol(sym, dec)
+        if getattr(mhs, "is_v2", False):
+            rep = await mhs.fit_ticks(ticks, digits, dec)
+        else:
+            rep = await mhs.fit(digits, last_ep, deadline=self._horizon_deadline())
         if not mhs.hs:
             raise RuntimeError("history too short for the models")
         eps = [int(t["epoch"]) for t in ticks[-500:]]
@@ -529,7 +543,7 @@ class MHEngine(SetEngine):
         self._q.setdefault(sym, 0.1)
         for ep, qt in list(self._pre.get(sym, ())):         # ticks that arrived while we were downloading/fitting
             if ep > last_ep:
-                self._ingest(sym, mhs, ep, pred.last_digit(qt, dec))
+                self._ingest(sym, mhs, ep, pred.last_digit(qt, dec), qt)
         self._pre[sym].clear()
         self.mh[sym] = mhs                                  # no await between replay and publish
         logger.info("FIT %s: %s", sym, rep["h"])
@@ -558,8 +572,12 @@ class MHEngine(SetEngine):
             self._T[sym] = self._median_gap(list(q))
         return i
 
-    def _ingest(self, sym: str, mhs: mp.MHSymbol, ep: float, digit: int) -> bool:
-        if not mhs.on_tick(digit, ep):
+    def _ingest(self, sym: str, mhs: mp.MHSymbol, ep: float, digit: int, quote: Optional[float] = None) -> bool:
+        if getattr(mhs, "is_v2", False):
+            ok = mhs.on_tick(digit, ep, quote)
+        else:
+            ok = mhs.on_tick(digit, ep)
+        if not ok:
             return False
         i = self._book(sym, ep)
         if self._rank_book:
@@ -592,7 +610,7 @@ class MHEngine(SetEngine):
             if buf is not None:
                 buf.append((ep, qt))
             return
-        if self._ingest(sym, mhs, ep, pred.last_digit(qt, self._decimals[sym])):
+        if self._ingest(sym, mhs, ep, pred.last_digit(qt, self._decimals[sym]), qt):
             self._recv[sym] = now
             ev = self._events.get(sym)
             if ev is not None:
@@ -2412,6 +2430,8 @@ class MHEngine(SetEngine):
         old = self.mh.get(sym)
         if old is None or not old.ready() or (sym in self._hold and not lead):
             return False
+        if getattr(old, "is_v2", False):
+            return False                                          # v2 models are online: no periodic refit
         t0 = time.time()
         self._bg_buf[sym] = collections.deque(maxlen=20000)       # record BEFORE the history request goes out
         try:
@@ -2442,7 +2462,7 @@ class MHEngine(SetEngine):
                     if ep > new.last_epoch and ep not in seen:
                         seen.add(ep)
                         if lead:
-                            self._ingest(sym, new, ep, pred.last_digit(qt, dec))
+                            self._ingest(sym, new, ep, pred.last_digit(qt, dec), qt)
                         else:
                             new.on_tick(pred.last_digit(qt, dec), ep)
                         n += 1
@@ -2470,10 +2490,10 @@ class MHEngine(SetEngine):
             if ticks and mhs is not None and mhs.last_epoch is not None and ticks[0]["epoch"] <= mhs.last_epoch:
                 for t in ticks:                             # gap fully covered: feed only the missing ticks
                     if t["epoch"] > mhs.last_epoch:
-                        self._ingest(sym, mhs, t["epoch"], pred.last_digit(t["quote"], dec))
+                        self._ingest(sym, mhs, t["epoch"], pred.last_digit(t["quote"], dec), t["quote"])
                 for ep, qt in list(self._pre.get(sym, ())):
                     if ep > mhs.last_epoch:
-                        self._ingest(sym, mhs, ep, pred.last_digit(qt, dec))
+                        self._ingest(sym, mhs, ep, pred.last_digit(qt, dec), qt)
                 self._pre[sym].clear()
                 logger.info("RESYNC %s: gap filled, %d ticks", sym, len(ticks))
             else:
@@ -2520,6 +2540,9 @@ class MHEngine(SetEngine):
         if self._rk_n:                                      # theoretical outcomes of the top-N pool entries per rank (n / hit rate / ROI)
             ro = " | rank-outcome " + " ".join(f"r{k}:{self._rk_n[k]}n/{100.0 * self._rk_hit[k] / self._rk_n[k]:.0f}%/"
                                                f"{self._rk_roi[k] / self._rk_n[k]:+.2f}" for k in sorted(self._rk_n))
+        v2 = " ".join(m.brief() for m in self.mh.values() if getattr(m, "is_v2", False))
+        if v2:
+            cl += f"V2[{v2}] | "
         return (f"SET REPORT | MH {trade} | {cl}per-h {per_h} | tradable (sym,h) {self._n_tradable()}/{total} | "
                 f"q {qs} | muted {sorted(self._muted) or '-'} | open {len(self._open)} | signals {len(self._sig)} | "
                 f"scans {self._scans} | rtt {self._rtt or 0:.3f}s{ro}")
