@@ -1821,3 +1821,19 @@ MH_DEADLINE_RTT       = os.environ.get("MH_DEADLINE_RTT", "p50").strip().lower()
 
 if TEST_MODE:
     MH_MODE = True                        # test mode lives in the MH engine
+
+# ── RNG-agnostic top-4 predictor v2 (rng_core/, see docs/v2/REPORT.md). MH_PRED_V2=0 (default) = legacy predictor, bit-identical ──
+MH_PRED_V2               = _env_b("MH_PRED_V2", 0)                 # 1 = the engine builds rng_core V2Symbol objects instead of mh_predictor.MHSymbol
+V2_RANK_MODE             = os.environ.get("V2_RANK_MODE", "off").strip().lower()   # off | calibrated (calibrated: act only when the Wilson lb of P(top4 hit) > 0.40 + V2_MIN_EDGE)
+V2_MIN_EDGE              = _env_f("V2_MIN_EDGE", 0.0)              # edge over the fair top-4 rate (0.40) required in V2_RANK_MODE=calibrated
+V2_ACT_ON_NO_STRUCTURE   = _env_b("V2_ACT_ON_NO_STRUCTURE", 0)     # 1 = the engine may act on predictions of streams with no detected structure (fair-RNG top-4 is 40%)
+V2_ALPHA                 = _env_f("V2_ALPHA", 0.01)                # total type-I budget (half diagnostics via alpha-spending, half the e-process)
+V2_HMAX                  = _env_i("V2_HMAX", 10)                   # horizons predicted and shadow-scored
+V2_DIAG_FIRST            = _env_i("V2_DIAG_FIRST", 5000)           # first diagnostic run at this many ticks of the segment; then x2 (5k, 10k, 20k, ...)
+V2_STORE_CAPACITY        = _env_i("V2_STORE_CAPACITY", 300000)     # ticks kept per symbol in memory (ring; ~25 bytes/tick)
+V2_SOLVER_BUDGET_SECONDS = _env_f("V2_SOLVER_BUDGET_SECONDS", 20)  # wall/CPU budget of one exact-solver run (child process)
+V2_SOLVER_MAX_MB         = _env_i("V2_SOLVER_MAX_MB", 400)         # address-space limit of the solver child process
+V2_VALIDATE_N            = _env_i("V2_VALIDATE_N", 24)             # held-out ticks an exact fit must reproduce before EXACT_STATE
+V2_EXACT_MASS            = _env_f("V2_EXACT_MASS", 0.999)          # probability put on the solver's digit in EXACT_STATE
+V2_EXHAUSTIVE            = _env_b("V2_EXHAUSTIVE", 0)              # 1 = also run the multi-minute solvers (32-bit LCG brute force, MT19937 elimination)
+V2_HISTORY_TICKS        = _env_i("V2_HISTORY_TICKS", 0)           # >0 and > MH_HISTORY_TICKS: history requested at boot when MH_PRED_V2=1 (paged, 1000 ticks/call; redeploy wipes memory, so this is the only way to reach the 20k / 40k diagnostic rungs early)
