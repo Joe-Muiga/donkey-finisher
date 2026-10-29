@@ -146,9 +146,6 @@ def cover_width(cand) -> int:
     return 9 - cand[1] if cand[0] == "OVER" else cand[1]
 
 
-FIVE_COVERS = (("OVER", 4), ("UNDER", 5), ("EVEN", None), ("ODD", None))   # the only strictly-5-digit contracts
-
-
 def pick_fits(cluster, max_width: int, widths, pick: str):
     """Covering contracts of the cluster, filtered by allowed widths, ordered by the pick rule."""
     fits = [(c, w) for c, w in sp.covering_contracts(cluster, max_width) if w in widths]
@@ -213,12 +210,10 @@ class MHEngine(SetEngine):
         self.min_ratio = float(_cfg("MH_MIN_PAYOUT_RATIO", 2.0))   # payout/stake must be >= this
         self.max_per_target = int(_cfg("MH_MAX_PER_TARGET", 2))
         self.cluster = bool(int(_cfg("MH_CLUSTER", 1)))
+        self.even_odd = bool(int(_cfg("MH_EVEN_ODD", 1)))
         self.set_size = int(_cfg("SET_SIZE", 4))
         self.max_width = int(_cfg("SET_MAX_COVER_WIDTH", 5))
         self.widths = tuple(int(w) for w in (_cfg("MH_CLUSTER_WIDTHS", (3, 4, 5)) or (3, 4, 5)))
-        self.five = bool(int(_cfg("MH_FIVE_MODE", 1)))
-        if self.five:
-            self.widths, self.max_width = (5,), 5
         pk = str(_cfg("MH_CLUSTER_PICK", "widest")).strip().lower()
         self.pick = pk if pk in ("widest", "tightest") else "widest"
         self.min_set_prob = float(_cfg("SET_MIN_SET_PROB", 0.0))
@@ -675,23 +670,16 @@ class MHEngine(SetEngine):
             return None
         nxt = mhs.hs.get(h + 1)
         p = p_eff_mix(hs.cur[1], nxt.cur[1] if (nxt is not None and nxt.cur is not None) else None, q)
-        if self.five:                                        # strictly 5 digits: OVER4 / UNDER5 / EVEN / ODD, best edge decides downstream
-            fits = [(cd, 5) for cd in FIVE_COVERS]
-            pv = [(float(p @ mp.W[:, mp.COVERS.index(cd)]), cd) for cd in FIVE_COVERS]
-            mass, bcd = max(pv, key=lambda x: x[0])
-            bci = mp.COVERS.index(bcd)
-            cl = tuple(d for d in range(10) if mp.W[d, bci] > 0)
-            self._cl_formed += 1
-        else:
-            cl = top_cluster(p, self.set_size)
-            mass = float(sum(p[d] for d in cl))
-            if self.rank_key != "edge" and self.min_set_prob > 0 and mass < self.min_set_prob:
-                return None                                  # raw-mass floor; under MH_RANK_KEY=edge the floor is MH_RANK_MIN_EDGE
-            self._cl_formed += 1
-            fits = pick_fits(cl, self.max_width, self.widths, self.pick)[:3]
-            if not fits:
-                self._cl_spread += 1
-                return None
+        cl = top_cluster(p, self.set_size)
+        mass = float(sum(p[d] for d in cl))
+        if self.rank_key != "edge" and self.min_set_prob > 0 and mass < self.min_set_prob:
+            return None                                      # raw-mass floor; under MH_RANK_KEY=edge the floor is MH_RANK_MIN_EDGE
+        self._cl_formed += 1
+        fits = pick_fits(cl, self.max_width, self.widths, self.pick)[:3]
+        if not fits:
+            self._cl_spread += 1
+        if self.even_odd:
+            fits = list(fits) + [(cd, 5) for cd in (("EVEN", None), ("ODD", None))]
         # Calibrate FIRST, mix AFTER (same as MHSymbol.screen): each calibrator was fitted on its own horizon's raw P, so it
         # only ever sees P_h resp. P_(h+1); the lag mix is applied to the calibrated p / Wilson lb. The cluster itself
         # (and its mass) still comes from the mixed distribution above.
@@ -856,7 +844,7 @@ class MHEngine(SetEngine):
             return
         need: list = []                                     # payout ratios still missing (top 3 per sym/h)
         seen = set()
-        for rank in range(3):                               # best cover of every (sym, h) first, then 2nd, then 3rd
+        for rank in range(5):                               # best cover of every (sym, h) first, then 2nd, then 3rd
             for sig in sigs:
                 for h, sc in sig.cands.items():
                     if rank < len(sc):
