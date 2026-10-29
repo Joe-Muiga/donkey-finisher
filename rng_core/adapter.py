@@ -286,4 +286,3 @@ def make_symbol(symbol: str, hmax: int, decimals: int, cfg_module=None):
     c.hmax = max(int(hmax), int(c.hmax))
     return V2Symbol(symbol, c, decimals, rank_mode=str(getattr(cfg_module, "V2_RANK_MODE", "off")).lower(),
                     min_edge=float(getattr(cfg_module, "V2_MIN_EDGE", 0.0)))
- 
