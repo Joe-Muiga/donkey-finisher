@@ -1677,12 +1677,12 @@ def _env_b(k, d):
 
 MH_MODE                = _env_b("MH_MODE", 1)
 MH_CLUSTER             = _env_b("MH_CLUSTER", 1)                  # 1 = SET-cluster contract choice inside MH; 0 = old MH edge logic
-MH_FIVE_MODE           = _env_b("MH_FIVE_MODE", 1)                # 1 = strictly 5-digit guesses: best of OVER4 / UNDER5 / EVEN / ODD each signal (win prob 0.5); 0 = old cluster logic
+MH_EVEN_ODD            = _env_b("MH_EVEN_ODD", 1)                 # 1 = EVEN / ODD (5 digits each) are offered next to the cluster Over/Under covers; 0 = Over/Under only
 MH_CLUSTER_WIDTHS      = _env_tuple("MH_CLUSTER_WIDTHS", (3, 4, 5))   # allowed cover widths (digits the cover wins on)
 MH_CLUSTER_PICK        = os.environ.get("MH_CLUSTER_PICK", "widest").strip().lower()   # widest = best win prob; tightest = best payout
 MH_MAX_OPEN            = _env_i("MH_MAX_OPEN", 0)                 # optional cap on open contracts; 0 = unlimited
 MH_MAX_PER_SCAN        = _env_i("MH_MAX_PER_SCAN", 0)             # optional cap on buys per scan; 0 = unlimited
-MH_MIN_PAYOUT_RATIO    = _env_f("MH_MIN_PAYOUT_RATIO", 1.8 if MH_FIVE_MODE else (1.9 if MH_CLUSTER else 2.0))   # real quote payout/stake floor
+MH_MIN_PAYOUT_RATIO    = _env_f("MH_MIN_PAYOUT_RATIO", 1.9 if MH_CLUSTER else 2.0)   # real quote payout/stake floor
 MH_HISTORY_TICKS       = _env_i("MH_HISTORY_TICKS", 15000)        # ticks fetched per symbol at boot
 MH_BOOT_BUDGET_SECONDS = _env_f("MH_BOOT_BUDGET_SECONDS", 75)     # extra horizons are skipped past this
 MH_BOOT_CONCURRENCY    = _env_i("MH_BOOT_CONCURRENCY", 5)         # symbols initialised in parallel
