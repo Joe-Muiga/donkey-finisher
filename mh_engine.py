@@ -141,7 +141,12 @@ def _num(name: str, default: float) -> float:
 
 
 def cover_width(cand) -> int:
+    if cand[0] in ("EVEN", "ODD"):
+        return 5
     return 9 - cand[1] if cand[0] == "OVER" else cand[1]
+
+
+FIVE_COVERS = (("OVER", 4), ("UNDER", 5), ("EVEN", None), ("ODD", None))   # the only strictly-5-digit contracts
 
 
 def pick_fits(cluster, max_width: int, widths, pick: str):
@@ -211,6 +216,9 @@ class MHEngine(SetEngine):
         self.set_size = int(_cfg("SET_SIZE", 4))
         self.max_width = int(_cfg("SET_MAX_COVER_WIDTH", 5))
         self.widths = tuple(int(w) for w in (_cfg("MH_CLUSTER_WIDTHS", (3, 4, 5)) or (3, 4, 5)))
+        self.five = bool(int(_cfg("MH_FIVE_MODE", 1)))
+        if self.five:
+            self.widths, self.max_width = (5,), 5
         pk = str(_cfg("MH_CLUSTER_PICK", "widest")).strip().lower()
         self.pick = pk if pk in ("widest", "tightest") else "widest"
         self.min_set_prob = float(_cfg("SET_MIN_SET_PROB", 0.0))
@@ -667,15 +675,23 @@ class MHEngine(SetEngine):
             return None
         nxt = mhs.hs.get(h + 1)
         p = p_eff_mix(hs.cur[1], nxt.cur[1] if (nxt is not None and nxt.cur is not None) else None, q)
-        cl = top_cluster(p, self.set_size)
-        mass = float(sum(p[d] for d in cl))
-        if self.rank_key != "edge" and self.min_set_prob > 0 and mass < self.min_set_prob:
-            return None                                      # raw-mass floor; under MH_RANK_KEY=edge the floor is MH_RANK_MIN_EDGE
-        self._cl_formed += 1
-        fits = pick_fits(cl, self.max_width, self.widths, self.pick)[:3]
-        if not fits:
-            self._cl_spread += 1
-            return None
+        if self.five:                                        # strictly 5 digits: OVER4 / UNDER5 / EVEN / ODD, best edge decides downstream
+            fits = [(cd, 5) for cd in FIVE_COVERS]
+            pv = [(float(p @ mp.W[:, mp.COVERS.index(cd)]), cd) for cd in FIVE_COVERS]
+            mass, bcd = max(pv, key=lambda x: x[0])
+            bci = mp.COVERS.index(bcd)
+            cl = tuple(d for d in range(10) if mp.W[d, bci] > 0)
+            self._cl_formed += 1
+        else:
+            cl = top_cluster(p, self.set_size)
+            mass = float(sum(p[d] for d in cl))
+            if self.rank_key != "edge" and self.min_set_prob > 0 and mass < self.min_set_prob:
+                return None                                  # raw-mass floor; under MH_RANK_KEY=edge the floor is MH_RANK_MIN_EDGE
+            self._cl_formed += 1
+            fits = pick_fits(cl, self.max_width, self.widths, self.pick)[:3]
+            if not fits:
+                self._cl_spread += 1
+                return None
         # Calibrate FIRST, mix AFTER (same as MHSymbol.screen): each calibrator was fitted on its own horizon's raw P, so it
         # only ever sees P_h resp. P_(h+1); the lag mix is applied to the calibrated p / Wilson lb. The cluster itself
         # (and its mass) still comes from the mixed distribution above.
@@ -1715,16 +1731,16 @@ class MHEngine(SetEngine):
             sc = parse_shortcode(r.get("shortcode")) or {}
             typ = r.get("contract_type") or sc.get("type")
             sym = r.get("symbol") or sc.get("sym")
-            if not cid or cid in self._open or cid in self._known_cids or typ not in ("DIGITOVER", "DIGITUNDER"):
+            if not cid or cid in self._open or cid in self._known_cids or typ not in ("DIGITOVER", "DIGITUNDER", "DIGITEVEN", "DIGITODD"):
                 continue
             try:
-                bar = int(sc.get("barrier"))
+                bar = None if typ in ("DIGITEVEN", "DIGITODD") else int(sc.get("barrier"))
                 bp = float(r.get("buy_price") or 0.0)
                 pay = float(r.get("payout") or 0.0)
                 opened = float(r.get("purchase_time") or time.time())
             except (TypeError, ValueError):
                 continue
-            cand = ("OVER" if typ == "DIGITOVER" else "UNDER", bar)
+            cand = {"DIGITEVEN": ("EVEN", None), "DIGITODD": ("ODD", None)}.get(typ) or ("OVER" if typ == "DIGITOVER" else "UNDER", bar)
             self._remember_cid(cid)
             self._open[cid] = {"sym": sym, "cand": cand, "stake": bp, "ratio": pay / bp if bp > 0 and pay > 0 else 1.9,
                                "opened_at": opened, "decision_epoch": None, "t0": time.time(), "h": None, "sig_idx": 0,
@@ -1738,7 +1754,7 @@ class MHEngine(SetEngine):
                 logger.warning("subscribe_contract(%s) failed (settle loop will poll): %s", cid, exc)
             if self.ledger is not None:
                 self.ledger.event("orphan_adopted", cid=cid, sym=sym, contract=f"{cand[0]}{cand[1]}", stake=bp)
-            logger.warning("MH ADOPT ORPHAN %s %s %s%d stake=%.2f (open on Deriv, not tracked here)", cid, sym, cand[0], cand[1], bp)
+            logger.warning("MH ADOPT ORPHAN %s %s %s%s stake=%.2f (open on Deriv, not tracked here)", cid, sym, cand[0], cand[1], bp)
             n += 1
         logger.info("MH ADOPT: %d orphan contract(s) adopted", n)
 
