@@ -678,8 +678,11 @@ class MHEngine(SetEngine):
         fits = pick_fits(cl, self.max_width, self.widths, self.pick)[:3]
         if not fits:
             self._cl_spread += 1
-        if self.even_odd:
-            fits = list(fits) + [(cd, 5) for cd in (("EVEN", None), ("ODD", None))]
+        if self.even_odd:                                    # one Even/Odd per (symbol, horizon): the likelier one, and only if it can clear the payout floor
+            eo = [cd for cd in (("EVEN", None), ("ODD", None)) if mp.P.estimated_payout_ratio(cd) >= self.min_ratio]
+            if eo:
+                eo.sort(key=lambda cd: -float(p @ mp.W[:, mp.COVERS.index(cd)]))
+                fits = list(fits) + [(eo[0], 5)]
         # Calibrate FIRST, mix AFTER (same as MHSymbol.screen): each calibrator was fitted on its own horizon's raw P, so it
         # only ever sees P_h resp. P_(h+1); the lag mix is applied to the calibrated p / Wilson lb. The cluster itself
         # (and its mass) still comes from the mixed distribution above.
