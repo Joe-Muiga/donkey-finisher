@@ -39,8 +39,8 @@ CAL_LIVE = bool(int(getattr(config, "MH_CAL_LIVE", 1)))                   # live
 CAL_LIVE_CAP = float(getattr(config, "MH_CAL_LIVE_CAP", 3000))            # live_n of a bin above this -> both live counts are halved
 logger = logging.getLogger(__name__)
 
-COVERS: List[P.Candidate] = [("OVER", b) for b in range(0, 9)] + [("UNDER", b) for b in range(1, 10)]
-W = np.array([[1.0 if P.wins_digit(c, d) else 0.0 for c in COVERS] for d in range(10)])   # (10, 18)
+COVERS: List[P.Candidate] = [("OVER", b) for b in range(0, 9)] + [("UNDER", b) for b in range(1, 10)] + [("EVEN", None), ("ODD", None)]
+W = np.array([[1.0 if P.wins_digit(c, d) else 0.0 for c in COVERS] for d in range(10)])   # (10, 20)
 TRUE_P = W.sum(axis=0) / 10.0
 
 
