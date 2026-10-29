@@ -43,7 +43,7 @@ from bot_engine import BotEngine, _cfg
 from set_engine import SetEngine, account_allowed
 
 logger = logging.getLogger(__name__)
-RATIO_TTL = float(getattr(config, "MH_RATIO_TTL", 600.0))   # digit-contract payout ratios are ~constant: cache long
+RATIO_TTL = float(getattr(config, "MH_RATIO_TTL", 3600.0))   # digit-contract payout ratios are ~constant: cache long
 _PROCESS_T0 = time.time()                                   # ~process start (boot report: how long boot + first fit took)
 
 
@@ -267,9 +267,12 @@ class MHEngine(SetEngine):
         self._rtt: Optional[float] = None
         self._rtt_ready = False
         self._ratio_cache: Dict[tuple, Tuple[float, float]] = {}
+        self._ratio_shared: Dict[tuple, Tuple[float, float]] = {}
+        self.per_symbol = bool(int(_num("MH_PER_SYMBOL", 1)))
+        self._sym_win: Dict[str, int] = {}
         self._tcount: Dict[tuple, int] = {}
         # minute ranking: per-symbol best contract, then best overall, once per UTC minute
-        self.minute_rank = bool(int(_num("MH_MINUTE_RANK", 1)))
+        self.minute_rank = bool(int(_num("MH_MINUTE_RANK", 1))) and not self.per_symbol
         rw = int(_num("MH_RANK_WINDOW_SECONDS", 30))
         if rw not in (30, 60):
             logger.warning("MH_RANK_WINDOW_SECONDS=%s is not 30 or 60: using 30", rw)
@@ -497,7 +500,7 @@ class MHEngine(SetEngine):
             raise RuntimeError("no digit contract could be priced")
         ratio = float(prop["payout"]) / self.stake
         self._ratios.setdefault(sym, {})[cand] = ratio
-        self._ratio_cache[(sym, mp.COVERS.index(cand), 1)] = (ratio, time.time())
+        self._ratio_put(sym, mp.COVERS.index(cand), 1, (ratio, time.time()))
         self._note_rtt(dt, sym)
 
     def _horizon_deadline(self) -> float:
@@ -752,12 +755,29 @@ class MHEngine(SetEngine):
                               age=round(time.time() - sig.recv, 4), rtt=round(self._rtt_for(sig.sym), 4))
 
     # ── API helpers ──────────────────────────────────────────────────────────
-    def _ratio_get(self, sym: str, ci: int, h: int) -> Optional[float]:
+    def _ratio_put(self, sym: str, ci: int, h: int, v: Tuple[float, float]) -> None:
+        self._ratio_cache[(sym, ci, h)] = v
+        self._ratio_shared[(ci, h)] = v
+
+    def _ratio_entry(self, sym: str, ci: int, h: int) -> Optional[Tuple[float, float]]:
+        now = time.time()
         v = self._ratio_cache.get((sym, ci, h))
         ttl = min(RATIO_TTL, self.max_quote_age) if self.max_quote_age > 0 else RATIO_TTL
-        return v[0] if v and time.time() - v[1] < ttl else None
+        if v and now - v[1] < ttl:
+            return v
+        s = self._ratio_shared.get((ci, h))
+        if s and now - s[1] < RATIO_TTL:
+            return s
+        return None
+
+    def _ratio_get(self, sym: str, ci: int, h: int) -> Optional[float]:
+        v = self._ratio_entry(sym, ci, h)
+        return v[0] if v else None
 
     def _ratio_ts(self, sym: str, ci: int, h: int) -> Optional[float]:
+        v = self._ratio_entry(sym, ci, h)
+        if v:
+            return v[1]
         v = self._ratio_cache.get((sym, ci, h))
         return v[1] if v else None
 
@@ -783,7 +803,7 @@ class MHEngine(SetEngine):
             prop = await self._propose(sym, mp.COVERS[ci], self.stake, h)
             self._note_rtt(time.perf_counter() - t0, sym)
         if prop and prop.get("payout"):
-            self._ratio_cache[(sym, ci, h)] = (float(prop["payout"]) / self.stake, time.time())
+            self._ratio_put(sym, ci, h, (float(prop["payout"]) / self.stake, time.time()))
 
     async def _on_api_error(self, what: str, exc: Exception):
         if "rate" in str(exc).lower():
@@ -852,8 +872,8 @@ class MHEngine(SetEngine):
                 for h, sc in sig.cands.items():
                     if rank < len(sc):
                         k = (sig.sym, sc[rank][0], h)
-                        if k not in seen and self._ratio_get(*k) is None:
-                            seen.add(k)
+                        if (k[1], k[2]) not in seen and self._ratio_get(*k) is None:
+                            seen.add((k[1], k[2]))
                             need.append(k)
         need = need[: self._max_ratio_fetch]                # cap per scan; the cache fills over the next scans
         if need and time.monotonic() >= self._rl_cool_until:
@@ -913,6 +933,7 @@ class MHEngine(SetEngine):
             return
         cands.sort(key=self._cand_key if self.cluster else (lambda c: -c.score))
         picks: List[Tuple[Cand, float]] = []
+        cur_win = self._win_id()
         for c in cands:
             if self._late(c.sig) or self._blocked():
                 continue
@@ -923,6 +944,8 @@ class MHEngine(SetEngine):
             tk = (c.sig.sym, c.sig.idx + c.h)
             if tk in self._doubt_targets or self._tcount.get(tk, 0) >= self.max_per_target:
                 continue                                    # an in-doubt buy keeps its target closed
+            if self.per_symbol and self._sym_win.get(c.sig.sym) == cur_win:
+                continue
             stake = self._next_stake()                      # shrinks as pending grows: best candidate = biggest stake
             if stake is None:
                 self._last_decision = "skip: no stake available"
@@ -931,7 +954,9 @@ class MHEngine(SetEngine):
                 self._last_decision = "skip: balance cannot pay the stake"
                 break
             self._tcount[tk] = self._tcount.get(tk, 0) + 1
-            c.win = self._win_id()                          # window id at pick time (no window slot in this legacy path)
+            c.win = cur_win                                 # window id at pick time (no window slot in this legacy path)
+            if self.per_symbol:
+                self._sym_win[c.sig.sym] = cur_win
             picks.append((c, stake))
         if picks:
             self._rank_shadow(cands, picks, f"scan {self._scans}")
@@ -1396,7 +1421,7 @@ class MHEngine(SetEngine):
         if not prop or not prop.get("payout"):
             return None
         v = (float(prop["payout"]) / self.stake, time.time())
-        self._ratio_cache[(sym, ci, h)] = v
+        self._ratio_put(sym, ci, h, v)
         return v
 
     async def _refresh_quote(self, c: Cand) -> Optional[str]:
@@ -1516,6 +1541,8 @@ class MHEngine(SetEngine):
             self._test_pending = max(0.0, self._test_pending - stake)
         if not ok:
             self._tcount[tk] = max(0, self._tcount.get(tk, 1) - 1)
+            if self.per_symbol and c.win is not None and self._sym_win.get(c.sig.sym) == c.win:
+                self._sym_win.pop(c.sig.sym, None)
             w = c.win if c.win is not None else win
             if self.minute_rank and c.arm is None and w is not None and self._release_slot(w):
                 logger.info("WINDOW %s: pick %s %s%s h=%d did not become a position: slot released%s", self._win_label(w), c.sig.sym,
@@ -2044,6 +2071,7 @@ class MHEngine(SetEngine):
         self._board.clear()
         self._bar_pool = {}
         self._ratio_cache.clear()
+        self._ratio_shared.clear()
         self._rnd_minute, self._rnd_rej, self._rnd_snap, self._rnd_seen = -1, {}, 0, False
         self._win_picks.clear()
         # (2) refit every symbol (the old model stays when a refit fails: never no model)
