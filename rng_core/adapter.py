@@ -31,7 +31,7 @@ from .orchestrator import SymbolOrchestrator, V2Config
 from .selector import Selector
 from .types import EXACT_STATE, NO_STRUCTURE, STAT_SIGNAL
 
-NCOVERS = 18                                    # mh_predictor.COVERS (OVER 0..8, UNDER 1..9); only the count matters here
+NCOVERS = 20                                    # mh_predictor.COVERS (OVER 0..8, UNDER 1..9); only the count matters here
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SHARED_CAL: Optional[Top4Calibrator] = None
 _BUILD_LOCKS: Dict[int, asyncio.Lock] = {}
