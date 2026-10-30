@@ -146,6 +146,21 @@ def cover_width(cand) -> int:
     return 9 - cand[1] if cand[0] == "OVER" else cand[1]
 
 
+def _build_inv_map():
+    out = {}
+    for ci, cd in enumerate(mp.COVERS):
+        if cd[0] not in ("OVER", "UNDER"):
+            continue
+        q = {d for d in range(10) if mp.W[d, ci] <= 0}
+        out[ci] = [cj for cj, c2 in enumerate(mp.COVERS)
+                   if c2[0] in ("OVER", "UNDER") and cover_width(c2) in (3, 4)
+                   and {d for d in range(10) if mp.W[d, cj] > 0} <= q]
+    return out
+
+
+INV_MAP = _build_inv_map()
+
+
 def pick_fits(cluster, max_width: int, widths, pick: str):
     """Covering contracts of the cluster, filtered by allowed widths, ordered by the pick rule."""
     fits = [(c, w) for c, w in sp.covering_contracts(cluster, max_width) if w in widths]
@@ -210,7 +225,9 @@ class MHEngine(SetEngine):
         self.min_ratio = float(_cfg("MH_MIN_PAYOUT_RATIO", 2.0))   # payout/stake must be >= this
         self.max_per_target = int(_cfg("MH_MAX_PER_TARGET", 2))
         self.cluster = bool(int(_cfg("MH_CLUSTER", 1)))
-        self.even_odd = bool(int(_cfg("MH_EVEN_ODD", 1)))
+        self.invert = bool(int(_num("MH_INVERT", 1)))
+        self.inv_min_ratio = float(_num("MH_INV_MIN_RATIO", 2.0))
+        self.even_odd = bool(int(_cfg("MH_EVEN_ODD", 1))) and not self.invert
         self.set_size = int(_cfg("SET_SIZE", 4))
         self.max_width = int(_cfg("SET_MAX_COVER_WIDTH", 5))
         self.widths = tuple(int(w) for w in (_cfg("MH_CLUSTER_WIDTHS", (3, 4, 5)) or (3, 4, 5)))
@@ -871,10 +888,11 @@ class MHEngine(SetEngine):
             for sig in sigs:
                 for h, sc in sig.cands.items():
                     if rank < len(sc):
-                        k = (sig.sym, sc[rank][0], h)
-                        if (k[1], k[2]) not in seen and self._ratio_get(*k) is None:
-                            seen.add((k[1], k[2]))
-                            need.append(k)
+                        for ci2 in ((sc[rank][0],) + tuple(INV_MAP.get(sc[rank][0], ()) if self.invert else ())):
+                            k = (sig.sym, ci2, h)
+                            if (k[1], k[2]) not in seen and self._ratio_get(*k) is None:
+                                seen.add((k[1], k[2]))
+                                need.append(k)
         need = need[: self._max_ratio_fetch]                # cap per scan; the cache fills over the next scans
         if need and time.monotonic() >= self._rl_cool_until:
             await asyncio.gather(*(self._ratio_fetch(*k) for k in need), return_exceptions=True)
@@ -946,6 +964,10 @@ class MHEngine(SetEngine):
                 continue                                    # an in-doubt buy keeps its target closed
             if self.per_symbol and self._sym_win.get(c.sig.sym) == cur_win:
                 continue
+            if self.invert:
+                c = self._invert(c)
+                if c is None:
+                    continue
             stake = self._next_stake()                      # shrinks as pending grows: best candidate = biggest stake
             if stake is None:
                 self._last_decision = "skip: no stake available"
@@ -965,6 +987,31 @@ class MHEngine(SetEngine):
             t = asyncio.create_task(self._buy_one(c, stake))
             self._tasks.add(t)
             t.add_done_callback(self._tasks.discard)
+
+    def _invert(self, c: "Cand") -> Optional["Cand"]:
+        inv = INV_MAP.get(c.ci)
+        if not inv:
+            return None
+        q = int(np.sum(mp.W[:, c.ci] <= 0))
+        best = None
+        for k in inv:
+            r = self._ratio_get(c.sig.sym, k, c.h)
+            if r is None or r < self.inv_min_ratio:
+                continue
+            w = cover_width(mp.COVERS[k])
+            sc = w * r
+            if best is None or sc > best[0] * 1.01 or (sc >= best[0] * 0.99 and w > best[2]):
+                best = (sc, k, w, r)
+        if best is None:
+            return None
+        _, k, w, r = best
+        p2 = (1.0 - c.p) * w / q
+        c2 = Cand(c.sig, c.h, k, p2, p2, r, p2 * r - 1.0)
+        c2.qts = self._ratio_ts(c.sig.sym, k, c.h)
+        c2.score = c.score
+        c2.cl = c.cl
+        c2.extra = c.extra
+        return c2
 
     @staticmethod
     def _key_mass(c: "Cand"):
