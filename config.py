@@ -1839,3 +1839,29 @@ V2_EXACT_MASS            = _env_f("V2_EXACT_MASS", 0.999)          # probability
 V2_EXHAUSTIVE            = _env_b("V2_EXHAUSTIVE", 0)              # 1 = also run the multi-minute solvers (32-bit LCG brute force, MT19937 elimination)
 V2_HISTORY_TICKS        = _env_i("V2_HISTORY_TICKS", 0)           # >0 and > MH_HISTORY_TICKS: history requested at boot when MH_PRED_V2=1 (paged, 1000 ticks/call; redeploy wipes memory, so this is the only way to reach the 20k / 40k diagnostic rungs early)
  
+
+# ── GUESSER MODE: classical calibrated digit guesser (guesser/, see GUESSER.md). GUESSER_MODE=0 (default) = nothing changes ──
+# Highest priority in main.py's engine choice when on.  DEMO ONLY: it calls set_engine.account_allowed() like SET/MH mode.
+GUESSER_MODE              = _env_b("GUESSER_MODE", 0)
+GUESSER_CADENCE           = os.environ.get("GUESSER_CADENCE", "probe").strip().lower()   # evidence | probe | bold
+GUESSER_ALLOWED_CONTRACTS = os.environ.get("GUESSER_ALLOWED_CONTRACTS", "OVER,UNDER").strip().upper()   # add MATCH,DIFFER,EVEN,ODD to widen the menu
+GUESSER_HORIZON           = _env_i("GUESSER_HORIZON", 1)             # prediction horizon in ticks (1 = next tick; 2 if buy latency eats one tick)
+GUESSER_PRIOR_NULL        = _env_f("GUESSER_PRIOR_NULL", 0.90)       # prior weight of the uniform null in the mixture (>= 0.90)
+GUESSER_FIXED_SHARE       = _env_f("GUESSER_FIXED_SHARE", 0.0)       # fixed-share switching rate; 0 = off (E4 decides)
+GUESSER_ALPHA1            = _env_f("GUESSER_ALPHA1", 0.01)           # T2 EVIDENCE level, after multiplicity correction
+GUESSER_ALPHA2            = _env_f("GUESSER_ALPHA2", 0.05)           # T1 PROBE level
+GUESSER_MULTIPLICITY      = os.environ.get("GUESSER_MULTIPLICITY", "bonferroni").strip().lower()   # bonferroni (anytime-valid, default) | ebh
+GUESSER_LB_Z              = _env_f("GUESSER_LB_Z", 1.64)             # z of the lower bound on the calibrated win probability
+GUESSER_MIN_EDGE          = _env_f("GUESSER_MIN_EDGE", 0.0)          # evidence trades need p_lb*r - 1 > this
+GUESSER_ASSUMED_MARGIN    = _env_f("GUESSER_ASSUMED_MARGIN", 0.05)   # model payout margin when no live proposal exists: r = (1-m)*10/k
+GUESSER_KELLY_FRAC        = _env_f("GUESSER_KELLY_FRAC", 0.25)       # fractional Kelly multiplier
+GUESSER_MAX_STAKE_FRAC    = _env_f("GUESSER_MAX_STAKE_FRAC", 0.05)   # evidence stake cap as a fraction of balance
+GUESSER_MAX_STAKE         = _env_f("GUESSER_MAX_STAKE", 100.0)       # absolute stake cap (USD)
+GUESSER_PROBE_BUDGET_FRAC = _env_f("GUESSER_PROBE_BUDGET_FRAC", 0.05)  # max NET probe loss as a fraction of the session-start balance
+GUESSER_PROBE_MAX_PER_MIN = _env_i("GUESSER_PROBE_MAX_PER_MIN", 12)  # probe trades per minute (all symbols) and per symbol
+GUESSER_TARGET_MULT       = _env_f("GUESSER_TARGET_MULT", 2.0)       # bold-play target = TARGET_BALANCE, else this x session-start balance
+GUESSER_MAX_OPEN          = _env_i("GUESSER_MAX_OPEN", 6)            # max contracts open at once
+GUESSER_HISTORY_TICKS     = _env_i("GUESSER_HISTORY_TICKS", 5000)    # ticks fetched at boot per symbol (paged, 1000/call) for the warm start
+GUESSER_REPORT_SECONDS    = _env_f("GUESSER_REPORT_SECONDS", 300)    # GUESSER REPORT period
+GUESSER_EXACT             = _env_b("GUESSER_EXACT", 1)               # T3: run the rng_core exact solvers (child process) per symbol
+GUESSER_SCAN_SECONDS      = _env_f("GUESSER_SCAN_SECONDS", 0.25)     # min seconds between scans
