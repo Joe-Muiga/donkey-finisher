@@ -203,7 +203,8 @@ class GuesserEngine(SetEngine):
         min_stake = self.stake
         orders, why = pol.decide(views, self.cadence, bal, min_stake, slots, self.probe, now, float(_cfg("GUESSER_KELLY_FRAC", 0.25)),
                                  float(_cfg("GUESSER_MAX_STAKE_FRAC", 0.05)), float(_cfg("GUESSER_MIN_EDGE", 0.0)),
-                                 target=self._target(), max_stake=float(_cfg("GUESSER_MAX_STAKE", 100.0)))
+                                 target=self._target(), max_stake=float(_cfg("GUESSER_MAX_STAKE", 100.0)),
+                                 min_ratio=float(_cfg("GUESSER_MIN_PAYOUT_RATIO", 2.0)))
         tiers = ",".join(f"{evd.TIER_NAMES[t][:2]}{sum(1 for v in views if v.tier == t)}" for t in sorted({v.tier for v in views}))
         msg = f"GUESSER SCAN {self._g_scans}: views={len(views)} tiers[{tiers}] bal={bal:.2f} -> {len(orders)} order(s); {why}"
         if orders or now - self._last_scan_log > 60:
@@ -222,7 +223,9 @@ class GuesserEngine(SetEngine):
             ratio = float(prop["payout"]) / o.stake if ok else 0.0
             if ok:
                 self._ratios.setdefault(o.sym, {})[o.contract] = ratio
-                if o.kind == "evidence" and o.p_lb * ratio - 1.0 <= float(_cfg("GUESSER_MIN_EDGE", 0.0)):
+                if ratio < float(_cfg("GUESSER_MIN_PAYOUT_RATIO", 2.0)):
+                    ok = False                                  # live payout below the floor
+                if ok and o.kind == "evidence" and o.p_lb * ratio - 1.0 <= float(_cfg("GUESSER_MIN_EDGE", 0.0)):
                     ok = False                                  # live payout ate the edge
             if ok and not self._blocked():
                 go.append((o, prop, ratio))
