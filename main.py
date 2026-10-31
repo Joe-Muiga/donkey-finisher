@@ -50,7 +50,14 @@ async def _run_engine(eng):
 def _run_bot():
     """Run the engine; if it ever exits or crashes, build a NEW one and start it again (never sit idle)."""
     import target_guard
-    if config.MH_MODE:
+    if getattr(config, "GUESSER_MODE", False):
+        from guesser.engine import GuesserEngine as Engine
+        from set_engine import account_allowed
+        allowed, why = account_allowed()
+        if not allowed:
+            logger.critical("GUESSER MODE REFUSED TO START: %s", why)
+            return                                   # demo-only guard, same as set / mh mode
+    elif config.MH_MODE:
         from mh_engine import MHEngine as Engine
         from set_engine import account_allowed
         allowed, why = account_allowed()
