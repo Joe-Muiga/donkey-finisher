@@ -236,7 +236,7 @@ class StepGuesserEngine(GuesserEngine):
                     cands.append(StepOrder(sym, c, stake, "step", lb, ratio, lb * ratio - 1.0, h, p.regime, p.bin, p.qstar, p_sh, key))
                 continue
             self._gates_open.discard(gk)
-            if sc.force and bal >= min_stake:
+            if sc.force and bal >= min_stake and p.qstar >= sc.force_min_q:
                 lb0 = wilson(grp.hits, grp.n, sc.lb_z)[0] if grp is not None and grp.n else 0.0
                 cands.append(StepOrder(sym, c, min_stake, "step_force", lb0, ratio, p.qstar * ratio - 1.0, h, p.regime, p.bin, p.qstar, p_sh, key))
             elif sc.explore and bal >= min_stake and explore_ok(m, p, sc):
@@ -418,7 +418,13 @@ class StepGuesserEngine(GuesserEngine):
         be = sum(v[3] for v in self._step_sym.values())
         pnl = sum(v[2] for v in self._step_sym.values())
         sh = " ".join(f"h{h} top1={100.0 * v[1] / v[0]:.2f}% n={v[0]}" for h, v in tot.items() if v[0]) or "no shadow yet"
-        return (f"STEP REPORT ALL: shadow {sh} (chance 10%) | gates open {len(self._gates_open)} | step trades {n} "
+        byb: Dict[int, list] = {}
+        for (_s, _h, _r, b), v in self._step_real.items():
+            a = byb.setdefault(b, [0, 0])
+            a[0] += v[0]
+            a[1] += v[1]
+        bb = " ".join(f"b{b}:{v[1]}/{v[0]}={v[1] / v[0]:.3f}" for b, v in sorted(byb.items()) if v[0]) or "-"
+        return (f"STEP REPORT ALL: realised by q-bin [{bb}] | shadow {sh} (chance 10%) | gates open {len(self._gates_open)} | step trades {n} "
                 f"hit={(100.0 * w / n if n else 0):.1f}% vs break-even {(100.0 * be / n if n else 0):.1f}% | step P&L {pnl:+.2f} | "
                 f"orders {self._g_orders} | balance {float(self.client.balance or 0):.2f} (start {self.start_balance})")
 
