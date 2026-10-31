@@ -227,14 +227,22 @@ class Order:
 def decide(views: Sequence[SymView], mode: str, balance: float, min_stake: float, slots: int, probe: Optional[ProbeBudget],
            now: float, kelly_frac: float = 0.25, max_frac: float = 0.05, min_edge: float = 0.0,
            target: Optional[float] = None, max_stake: Optional[float] = None, bold_tier_switch: bool = True,
-           ) -> Tuple[List[Order], str]:
+           min_ratio: float = 0.0) -> Tuple[List[Order], str]:
     """The single scheduler: maps (tier, probe budget left, target distance, open-contract cap) to orders + a one-line reason.
     mode: evidence | probe | bold.  Evidence orders (tier >= 2 and p_lb*r - 1 > min_edge) always come first, best edge first.
     In `probe` mode symbols at T0/T1 may get ONE minimum-stake probe on their best POSTERIOR edge (p_hat*r - 1), inside ProbeBudget.
     In `bold` mode a symbol without T2 evidence gets the bold stake on the contract with the best DP value."""
     orders: List[Order] = []
     why: List[str] = []
-    if slots <= 0:
+    if min_ratio > 0:                       # payout floor: drop every contract paying less than min_ratio x stake (e.g. Over 0 ~ 1.06x)
+        import dataclasses
+        nv = []
+        for v in views:
+            keep = [j for j in range(len(v.menu)) if v.ratio[j] >= min_ratio]
+            if keep:
+                nv.append(dataclasses.replace(v, menu=[v.menu[j] for j in keep], p_hat=v.p_hat[keep], p_cal=v.p_cal[keep], p_lb=v.p_lb[keep], ratio=v.ratio[keep]))
+        views = nv
+    if slots <= 0 or not views:
         return [], "no free slots"
     ev: List[Order] = []
     for v in views:
