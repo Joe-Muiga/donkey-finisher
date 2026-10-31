@@ -77,6 +77,8 @@ class StepGuesserEngine(GuesserEngine):
         self._step_n = 0
 
     async def run(self):
+        if self.scfg.force:
+            logger.warning("STEP FORCE ON: top digit traded at min stake with NO gate (demo scoreboard only); loss capped by the explore budget")
         logger.info("STEP MODE: cadence=%s trade=%s horizon=%s explore=%s min_n=%d lb_z=%.2f kelly=%.2f max_stake=%.2f",
                     self.cadence, self.scfg.trade, self.scfg.horizon, self.scfg.explore, self.scfg.min_n, self.scfg.lb_z,
                     self.scfg.kelly_frac, self.scfg.max_stake)
@@ -189,7 +191,8 @@ class StepGuesserEngine(GuesserEngine):
         bal = float(self.client.balance or 0.0)
         if self.start_balance is None and bal > 0:
             self.start_balance = bal
-            self.step_probe = pol.ProbeBudget(bal, sc.explore_budget_frac, sc.explore_max_per_min, max(1, sc.explore_max_per_min // 3))
+            pm = max(sc.explore_max_per_min, sc.force_per_min if sc.force else 0)
+            self.step_probe = pol.ProbeBudget(bal, sc.explore_budget_frac, pm, max(1, pm // 3))
             logger.info("STEP session start balance %.2f, explore budget %.2f", bal, self.step_probe.cap)
         if not sc.trade:
             self._last_decision = "step shadow only (STEP_TRADE=0)"
@@ -233,7 +236,10 @@ class StepGuesserEngine(GuesserEngine):
                     cands.append(StepOrder(sym, c, stake, "step", lb, ratio, lb * ratio - 1.0, h, p.regime, p.bin, p.qstar, p_sh, key))
                 continue
             self._gates_open.discard(gk)
-            if sc.explore and bal >= min_stake and explore_ok(m, p, sc):
+            if sc.force and bal >= min_stake:
+                lb0 = wilson(grp.hits, grp.n, sc.lb_z)[0] if grp is not None and grp.n else 0.0
+                cands.append(StepOrder(sym, c, min_stake, "step_force", lb0, ratio, p.qstar * ratio - 1.0, h, p.regime, p.bin, p.qstar, p_sh, key))
+            elif sc.explore and bal >= min_stake and explore_ok(m, p, sc):
                 lb0 = wilson(grp.hits, grp.n, sc.lb_z)[0] if grp is not None and grp.n else 0.0
                 cands.append(StepOrder(sym, c, min_stake, "step_explore", lb0, ratio, lb0 * ratio - 1.0, h, p.regime, p.bin, p.qstar, p_sh, key))
         cands.sort(key=lambda o: -o.edge)
@@ -241,12 +247,12 @@ class StepGuesserEngine(GuesserEngine):
         for o in cands:
             if len(picks) >= slots:
                 break
-            if o.kind == "step_explore":
+            if o.kind in ("step_explore", "step_force"):
                 if self.step_probe is None or not self.step_probe.allowed(o.stake, o.sym, now):
                     continue
                 self.step_probe.open(o.stake, o.sym, now)    # reserve at once: a burst can never overshoot the cap
             picks.append(o)
-        msg = f"STEP SCAN {self._g_scans}: ready={n_ready} gated={sum(1 for o in cands if o.kind == 'step')} explore={sum(1 for o in cands if o.kind == 'step_explore')} bal={bal:.2f} -> {len(picks)} order(s)"
+        msg = f"STEP SCAN {self._g_scans}: ready={n_ready} gated={sum(1 for o in cands if o.kind == 'step')} explore={sum(1 for o in cands if o.kind == 'step_explore')} force={sum(1 for o in cands if o.kind == 'step_force')} bal={bal:.2f} -> {len(picks)} order(s)"
         if picks or now - self._last_scan_log > 60:
             logger.info(msg)
             self._last_scan_log = now
@@ -294,7 +300,7 @@ class StepGuesserEngine(GuesserEngine):
                 self.money.release(o.stake)
         for (o, _, _), cid in zip(reserved, res):
             if isinstance(cid, BaseException) or not cid:
-                if o.kind == "step_explore" and any(w in self._last_buy_err.lower() for w in ("timeout", "timed out")):
+                if o.kind in ("step_explore", "step_force") and any(w in self._last_buy_err.lower() for w in ("timeout", "timed out")):
                     logger.error("STEP BUY IN DOUBT %s %s: explore reservation %.2f stays HELD", o.sym, o.kind, o.stake)
                 else:
                     self._explore_release(o)
@@ -305,7 +311,7 @@ class StepGuesserEngine(GuesserEngine):
                     logger.info("STEP first trade %.1f s after boot", self._first_trade_wall - self._boot_wall)
 
     def _explore_release(self, o) -> None:
-        if getattr(o, "kind", "") == "step_explore" and self.step_probe is not None:
+        if getattr(o, "kind", "") in ("step_explore", "step_force") and self.step_probe is not None:
             self.step_probe.settle(o.stake, o.stake)         # nothing was bought: give the reservation back
 
     async def _buy_order(self, o, prop: dict, ratio: float):
@@ -347,7 +353,7 @@ class StepGuesserEngine(GuesserEngine):
         sy[2] += profit
         sy[3] += 1.0 / max(float(info.get("ratio") or 1.0), 1.0001)
         self._step_n += 1
-        if info.get("kind") == "step_explore" and self.step_probe is not None:
+        if info.get("kind") in ("step_explore", "step_force") and self.step_probe is not None:
             self.step_probe.settle(stake, stake + profit)
         if info.get("kind") == "step":
             self._step_recent.append((int(won), float(info.get("p_sh") or 0.1)))
