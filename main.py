@@ -51,7 +51,14 @@ def _run_bot():
     """Run the engine; if it ever exits or crashes, build a NEW one and start it again (never sit idle)."""
     import target_guard
     if getattr(config, "GUESSER_MODE", False):
-        from guesser.engine import GuesserEngine as Engine
+        import os as _os
+        if _os.environ.get("STEP_MODE", "0").strip().lower() in ("1", "true", "yes", "on"):
+            from guesser.step_engine import StepGuesserEngine as Engine
+        else:
+            from guesser.engine import GuesserEngine as Engine
+            if str(getattr(config, "GUESSER_CADENCE", "")).lower() == "step":
+                logger.critical("GUESSER_CADENCE=step needs STEP_MODE=1: running evidence cadence (never probe)")
+                config.GUESSER_CADENCE = "evidence"
         from set_engine import account_allowed
         allowed, why = account_allowed()
         if not allowed:
