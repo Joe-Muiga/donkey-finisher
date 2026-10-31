@@ -1865,3 +1865,4 @@ GUESSER_HISTORY_TICKS     = _env_i("GUESSER_HISTORY_TICKS", 5000)    # ticks fet
 GUESSER_REPORT_SECONDS    = _env_f("GUESSER_REPORT_SECONDS", 300)    # GUESSER REPORT period
 GUESSER_EXACT             = _env_b("GUESSER_EXACT", 1)               # T3: run the rng_core exact solvers (child process) per symbol
 GUESSER_SCAN_SECONDS      = _env_f("GUESSER_SCAN_SECONDS", 0.25)     # min seconds between scans
+GUESSER_MIN_PAYOUT_RATIO  = _env_f("GUESSER_MIN_PAYOUT_RATIO", 2.0)   # never trade a contract paying less than this x stake (Over 0 pays ~1.06x)
