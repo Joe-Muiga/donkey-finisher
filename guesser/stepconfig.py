@@ -55,6 +55,7 @@ class StepConfig:
     explore_budget_frac: float = 0.01
     force: bool = False           # demo plumbing/scoreboard mode: trade the top digit at min stake, no gate
     force_per_min: int = 6
+    force_min_q: float = 0.0      # force mode trades only ticks whose top-digit probability q* is at least this
     report_seconds: float = 300.0
     # extras (not in the brief's table; safe defaults)
     warmup: int = 50              # steps before a regime exists
@@ -87,7 +88,7 @@ class StepConfig:
             rtt_frac=_f("STEP_RTT_FRAC", d.rtt_frac), explore=_b("STEP_EXPLORE", 0),
             explore_min_q=_f("STEP_EXPLORE_MIN_Q", d.explore_min_q), explore_max_per_min=int(_f("STEP_EXPLORE_MAX_PER_MIN", d.explore_max_per_min)),
             explore_budget_frac=_f("STEP_EXPLORE_BUDGET_FRAC", d.explore_budget_frac),
-            force=_b("STEP_FORCE", 0), force_per_min=int(_f("STEP_FORCE_MAX_PER_MIN", d.force_per_min)),
+            force=_b("STEP_FORCE", 0), force_per_min=int(_f("STEP_FORCE_MAX_PER_MIN", d.force_per_min)), force_min_q=_f("STEP_FORCE_MIN_Q", d.force_min_q),
             report_seconds=_f("STEP_REPORT_SECONDS", d.report_seconds), warmup=max(2, int(_f("STEP_WARMUP", d.warmup))),
             gap_factor=_f("STEP_GAP_FACTOR", d.gap_factor), drift_alpha=_f("STEP_DRIFT_ALPHA", d.drift_alpha),
             drift_band=_f("STEP_DRIFT_BAND", d.drift_band), z_hi=_f("STEP_Z_HI", d.z_hi),
